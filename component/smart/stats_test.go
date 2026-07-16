@@ -12,21 +12,21 @@ func almostEqual(a, b float64) bool {
 	return math.Abs(a-b) <= epsilon
 }
 
-func TestUpdateIIDRewardUsesDiscountedMeanAndCount(t *testing.T) {
+func TestUpdateDiscountedWeightUsesDiscountedMeanAndCount(t *testing.T) {
 	record := &AtomicStatsRecord{
 		weights: lru.New[string, float64](lru.WithSize[string, float64](16)),
 	}
 
-	rewards := []float64{0.2, 0.8, 0.5}
+	weights := []float64{0.2, 0.8, 0.5}
 	var expectedMean float64
 	var expectedCount float64
 
-	for i, reward := range rewards {
+	for i, weight := range weights {
 		discountedCount := expectedCount * DiscountedUCBGamma
 		expectedCount = discountedCount + 1.0
-		expectedMean = (expectedMean*discountedCount + reward) / expectedCount
+		expectedMean = (expectedMean*discountedCount + clamp01(weight)) / expectedCount
 
-		mean, count := record.UpdateIIDReward(IIDRewardTypeTCP, reward)
+		mean, count := record.UpdateDiscountedWeight(WeightTypeTCP, weight)
 		if !almostEqual(mean, expectedMean) {
 			t.Fatalf("step %d mean = %.12f, want %.12f", i, mean, expectedMean)
 		}
@@ -34,7 +34,7 @@ func TestUpdateIIDRewardUsesDiscountedMeanAndCount(t *testing.T) {
 			t.Fatalf("step %d count = %.12f, want %.12f", i, count, expectedCount)
 		}
 
-		storedMean, storedCount := record.GetIIDReward(IIDRewardTypeTCP)
+		storedMean, storedCount := record.GetDiscountedWeight(WeightTypeTCP)
 		if !almostEqual(storedMean, expectedMean) {
 			t.Fatalf("step %d stored mean = %.12f, want %.12f", i, storedMean, expectedMean)
 		}
@@ -44,12 +44,12 @@ func TestUpdateIIDRewardUsesDiscountedMeanAndCount(t *testing.T) {
 	}
 }
 
-func TestCalculateUCB1TunedScoreUsesDiscountedUCB(t *testing.T) {
+func TestCalculateUCB1ScoreUsesDiscountedUCB(t *testing.T) {
 	mean := 0.7
 	count := 2.5
 	totalCount := 10.0
 
-	score, bonus := CalculateUCB1TunedScore(mean, count, totalCount)
+	score, bonus := CalculateUCB1Score(mean, count, totalCount)
 	expectedBonus := math.Sqrt(2.0 * math.Log(totalCount) / count)
 	expectedScore := mean + expectedBonus
 
@@ -61,12 +61,12 @@ func TestCalculateUCB1TunedScoreUsesDiscountedUCB(t *testing.T) {
 	}
 }
 
-func TestCalculateUCB1TunedScoreAdjustsTotalCountAndClampsMean(t *testing.T) {
+func TestCalculateUCB1ScoreAdjustsTotalCountAndClampsMean(t *testing.T) {
 	mean := 1.5
 	count := 5.0
 	totalCount := 3.0
 
-	score, bonus := CalculateUCB1TunedScore(mean, count, totalCount)
+	score, bonus := CalculateUCB1Score(mean, count, totalCount)
 	expectedBonus := math.Sqrt(2.0 * math.Log(count) / count)
 	expectedScore := 1.0 + expectedBonus
 
@@ -78,13 +78,13 @@ func TestCalculateUCB1TunedScoreAdjustsTotalCountAndClampsMean(t *testing.T) {
 	}
 }
 
-func TestCalculateUCB1TunedScoreHandlesColdAndSingleSampleInputs(t *testing.T) {
-	score, bonus := CalculateUCB1TunedScore(0.5, 0, 10)
+func TestCalculateUCB1ScoreHandlesColdAndSingleSampleInputs(t *testing.T) {
+	score, bonus := CalculateUCB1Score(0.5, 0, 10)
 	if !math.IsInf(score, 1) || !math.IsInf(bonus, 1) {
 		t.Fatalf("cold arm score/bonus = %.12f/%.12f, want +Inf/+Inf", score, bonus)
 	}
 
-	score, bonus = CalculateUCB1TunedScore(1.5, 1, 1)
+	score, bonus = CalculateUCB1Score(1.5, 1, 1)
 	if score != 1.0 || bonus != 0.0 {
 		t.Fatalf("single-sample score/bonus = %.12f/%.12f, want 1/0", score, bonus)
 	}

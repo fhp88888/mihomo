@@ -704,7 +704,7 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 		}
 
 		// 实时计算 UCB1-Tuned 节点排名
-		if proxiesName, scores, err := s.store.GetUCB1TunedProxyRankingForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
+		if proxiesName, scores, err := s.store.GetUCB1ProxyRankingForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
 			return proxiesName, scores
 		}
 
@@ -1278,21 +1278,17 @@ func (s *Smart) logConnectionStats(err error, record *smart.StatsRecord, metadat
 	connectionDuration int64, asnInfo string, ModelPredicted bool, lossRate, cumulLossRate float64) {
 
 	var tcpAsnWeight, udpAsnWeight float64
-	var tcpIIDReward, udpIIDReward, tcpAsnIIDReward, udpAsnIIDReward float64
-	var tcpIIDRewardCount, udpIIDRewardCount, tcpAsnIIDRewardCount, udpAsnIIDRewardCount int64
+	var tcpUCBMean, udpUCBMean, tcpAsnUCBMean, udpAsnUCBMean float64
+	var tcpUCBCount, udpUCBCount, tcpAsnUCBCount, udpAsnUCBCount float64
 
 	if record.Weights != nil {
-		tcpIIDReward = record.Weights[smart.IIDRewardTypeTCP]
-		udpIIDReward = record.Weights[smart.IIDRewardTypeUDP]
-		tcpIIDRewardCount = int64(record.Weights[smart.IIDRewardTypeTCP+":count"])
-		udpIIDRewardCount = int64(record.Weights[smart.IIDRewardTypeUDP+":count"])
+		tcpUCBMean, tcpUCBCount = record.Weights[smart.WeightTypeTCP], record.Weights[smart.WeightTypeTCP+":count"]
+		udpUCBMean, udpUCBCount = record.Weights[smart.WeightTypeUDP], record.Weights[smart.WeightTypeUDP+":count"]
 	}
 
 	if asnInfo != "" {
 		tcpAsnWeightKey := smart.WeightTypeTCPASN + ":" + asnInfo
 		udpAsnWeightKey := smart.WeightTypeUDPASN + ":" + asnInfo
-		tcpAsnIIDRewardKey := smart.IIDRewardTypeTCPASN + ":" + asnInfo
-		udpAsnIIDRewardKey := smart.IIDRewardTypeUDPASN + ":" + asnInfo
 		if record.Weights != nil {
 			if w, ok := record.Weights[tcpAsnWeightKey]; ok {
 				tcpAsnWeight = w
@@ -1300,10 +1296,8 @@ func (s *Smart) logConnectionStats(err error, record *smart.StatsRecord, metadat
 			if w, ok := record.Weights[udpAsnWeightKey]; ok {
 				udpAsnWeight = w
 			}
-			tcpAsnIIDReward = record.Weights[tcpAsnIIDRewardKey]
-			udpAsnIIDReward = record.Weights[udpAsnIIDRewardKey]
-			tcpAsnIIDRewardCount = int64(record.Weights[tcpAsnIIDRewardKey+":count"])
-			udpAsnIIDRewardCount = int64(record.Weights[udpAsnIIDRewardKey+":count"])
+			tcpAsnUCBMean, tcpAsnUCBCount = record.Weights[tcpAsnWeightKey], record.Weights[tcpAsnWeightKey+":count"]
+			udpAsnUCBMean, udpAsnUCBCount = record.Weights[udpAsnWeightKey], record.Weights[udpAsnWeightKey+":count"]
 		}
 	}
 
@@ -1320,7 +1314,7 @@ func (s *Smart) logConnectionStats(err error, record *smart.StatsRecord, metadat
 	log.Debugln("[Smart] Connection status: [%s], Updated weights: (Model: [%s], TCP: [%.4f], UDP: [%.4f], TCP ASN: [%.4f], UDP ASN: [%.4f], Base: [%.4f], Priority: [%.2f]) "+
 		"For (Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s]) "+
 		"- Current: (Connect: [%s], Latency: [%s], LossRate: [%.2f%%], Up: [%s], Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Duration: [%s]) "+
-		"- Current UCB: (IIDReward TCP: [%.4f/%d], IIDReward UDP: [%.4f/%d], IIDReward TCP ASN: [%.4f/%d], IIDReward UDP ASN: [%.4f/%d]) "+
+		"- Current UCB: (UCBWeight TCP: [%.4f/%.1f], UCBWeight UDP: [%.4f/%.1f], UCBWeight TCP ASN: [%.4f/%.1f], UCBWeight UDP ASN: [%.4f/%.1f]) "+
 		"- History: (Success: [%d], Failure: [%d], EMA Connect: [%s], EMA Latency: [%s], Cumul LossRate: [%.2f%%], Total Up: [%s], Total Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Avg Duration: [%s])",
 		statusStr, weightSource, record.Weights[smart.WeightTypeTCP], record.Weights[smart.WeightTypeUDP], tcpAsnWeight, udpAsnWeight, baseWeight, priorityFactor,
 		s.Name(), proxyName, metadata.NetWork.String(), addressDisplay,
@@ -1332,7 +1326,7 @@ func (s *Smart) logConnectionStats(err error, record *smart.StatsRecord, metadat
 		formatTrafficUnit(maxUploadRate*1024, true),
 		formatTrafficUnit(maxDownloadRate*1024, true),
 		formatTimeUnit(float64(connectionDuration)),
-		tcpIIDReward, tcpIIDRewardCount, udpIIDReward, udpIIDRewardCount, tcpAsnIIDReward, tcpAsnIIDRewardCount, udpAsnIIDReward, udpAsnIIDRewardCount,
+		tcpUCBMean, tcpUCBCount, udpUCBMean, udpUCBCount, tcpAsnUCBMean, tcpAsnUCBCount, udpAsnUCBMean, udpAsnUCBCount,
 		record.Success, record.Failure,
 		formatTimeUnit(float64(record.ConnectTime)),
 		formatTimeUnit(float64(record.Latency)),
@@ -1414,18 +1408,14 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	}
 
 	weightType := smart.WeightTypeTCP
-	iidRewardType := smart.IIDRewardTypeTCP
 	if asnInfo != "" {
 		if isUDP {
 			weightType = smart.WeightTypeUDPASN + ":" + asnInfo
-			iidRewardType = smart.IIDRewardTypeUDPASN + ":" + asnInfo
 		} else {
 			weightType = smart.WeightTypeTCPASN + ":" + asnInfo
-			iidRewardType = smart.IIDRewardTypeTCPASN + ":" + asnInfo
 		}
 	} else if isUDP {
 		weightType = smart.WeightTypeUDP
-		iidRewardType = smart.IIDRewardTypeUDP
 	}
 
 	lock := smart.GetTargetNodeLock(target, s.Name(), proxyName)
@@ -1518,26 +1508,6 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	// 针对具体 域名/IP 屏蔽节点
 	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, isDegraded, checked, blockCode)
 
-	statusScore := 1.0
-	if err != nil {
-		statusScore = 0.0
-	}
-	if isDegraded || failedBlock {
-		switch blockCode {
-		case 1, 3:
-			statusScore = 0.0
-		case 2:
-			statusScore = 0.1
-		case 4:
-			statusScore = 0.05
-		case 5:
-			statusScore = 0.2
-		default:
-			statusScore = 0.1
-		}
-	}
-	iidReward := smart.CalculateIIDReward(input, statusScore)
-
 	if isDegraded || failedBlock {
 		s.findSameConnection(metadata, proxyName, target, asnInfo)
 	}
@@ -1545,7 +1515,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	// 平均权重(适应 target 调整为 rule based 和 asn based 的情况)
 	newWeight := updateEMAFloat(oldWeight, adjWeight)
 	atomicRecord.Set("lastUsed", time.Now().Unix())
-	atomicRecord.UpdateIIDReward(iidRewardType, iidReward)
+	atomicRecord.UpdateDiscountedWeight(weightType, adjWeight)
 	atomicRecord.SetWeight(weightType, newWeight, isUDP)
 	statsSnapshot := atomicRecord.CreateStatsSnapshot(cacheKey)
 	s.saveStatsRecord(target, proxy, statsSnapshot)

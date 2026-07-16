@@ -354,23 +354,26 @@ func (r *AtomicStatsRecord) Add(field string, value interface{}) {
 	}
 }
 
-func (r *AtomicStatsRecord) GetIIDReward(iidRewardType string) (float64, float64) {
-	mean, _ := r.weights.Get(iidRewardType)
-	count, _ := r.weights.Get(iidRewardType + ":count")
+func (r *AtomicStatsRecord) GetDiscountedWeight(weightType string) (float64, float64) {
+	mean, _ := r.weights.Get(weightType)
+	count, _ := r.weights.Get(weightType + ":count")
 	return mean, count
 }
 
-func (r *AtomicStatsRecord) UpdateIIDReward(iidRewardType string, reward float64) (float64, float64) {
-	oldMean, oldCount := r.GetIIDReward(iidRewardType)
+func (r *AtomicStatsRecord) UpdateDiscountedWeight(weightType string, weight float64) (float64, float64) {
+	oldMean, oldCount := r.GetDiscountedWeight(weightType)
 	discountedCount := oldCount * DiscountedUCBGamma
 	newCount := discountedCount + 1.0
-	newMean := (oldMean*discountedCount + reward) / newCount
-	r.weights.Set(iidRewardType, newMean)
-	r.weights.Set(iidRewardType+":count", newCount)
+	newMean := (oldMean*discountedCount + clamp01(weight)) / newCount
+	r.weights.Set(weightType, newMean)
+	r.weights.Set(weightType+":count", newCount)
 	return newMean, newCount
 }
 
-func CalculateUCB1TunedScore(mean float64, count, totalCount float64) (float64, float64) {
+// CalculateUCB1Score 计算 Discounted UCB1 的 ranking score 和探索项。
+// score = clamped_mean + sqrt(2 * ln(totalCount) / count)
+// count <= 0 返回 +Inf，优先探索未尝试节点。
+func CalculateUCB1Score(mean float64, count, totalCount float64) (float64, float64) {
 	if count <= 0 {
 		return math.Inf(1), math.Inf(1)
 	}
@@ -582,26 +585,26 @@ func (s *Store) StoreNodeWeightRanking(group, config string, ranking NodeRank) {
 	})
 }
 
-func getIIDRewardType(asnNumber string, isUDP bool) string {
+func getWeightType(asnNumber string, isUDP bool) string {
 	if asnNumber != "" && !CdnASNs[asnNumber] {
 		if isUDP {
-			return IIDRewardTypeUDPASN + ":" + asnNumber
+			return WeightTypeUDPASN + ":" + asnNumber
 		}
-		return IIDRewardTypeTCPASN + ":" + asnNumber
+		return WeightTypeTCPASN + ":" + asnNumber
 	}
 	if isUDP {
-		return IIDRewardTypeUDP
+		return WeightTypeUDP
 	}
-	return IIDRewardTypeTCP
+	return WeightTypeTCP
 }
 
-// 获取目标的 UCB1-Tuned 节点排名
-func (s *Store) GetUCB1TunedRankingForTarget(group, config, target, asnNumber string, isUDP bool) ([]NodeUCBScore, error) {
+// 获取目标的 Discounted UCB1 节点排名
+func (s *Store) GetUCB1RankingForTarget(group, config, target, asnNumber string, isUDP bool) ([]NodeUCBScore, error) {
 	if target == "" {
 		return nil, errors.New("empty target")
 	}
 
-	iidRewardType := getIIDRewardType(asnNumber, isUDP)
+	weightType := getWeightType(asnNumber, isUDP)
 	nodeScores := make(map[string]*NodeUCBScore)
 	var totalCount float64
 
@@ -609,11 +612,11 @@ func (s *Store) GetUCB1TunedRankingForTarget(group, config, target, asnNumber st
 		if record.Weights == nil {
 			return
 		}
-		mean, ok := record.Weights[iidRewardType]
+		mean, ok := record.Weights[weightType]
 		if !ok {
 			return
 		}
-		count := record.Weights[iidRewardType+":count"]
+		count := record.Weights[weightType+":count"]
 		if count <= 0 {
 			return
 		}
@@ -663,7 +666,7 @@ func (s *Store) GetUCB1TunedRankingForTarget(group, config, target, asnNumber st
 
 	ranking := make([]NodeUCBScore, 0, len(nodeScores))
 	for _, score := range nodeScores {
-		score.Score, score.ExplorationBonus = CalculateUCB1TunedScore(score.Mean, score.Count, totalCount)
+		score.Score, score.ExplorationBonus = CalculateUCB1Score(score.Mean, score.Count, totalCount)
 		ranking = append(ranking, *score)
 	}
 
@@ -683,8 +686,8 @@ func (s *Store) GetUCB1TunedRankingForTarget(group, config, target, asnNumber st
 	return ranking, nil
 }
 
-func (s *Store) GetUCB1TunedProxyRankingForTarget(group, config, target, asnNumber string, isUDP bool) ([]string, []float64, error) {
-	ranking, err := s.GetUCB1TunedRankingForTarget(group, config, target, asnNumber, isUDP)
+func (s *Store) GetUCB1ProxyRankingForTarget(group, config, target, asnNumber string, isUDP bool) ([]string, []float64, error) {
+	ranking, err := s.GetUCB1RankingForTarget(group, config, target, asnNumber, isUDP)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -986,7 +989,7 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 				bestNodes = v.nodes
 				bestWeights = v.weights
 			} else {
-				bestNodes, bestWeights, err = s.GetUCB1TunedProxyRankingForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+				bestNodes, bestWeights, err = s.GetUCB1ProxyRankingForTarget(group, config, active.Target, active.ASN, active.IsUDP)
 				// 原 Smart 权重排名暂时停用，使用新的UCB Ranking
 				// bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
 				asnCache[key] = asnCacheValue{
@@ -995,7 +998,7 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 				}
 			}
 		} else {
-			bestNodes, bestWeights, err = s.GetUCB1TunedProxyRankingForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+			bestNodes, bestWeights, err = s.GetUCB1ProxyRankingForTarget(group, config, active.Target, active.ASN, active.IsUDP)
 			// 原 Smart 权重排名暂时停用，使用新的UCB Ranking
 			// bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
 		}

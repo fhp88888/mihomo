@@ -32,22 +32,7 @@ type (
 		lossWeight        float64
 		minDecayFactor    float64
 	}
-
-	IIDRewardWeights struct {
-		Success    float64
-		Latency    float64
-		Throughput float64
-		Stability  float64
-		Status     float64
-	}
 )
-
-var presetIIDRewardWeights = [4]IIDRewardWeights{
-	sceneWeb:         {0.45, 0.20, 0.15, 0.10, 0.10},
-	sceneInteractive: {0.35, 0.30, 0.10, 0.15, 0.10},
-	sceneStreaming:   {0.30, 0.15, 0.30, 0.15, 0.10},
-	sceneTransfer:    {0.30, 0.10, 0.35, 0.15, 0.10},
-}
 
 type ModelInput struct {
 	// 节点历史性能指标
@@ -95,107 +80,6 @@ func clamp01(v float64) float64 {
 		return 0
 	}
 	return math.Min(1.0, math.Max(0.0, v))
-}
-
-// CalculateIIDReward 生成单次连接的有界 IIDReward 样本，范围为 [0, 1]。
-func CalculateIIDReward(input *ModelInput, statusScore float64) float64 {
-	// 1. 提取本次连接观测值。IIDReward 必须基于本次连接样本；
-	// 历史字段只作为归一化基准使用。
-	uploadMB := input.UploadTotal
-	downloadMB := input.DownloadTotal
-	maxUploadRateKB := input.MaxuploadRate
-	maxDownloadRateKB := input.MaxdownloadRate
-	durationMinutes := input.ConnectionDuration
-	latency := input.Latency
-	connectTime := input.ConnectTime
-
-	// 2. 填补缺失的 connect/latency 样本，避免失败连接和成功但零值的连接
-	// 得到相同的延迟得分。
-	if connectTime == 0 {
-		if input.ConnectionFailed {
-			connectTime = 2000
-		} else {
-			connectTime = 1
-		}
-	}
-	if latency == 0 {
-		if input.ConnectionFailed {
-			latency = 2000
-		} else {
-			latency = 1
-		}
-	}
-
-	// 3. 复用 Smart 现有场景分类，选择不同场景下的 reward 分量权重。
-	scene := identifyConnectionScene(input.IsUDP, latency, uploadMB, downloadMB, maxUploadRateKB, maxDownloadRateKB, durationMinutes)
-	weights := presetIIDRewardWeights[scene]
-
-	// 4. 成功分量：硬失败不给成功收益。
-	successScore := 1.0
-	if input.ConnectionFailed {
-		successScore = 0.0
-	}
-
-	// 5. 延迟分量：结合建连耗时和首包/UDP 延迟，使用 Smart 权重计算中
-	// 相同风格的指数衰减。
-	connectScore := math.Exp(-float64(connectTime) / 1500.0)
-	latencyValueScore := math.Exp(-float64(latency) / 1500.0)
-	latencyScore := clamp01(connectScore*0.4 + latencyValueScore*0.6)
-
-	// 6. 吞吐分量：复用 calculateTrafficFactor 和 Smart 现有的场景化上下行偏好，
-	// 再从 [0, 1.25] 归一化到 [0, 1]。
-	isShortConnection := durationMinutes <= 1
-	uploadFactor := calculateTrafficFactor(uploadMB, maxUploadRateKB, durationMinutes, input.HistoryMaxUploadRate, input.HistoryUploadTotal, input.HistoryConnectionDuration, isShortConnection)
-	downloadFactor := calculateTrafficFactor(downloadMB, maxDownloadRateKB, durationMinutes, input.HistoryMaxDownloadRate, input.HistoryDownloadTotal, input.HistoryConnectionDuration, isShortConnection)
-
-	var uploadWeight, downloadWeight float64
-	if scene == sceneStreaming {
-		uploadWeight, downloadWeight = 0.2, 0.8
-	} else if scene == sceneTransfer && uploadMB > downloadMB*2 {
-		uploadWeight, downloadWeight = 0.7, 0.3
-	} else {
-		uploadWeight, downloadWeight = 0.1, 0.9
-	}
-	throughputScore := clamp01((uploadFactor*uploadWeight + downloadFactor*downloadWeight) / 1.25)
-	if uploadMB <= 0 && downloadMB <= 0 {
-		throughputScore = 0
-	}
-
-	// 7. 稳定性分量：复用 Smart 对本次/累计丢包率的惩罚方式。
-	// 本次丢包更敏感；累计丢包一旦可信，就成为更强的判断依据。
-	stabilityScore := 1.0
-	if input.LossRate > 0 || input.CumulLossRate > 0 {
-		currentPenalty := 0.0
-		if input.LossRate > 0 {
-			currentPenalty = 1.0 - math.Exp(-input.LossRate*10.0)
-		}
-		cumulPenalty := 0.0
-		if input.CumulLossRate > 0 {
-			cumulPenalty = 1.0 - math.Exp(-input.CumulLossRate*50.0)
-		}
-		trustCumul := math.Min(1.0, cumulPenalty*5.0)
-		lossFactor := trustCumul*math.Max(currentPenalty, cumulPenalty) +
-			(1.0-trustCumul)*currentPenalty*0.3
-		stabilityScore = 1.0 - lossFactor
-	}
-	if input.ConnectionFailed {
-		stabilityScore *= 0.5
-	}
-
-	// 8. 合成有界 reward 样本。statusScore 由 Smart 质量检查提供，
-	// 使 HTTP 状态、零流量等异常只影响本次样本。
-	reward := weights.Success*successScore +
-		weights.Latency*latencyScore +
-		weights.Throughput*throughputScore +
-		weights.Stability*clamp01(stabilityScore) +
-		weights.Status*clamp01(statusScore)
-
-	// 9. 硬失败封顶，避免其他分量的乐观默认值把失败样本抬得过高。
-	if input.ConnectionFailed {
-		reward = math.Min(reward, 0.2)
-	}
-
-	return clamp01(reward)
 }
 
 // 计算权重
