@@ -365,14 +365,16 @@ func CalculateUCB1Score(reward float64, count, totalCount float64) (float64, flo
 		totalCount = count
 	}
 	if totalCount <= 1 {
-		return clamp01(reward), 0
+		return clamp01(reward, 3.5), 0
 	}
 
-	boundedReward := clamp01(reward)
-	explorationBonus := math.Sqrt(2.0 * math.Log(totalCount) / count)
+	boundedReward := clamp01(reward, 3.5)
+	explorationBonus := clamp01(math.Sqrt(2.0 * math.Log(totalCount) / count), 5.0)
+	finalScore := boundedReward * 0.7 + explorationBonus * 0.3
+
 	log.Debugln("[UCB1] reward=%.4f boundedReward=%.4f count=%.0f totalCount=%.0f explorationBonus=%.4f score=%.4f",
-		reward, boundedReward, count, totalCount, explorationBonus, boundedReward+explorationBonus)
-	return boundedReward + explorationBonus, explorationBonus
+		reward, boundedReward, count, totalCount, explorationBonus, finalScore)
+	return finalScore, explorationBonus
 }
 
 func (r *AtomicStatsRecord) GetWeight(weightType string) float64 {

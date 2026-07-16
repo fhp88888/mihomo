@@ -75,11 +75,11 @@ type ModelInput struct {
 	NodeName                   string    // 节点名称
 }
 
-func clamp01(v float64) float64 {
+func clamp01(v float64, max float64) float64 {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return 0
 	}
-	return math.Min(3.5, math.Max(0.0, v)) / 3.5
+	return math.Min(max, math.Max(0.0, v)) / max
 }
 
 // 计算权重
