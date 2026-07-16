@@ -369,6 +369,25 @@ func (r *AtomicStatsRecord) UpdateIIDReward(iidRewardType string, reward float64
 	return newMean, newCount
 }
 
+func CalculateUCB1TunedScore(mean float64, count, totalCount int64) (float64, float64) {
+	if count <= 0 {
+		return math.Inf(1), math.Inf(1)
+	}
+	if totalCount < count {
+		totalCount = count
+	}
+	if totalCount <= 1 {
+		return clamp01(mean), 0
+	}
+
+	boundedMean := clamp01(mean)
+	lnTotal := math.Log(float64(totalCount))
+	varianceBound := boundedMean * (1.0 - boundedMean)
+	varianceTuned := varianceBound + math.Sqrt(2.0*lnTotal/float64(count))
+	explorationBonus := math.Sqrt((lnTotal / float64(count)) * math.Min(0.25, varianceTuned))
+	return boundedMean + explorationBonus, explorationBonus
+}
+
 func (r *AtomicStatsRecord) GetWeight(weightType string) float64 {
 	if value, ok := r.weights.Get(weightType); ok {
 		return value
@@ -563,6 +582,121 @@ func (s *Store) StoreNodeWeightRanking(group, config string, ranking NodeRank) {
 		Config: config,
 		Data:   data,
 	})
+}
+
+func getIIDRewardType(asnNumber string, isUDP bool) string {
+	if asnNumber != "" && !CdnASNs[asnNumber] {
+		if isUDP {
+			return IIDRewardTypeUDPASN + ":" + asnNumber
+		}
+		return IIDRewardTypeTCPASN + ":" + asnNumber
+	}
+	if isUDP {
+		return IIDRewardTypeUDP
+	}
+	return IIDRewardTypeTCP
+}
+
+// 获取目标的 UCB1-Tuned 节点排名
+func (s *Store) GetUCB1TunedRankingForTarget(group, config, target, asnNumber string, isUDP bool) ([]NodeUCBScore, error) {
+	if target == "" {
+		return nil, errors.New("empty target")
+	}
+
+	iidRewardType := getIIDRewardType(asnNumber, isUDP)
+	nodeScores := make(map[string]*NodeUCBScore)
+	var totalCount int64
+
+	collectRecord := func(nodeName string, record StatsRecord) {
+		if record.Weights == nil {
+			return
+		}
+		mean, ok := record.Weights[iidRewardType]
+		if !ok {
+			return
+		}
+		count := int64(record.Weights[iidRewardType+":count"])
+		if count <= 0 {
+			return
+		}
+		score := nodeScores[nodeName]
+		if score == nil {
+			score = &NodeUCBScore{Node: nodeName}
+			nodeScores[nodeName] = score
+		}
+		oldCount := score.Count
+		newCount := oldCount + count
+		score.Mean = (score.Mean*float64(oldCount) + clamp01(mean)*float64(count)) / float64(newCount)
+		score.Count = newCount
+		totalCount += count
+	}
+
+	if asnNumber != "" && !CdnASNs[asnNumber] {
+		allStatsMap, err := s.GetAllStats(group, config)
+		if err != nil {
+			return nil, err
+		}
+		for _, mapStats := range allStatsMap {
+			for nodeName, data := range mapStats {
+				var record StatsRecord
+				if json.Unmarshal(data, &record) != nil {
+					continue
+				}
+				collectRecord(nodeName, record)
+			}
+		}
+	} else {
+		mapStats, err := s.GetStatsForTarget(group, config, target, "")
+		if err != nil {
+			return nil, err
+		}
+		for nodeName, data := range mapStats {
+			var record StatsRecord
+			if json.Unmarshal(data, &record) != nil {
+				continue
+			}
+			collectRecord(nodeName, record)
+		}
+	}
+
+	if len(nodeScores) == 0 {
+		return nil, errors.New("no node with IIDReward")
+	}
+
+	ranking := make([]NodeUCBScore, 0, len(nodeScores))
+	for _, score := range nodeScores {
+		score.Score, score.ExplorationBonus = CalculateUCB1TunedScore(score.Mean, score.Count, totalCount)
+		ranking = append(ranking, *score)
+	}
+
+	sort.Slice(ranking, func(i, j int) bool {
+		if ranking[i].Score != ranking[j].Score {
+			return ranking[i].Score > ranking[j].Score
+		}
+		if ranking[i].Mean != ranking[j].Mean {
+			return ranking[i].Mean > ranking[j].Mean
+		}
+		if ranking[i].Count != ranking[j].Count {
+			return ranking[i].Count < ranking[j].Count
+		}
+		return ranking[i].Node < ranking[j].Node
+	})
+
+	return ranking, nil
+}
+
+func (s *Store) GetUCB1TunedProxyRankingForTarget(group, config, target, asnNumber string, isUDP bool) ([]string, []float64, error) {
+	ranking, err := s.GetUCB1TunedRankingForTarget(group, config, target, asnNumber, isUDP)
+	if err != nil {
+		return nil, nil, err
+	}
+	nodes := make([]string, len(ranking))
+	scores := make([]float64, len(ranking))
+	for i, item := range ranking {
+		nodes[i] = item.Node
+		scores[i] = item.Score
+	}
+	return nodes, scores, nil
 }
 
 // 获取目标的最佳代理
