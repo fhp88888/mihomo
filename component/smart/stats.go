@@ -382,36 +382,76 @@ func (r *AtomicStatsRecord) GetWeight(weightType string) float64 {
 
 func (r *AtomicStatsRecord) SetWeight(weightType string, value float64, isUDP bool) {
 	r.weights.Set(weightType, value)
+	r.incrementWeightCount(weightType)
 	if weightType != WeightTypeTCP && weightType != WeightTypeUDP {
 		if isUDP {
 			minUDP := r.avgASNWeight(WeightTypeUDP)
 			if minUDP > 0 {
 				r.weights.Set(WeightTypeUDP, minUDP)
 			}
+			if count := r.sumASNWeightCount(WeightTypeUDP); count > 0 {
+				r.weights.Set(WeightTypeUDP+":count", count)
+			}
 		} else {
 			minTCP := r.avgASNWeight(WeightTypeTCP)
 			if minTCP > 0 {
 				r.weights.Set(WeightTypeTCP, minTCP)
 			}
+			if count := r.sumASNWeightCount(WeightTypeTCP); count > 0 {
+				r.weights.Set(WeightTypeTCP+":count", count)
+			}
 		}
 	}
 }
 
+func (r *AtomicStatsRecord) incrementWeightCount(weightType string) float64 {
+	countKey := weightType + ":count"
+	count := 0.0
+	if value, ok := r.weights.Get(countKey); ok {
+		count = value
+	}
+	count++
+	r.weights.Set(countKey, count)
+	return count
+}
+
+func asnWeightPrefix(prefix string) string {
+	if prefix == WeightTypeUDP {
+		return WeightTypeUDPASN + ":"
+	}
+	return WeightTypeTCPASN + ":"
+}
+
 func (r *AtomicStatsRecord) avgASNWeight(prefix string) float64 {
-	weights := r.weights.FilterByKeyPrefix(prefix)
+	weights := r.weights.FilterByKeyPrefix(asnWeightPrefix(prefix))
 	var sum float64
-	var count int
+	var totalCount float64
 	for k, v := range weights {
-		if k == prefix {
+		if strings.HasSuffix(k, ":count") {
 			continue
 		}
-		sum += v
-		count++
+		count := weights[k+":count"]
+		if count <= 0 {
+			count = 1
+		}
+		sum += v * count
+		totalCount += count
 	}
-	if count == 0 {
+	if totalCount == 0 {
 		return 0.0
 	}
-	return sum / float64(count)
+	return sum / totalCount
+}
+
+func (r *AtomicStatsRecord) sumASNWeightCount(prefix string) float64 {
+	weights := r.weights.FilterByKeyPrefix(asnWeightPrefix(prefix))
+	var count float64
+	for k, v := range weights {
+		if strings.HasSuffix(k, ":count") {
+			count += v
+		}
+	}
+	return count
 }
 
 // 获取节点权重排名缓存
