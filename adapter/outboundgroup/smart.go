@@ -694,14 +694,14 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 
 	trySelector := func(isUDP bool) ([]string, []float64) {
 		// 检查匹配缓存
-		if proxiesName := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber); len(proxiesName) > 0 {
-			return proxiesName, nil
-		}
+		// if proxiesName := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber); len(proxiesName) > 0 {
+		// 	return proxiesName, nil
+		// }
 
 		// 检查预解析缓存
-		if proxiesName, weights := s.store.GetPrefetchResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); len(proxiesName) > 0 {
-			return proxiesName, weights
-		}
+		// if proxiesName, weights := s.store.GetPrefetchResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); len(proxiesName) > 0 {
+		// 	return proxiesName, weights
+		// }
 
 		// 实时计算 UCB1-Tuned 节点排名
 		if proxiesName, scores, err := s.store.GetUCB1ProxyRankingForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
@@ -1313,29 +1313,10 @@ func (s *Smart) logConnectionStats(err error, record *smart.StatsRecord, metadat
 
 	log.Debugln("[Smart] Connection status: [%s], Updated weights: (Model: [%s], TCP: [%.4f], UDP: [%.4f], TCP ASN: [%.4f], UDP ASN: [%.4f], Base: [%.4f], Priority: [%.2f]) "+
 		"For (Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s]) "+
-		"- Current: (Connect: [%s], Latency: [%s], LossRate: [%.2f%%], Up: [%s], Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Duration: [%s]) "+
-		"- Current UCB: (UCBWeight TCP: [%.4f/%.1f], UCBWeight UDP: [%.4f/%.1f], UCBWeight TCP ASN: [%.4f/%.1f], UCBWeight UDP ASN: [%.4f/%.1f]) "+
-		"- History: (Success: [%d], Failure: [%d], EMA Connect: [%s], EMA Latency: [%s], Cumul LossRate: [%.2f%%], Total Up: [%s], Total Down: [%s], Max Up Speed: [%s], Max Down Speed: [%s], Avg Duration: [%s])",
+		"- Current UCB: (UCBWeight TCP: [%.4f/%.1f], UCBWeight UDP: [%.4f/%.1f], UCBWeight TCP ASN: [%.4f/%.1f], UCBWeight UDP ASN: [%.4f/%.1f])",
 		statusStr, weightSource, record.Weights[smart.WeightTypeTCP], record.Weights[smart.WeightTypeUDP], tcpAsnWeight, udpAsnWeight, baseWeight, priorityFactor,
 		s.Name(), proxyName, metadata.NetWork.String(), addressDisplay,
-		formatTimeUnit(float64(connectTime)),
-		formatTimeUnit(float64(latency)),
-		lossRate*100,
-		formatTrafficUnit(uploadTotal*1024*1024, false),
-		formatTrafficUnit(downloadTotal*1024*1024, false),
-		formatTrafficUnit(maxUploadRate*1024, true),
-		formatTrafficUnit(maxDownloadRate*1024, true),
-		formatTimeUnit(float64(connectionDuration)),
 		tcpUCBMean, tcpUCBCount, udpUCBMean, udpUCBCount, tcpAsnUCBMean, tcpAsnUCBCount, udpAsnUCBMean, udpAsnUCBCount,
-		record.Success, record.Failure,
-		formatTimeUnit(float64(record.ConnectTime)),
-		formatTimeUnit(float64(record.Latency)),
-		cumulLossRate*100,
-		formatTrafficUnit(record.UploadTotal*1024*1024, false),
-		formatTrafficUnit(record.DownloadTotal*1024*1024, false),
-		formatTrafficUnit(record.MaxUploadRate*1024, true),
-		formatTrafficUnit(record.MaxDownloadRate*1024, true),
-		formatTimeUnit(record.ConnectionDuration*60000),
 	)
 }
 
