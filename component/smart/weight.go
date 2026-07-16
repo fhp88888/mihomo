@@ -154,7 +154,7 @@ func CalculateIIDReward(input *ModelInput, statusScore float64) float64 {
 	} else if scene == sceneTransfer && uploadMB > downloadMB*2 {
 		uploadWeight, downloadWeight = 0.7, 0.3
 	} else {
-		uploadWeight, downloadWeight = 0.4, 0.6
+		uploadWeight, downloadWeight = 0.1, 0.9
 	}
 	throughputScore := clamp01((uploadFactor*uploadWeight + downloadFactor*downloadWeight) / 1.25)
 	if uploadMB <= 0 && downloadMB <= 0 {
