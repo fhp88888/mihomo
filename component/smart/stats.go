@@ -354,10 +354,10 @@ func (r *AtomicStatsRecord) Add(field string, value interface{}) {
 	}
 }
 
-// CalculateUCB1Score 计算 Discounted UCB1 的 ranking score 和探索项。
-// score = clamped_mean + sqrt(2 * ln(totalCount) / count)
+// CalculateUCB1Score 计算 UCB1 的 ranking score 和探索项。
+// score = reward + sqrt(2 * ln(totalCount) / count)
 // count <= 0 返回 +Inf，优先探索未尝试节点。
-func CalculateUCB1Score(mean float64, count, totalCount float64) (float64, float64) {
+func CalculateUCB1Score(reward float64, count, totalCount float64) (float64, float64) {
 	if count <= 0 {
 		return math.Inf(1), math.Inf(1)
 	}
@@ -365,12 +365,14 @@ func CalculateUCB1Score(mean float64, count, totalCount float64) (float64, float
 		totalCount = count
 	}
 	if totalCount <= 1 {
-		return clamp01(mean), 0
+		return clamp01(reward), 0
 	}
 
-	boundedMean := clamp01(mean)
+	boundedReward := clamp01(reward)
 	explorationBonus := math.Sqrt(2.0 * math.Log(totalCount) / count)
-	return boundedMean + explorationBonus, explorationBonus
+	log.Debugln("[UCB1] reward=%.4f boundedReward=%.4f count=%.0f totalCount=%.0f explorationBonus=%.4f score=%.4f",
+		reward, boundedReward, count, totalCount, explorationBonus, boundedReward+explorationBonus)
+	return boundedReward + explorationBonus, explorationBonus
 }
 
 func (r *AtomicStatsRecord) GetWeight(weightType string) float64 {
@@ -622,7 +624,7 @@ func getWeightType(asnNumber string, isUDP bool) string {
 	return WeightTypeTCP
 }
 
-// 获取目标的 Discounted UCB1 节点排名
+// 获取目标的 UCB1 节点排名
 func (s *Store) GetUCB1RankingForTarget(group, config, target, asnNumber string, isUDP bool) ([]NodeUCBScore, error) {
 	if target == "" {
 		return nil, errors.New("empty target")
@@ -651,7 +653,7 @@ func (s *Store) GetUCB1RankingForTarget(group, config, target, asnNumber string,
 		}
 		oldCount := score.Count
 		newCount := oldCount + count
-		score.Mean = (score.Mean*oldCount + clamp01(mean)*count) / newCount
+		score.Mean = (score.Mean*oldCount + mean*count) / newCount
 		score.Count = newCount
 		totalCount += count
 	}

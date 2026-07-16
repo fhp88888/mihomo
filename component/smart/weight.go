@@ -79,7 +79,7 @@ func clamp01(v float64) float64 {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return 0
 	}
-	return math.Min(1.0, math.Max(0.0, v))
+	return math.Min(3.5, math.Max(0.0, v)) / 3.5
 }
 
 // 计算权重
