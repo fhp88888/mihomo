@@ -988,14 +988,18 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 				bestNodes = v.nodes
 				bestWeights = v.weights
 			} else {
-				bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+				bestNodes, bestWeights, err = s.GetUCB1TunedProxyRankingForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+				// 原 Smart 权重排名暂时停用，使用新的UCB Ranking
+				// bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
 				asnCache[key] = asnCacheValue{
 					nodes:      bestNodes,
 					weights:    bestWeights,
 				}
 			}
 		} else {
-			bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+			bestNodes, bestWeights, err = s.GetUCB1TunedProxyRankingForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+			// 原 Smart 权重排名暂时停用，使用新的UCB Ranking
+			// bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
 		}
 
 		if err != nil || len(bestNodes) == 0 {

@@ -703,10 +703,16 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 			return proxiesName, weights
 		}
 
-		// 实时计算最佳节点
-		if proxiesName, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
-			return proxiesName, weights
+		// 实时计算 UCB1-Tuned 节点排名
+		if proxiesName, scores, err := s.store.GetUCB1TunedProxyRankingForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
+			return proxiesName, scores
 		}
+
+		// 原 Smart 权重排名暂时停用，使用新的UCB Ranking
+
+		// if proxiesName, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
+		// 	return proxiesName, weights
+		// }
 
 		return nil, nil
 	}
