@@ -1213,7 +1213,7 @@ func (s *Smart) checkBlockedNodes() {
 			continue
 		}
 
-		if state.BlockedUntil > 0 && state.BlockedUntil > time.Now().Unix() {
+		if state.BlockedUntil > 0 && state.BlockedUntil < time.Now().Unix() {
 			state.BlockedUntil = 0
 			nodesToUpdate[nodeName] = &state
 			log.Debugln("[Smart] Node [%s] block period expired, unblocking", nodeName)
@@ -1604,7 +1604,7 @@ func (s *Smart) checkNodeQuality(
 		return newWeight, false, false, 0
 	}
 
-	if newWeight < smart.AllowedWeight {
+	if newWeight > 0 && newWeight < smart.AllowedWeight {
 		return newWeight, true, true, 5
 	}
 
