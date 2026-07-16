@@ -354,22 +354,23 @@ func (r *AtomicStatsRecord) Add(field string, value interface{}) {
 	}
 }
 
-func (r *AtomicStatsRecord) GetIIDReward(iidRewardType string) (float64, int64) {
+func (r *AtomicStatsRecord) GetIIDReward(iidRewardType string) (float64, float64) {
 	mean, _ := r.weights.Get(iidRewardType)
-	countFloat, _ := r.weights.Get(iidRewardType + ":count")
-	return mean, int64(countFloat)
+	count, _ := r.weights.Get(iidRewardType + ":count")
+	return mean, count
 }
 
-func (r *AtomicStatsRecord) UpdateIIDReward(iidRewardType string, reward float64) (float64, int64) {
+func (r *AtomicStatsRecord) UpdateIIDReward(iidRewardType string, reward float64) (float64, float64) {
 	oldMean, oldCount := r.GetIIDReward(iidRewardType)
-	newCount := oldCount + 1
-	newMean := oldMean + (reward-oldMean)/float64(newCount)
+	discountedCount := oldCount * DiscountedUCBGamma
+	newCount := discountedCount + 1.0
+	newMean := (oldMean*discountedCount + reward) / newCount
 	r.weights.Set(iidRewardType, newMean)
-	r.weights.Set(iidRewardType+":count", float64(newCount))
+	r.weights.Set(iidRewardType+":count", newCount)
 	return newMean, newCount
 }
 
-func CalculateUCB1TunedScore(mean float64, count, totalCount int64) (float64, float64) {
+func CalculateUCB1TunedScore(mean float64, count, totalCount float64) (float64, float64) {
 	if count <= 0 {
 		return math.Inf(1), math.Inf(1)
 	}
@@ -381,10 +382,7 @@ func CalculateUCB1TunedScore(mean float64, count, totalCount int64) (float64, fl
 	}
 
 	boundedMean := clamp01(mean)
-	lnTotal := math.Log(float64(totalCount))
-	varianceBound := boundedMean * (1.0 - boundedMean)
-	varianceTuned := varianceBound + math.Sqrt(2.0*lnTotal/float64(count))
-	explorationBonus := math.Sqrt((lnTotal / float64(count)) * math.Min(0.25, varianceTuned))
+	explorationBonus := math.Sqrt(2.0 * math.Log(totalCount) / count)
 	return boundedMean + explorationBonus, explorationBonus
 }
 
@@ -605,7 +603,7 @@ func (s *Store) GetUCB1TunedRankingForTarget(group, config, target, asnNumber st
 
 	iidRewardType := getIIDRewardType(asnNumber, isUDP)
 	nodeScores := make(map[string]*NodeUCBScore)
-	var totalCount int64
+	var totalCount float64
 
 	collectRecord := func(nodeName string, record StatsRecord) {
 		if record.Weights == nil {
@@ -615,7 +613,7 @@ func (s *Store) GetUCB1TunedRankingForTarget(group, config, target, asnNumber st
 		if !ok {
 			return
 		}
-		count := int64(record.Weights[iidRewardType+":count"])
+		count := record.Weights[iidRewardType+":count"]
 		if count <= 0 {
 			return
 		}
@@ -626,7 +624,7 @@ func (s *Store) GetUCB1TunedRankingForTarget(group, config, target, asnNumber st
 		}
 		oldCount := score.Count
 		newCount := oldCount + count
-		score.Mean = (score.Mean*float64(oldCount) + clamp01(mean)*float64(count)) / float64(newCount)
+		score.Mean = (score.Mean*oldCount + clamp01(mean)*count) / newCount
 		score.Count = newCount
 		totalCount += count
 	}

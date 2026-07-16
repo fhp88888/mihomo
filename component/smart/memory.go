@@ -44,7 +44,7 @@ type (
 		Node             string
 		Score            float64
 		Mean             float64
-		Count            int64
+		Count            float64
 		ExplorationBonus float64
 	}
 

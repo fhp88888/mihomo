@@ -56,6 +56,7 @@ const (
 	HostFailureNodeTTL      = 24 * time.Hour
 
 	AllowedWeight           = 0.4
+	DiscountedUCBGamma      = 0.95
 
 	RankMostUsed            = "MostUsed"
 	RankOccasional          = "OccasionalUsed"
