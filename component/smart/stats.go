@@ -354,6 +354,25 @@ func (r *AtomicStatsRecord) Add(field string, value interface{}) {
 	}
 }
 
+// CalculateUCB1Score 计算 Discounted UCB1 的 ranking score 和探索项。
+// score = clamped_mean + sqrt(2 * ln(totalCount) / count)
+// count <= 0 返回 +Inf，优先探索未尝试节点。
+func CalculateUCB1Score(mean float64, count, totalCount float64) (float64, float64) {
+	if count <= 0 {
+		return math.Inf(1), math.Inf(1)
+	}
+	if totalCount < count {
+		totalCount = count
+	}
+	if totalCount <= 1 {
+		return clamp01(mean), 0
+	}
+
+	boundedMean := clamp01(mean)
+	explorationBonus := math.Sqrt(2.0 * math.Log(totalCount) / count)
+	return boundedMean + explorationBonus, explorationBonus
+}
+
 func (r *AtomicStatsRecord) GetWeight(weightType string) float64 {
 	if value, ok := r.weights.Get(weightType); ok {
 		return value
@@ -548,6 +567,121 @@ func (s *Store) StoreNodeWeightRanking(group, config string, ranking NodeRank) {
 		Config: config,
 		Data:   data,
 	})
+}
+
+func getWeightType(asnNumber string, isUDP bool) string {
+	if asnNumber != "" && !CdnASNs[asnNumber] {
+		if isUDP {
+			return WeightTypeUDPASN + ":" + asnNumber
+		}
+		return WeightTypeTCPASN + ":" + asnNumber
+	}
+	if isUDP {
+		return WeightTypeUDP
+	}
+	return WeightTypeTCP
+}
+
+// 获取目标的 Discounted UCB1 节点排名
+func (s *Store) GetUCB1RankingForTarget(group, config, target, asnNumber string, isUDP bool) ([]NodeUCBScore, error) {
+	if target == "" {
+		return nil, errors.New("empty target")
+	}
+
+	weightType := getWeightType(asnNumber, isUDP)
+	nodeScores := make(map[string]*NodeUCBScore)
+	var totalCount float64
+
+	collectRecord := func(nodeName string, record StatsRecord) {
+		if record.Weights == nil {
+			return
+		}
+		mean, ok := record.Weights[weightType]
+		if !ok {
+			return
+		}
+		count := record.Weights[weightType+":count"]
+		if count <= 0 {
+			return
+		}
+		score := nodeScores[nodeName]
+		if score == nil {
+			score = &NodeUCBScore{Node: nodeName}
+			nodeScores[nodeName] = score
+		}
+		oldCount := score.Count
+		newCount := oldCount + count
+		score.Mean = (score.Mean*oldCount + clamp01(mean)*count) / newCount
+		score.Count = newCount
+		totalCount += count
+	}
+
+	if asnNumber != "" && !CdnASNs[asnNumber] {
+		allStatsMap, err := s.GetAllStats(group, config)
+		if err != nil {
+			return nil, err
+		}
+		for _, mapStats := range allStatsMap {
+			for nodeName, data := range mapStats {
+				var record StatsRecord
+				if json.Unmarshal(data, &record) != nil {
+					continue
+				}
+				collectRecord(nodeName, record)
+			}
+		}
+	} else {
+		mapStats, err := s.GetStatsForTarget(group, config, target, "")
+		if err != nil {
+			return nil, err
+		}
+		for nodeName, data := range mapStats {
+			var record StatsRecord
+			if json.Unmarshal(data, &record) != nil {
+				continue
+			}
+			collectRecord(nodeName, record)
+		}
+	}
+
+	if len(nodeScores) == 0 {
+		return nil, errors.New("no node with IIDReward")
+	}
+
+	ranking := make([]NodeUCBScore, 0, len(nodeScores))
+	for _, score := range nodeScores {
+		score.Score, score.ExplorationBonus = CalculateUCB1Score(score.Mean, score.Count, totalCount)
+		ranking = append(ranking, *score)
+	}
+
+	sort.Slice(ranking, func(i, j int) bool {
+		if ranking[i].Score != ranking[j].Score {
+			return ranking[i].Score > ranking[j].Score
+		}
+		if ranking[i].Mean != ranking[j].Mean {
+			return ranking[i].Mean > ranking[j].Mean
+		}
+		if ranking[i].Count != ranking[j].Count {
+			return ranking[i].Count < ranking[j].Count
+		}
+		return ranking[i].Node < ranking[j].Node
+	})
+
+	return ranking, nil
+}
+
+func (s *Store) GetUCB1ProxyRankingForTarget(group, config, target, asnNumber string, isUDP bool) ([]string, []float64, error) {
+	ranking, err := s.GetUCB1RankingForTarget(group, config, target, asnNumber, isUDP)
+	if err != nil {
+		return nil, nil, err
+	}
+	nodes := make([]string, len(ranking))
+	scores := make([]float64, len(ranking))
+	for i, item := range ranking {
+		nodes[i] = item.Node
+		scores[i] = item.Score
+	}
+	return nodes, scores, nil
 }
 
 // 获取目标的最佳代理
@@ -839,14 +973,18 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 				bestNodes = v.nodes
 				bestWeights = v.weights
 			} else {
-				bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+				bestNodes, bestWeights, err = s.GetUCB1ProxyRankingForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+				// 原 Smart 权重排名暂时停用，使用新的UCB Ranking
+				// bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
 				asnCache[key] = asnCacheValue{
 					nodes:      bestNodes,
 					weights:    bestWeights,
 				}
 			}
 		} else {
-			bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+			bestNodes, bestWeights, err = s.GetUCB1ProxyRankingForTarget(group, config, active.Target, active.ASN, active.IsUDP)
+			// 原 Smart 权重排名暂时停用，使用新的UCB Ranking
+			// bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
 		}
 
 		if err != nil || len(bestNodes) == 0 {

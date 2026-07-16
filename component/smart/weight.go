@@ -75,6 +75,13 @@ type ModelInput struct {
 	NodeName                   string    // 节点名称
 }
 
+func clamp01(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0
+	}
+	return math.Min(1.0, math.Max(0.0, v))
+}
+
 // 计算权重
 func CalculateWeight(input *ModelInput, priorityFactor float64) (float64, bool) {
 	// 1. 数据准备

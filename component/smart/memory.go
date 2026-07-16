@@ -40,6 +40,14 @@ type (
 		Weight float64
 	}
 
+	NodeUCBScore struct {
+		Node             string
+		Score            float64
+		Mean             float64
+		Count            float64
+		ExplorationBonus float64
+	}
+
 	PrefetchMap struct {
 		TCP         NodesWithWeights `json:"tcp,omitempty"`
 		UDP         NodesWithWeights `json:"udp,omitempty"`
