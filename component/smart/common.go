@@ -36,6 +36,11 @@ const (
 	WeightTypeUDP           = "udp"
 	WeightTypeTCPASN        = "tcp_asn"
 	WeightTypeUDPASN        = "udp_asn"
+
+	IIDRewardTypeTCP        = "iid_reward_tcp"
+	IIDRewardTypeUDP        = "iid_reward_udp"
+	IIDRewardTypeTCPASN     = "iid_reward_tcp_asn"
+	IIDRewardTypeUDPASN     = "iid_reward_udp_asn"
 )
 
 const (

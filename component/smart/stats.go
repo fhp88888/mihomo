@@ -354,6 +354,21 @@ func (r *AtomicStatsRecord) Add(field string, value interface{}) {
 	}
 }
 
+func (r *AtomicStatsRecord) GetIIDReward(iidRewardType string) (float64, int64) {
+	mean, _ := r.weights.Get(iidRewardType)
+	countFloat, _ := r.weights.Get(iidRewardType + ":count")
+	return mean, int64(countFloat)
+}
+
+func (r *AtomicStatsRecord) UpdateIIDReward(iidRewardType string, reward float64) (float64, int64) {
+	oldMean, oldCount := r.GetIIDReward(iidRewardType)
+	newCount := oldCount + 1
+	newMean := oldMean + (reward-oldMean)/float64(newCount)
+	r.weights.Set(iidRewardType, newMean)
+	r.weights.Set(iidRewardType+":count", float64(newCount))
+	return newMean, newCount
+}
+
 func (r *AtomicStatsRecord) GetWeight(weightType string) float64 {
 	if value, ok := r.weights.Get(weightType); ok {
 		return value
