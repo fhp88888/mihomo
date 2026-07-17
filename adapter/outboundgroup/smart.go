@@ -822,83 +822,21 @@ func (s *Smart) startTimedTask(initialDelay, interval time.Duration, taskName st
 }
 
 func (s *Smart) runPrefetch() {
+	// Prefetch is not needed for TS: rankings are computed on-demand per
+	// request via GetTSProxyRankingForTarget.  Keep the timer but skip
+	// the expensive UCB1 computation.
 	proxies := s.GetProxies(true)
-	proxyMap := make(map[string]bool, len(proxies))
-	for _, proxy := range proxies {
-		proxyMap[proxy.Name()] = true
-	}
-	s.store.RunPrefetch(s.Name(), s.configName, proxyMap)
+	log.Debugln("[Smart-TS] Prefetch skipped (TS computes rankings on-demand) group=[%s] proxies=%d",
+		s.Name(), len(proxies))
 }
 
 func (s *Smart) updateNodeRanking() {
+	// The old UCB1-style node ranking (GetNodeWeightRanking) is replaced
+	// by Thompson Sampling.  OU states are persisted to DB on every
+	// connection and ranked on-demand.  This timer is now a no-op.
 	proxies := s.GetProxies(true)
-	rankingWrapper, _ := s.store.GetNodeWeightRankingCache(s.Name(), s.configName)
-
-	if len(rankingWrapper.Result) > 0 {
-		now := time.Now().Unix()
-		lastUpdated := rankingWrapper.LastUpdated
-		cacheAge := time.Duration(now - lastUpdated) * time.Second
-
-		if cacheAge < 30 * time.Minute {
-			rankedNodes := make(map[string]bool, len(rankingWrapper.Result))
-			for _, r := range rankingWrapper.Result {
-				rankedNodes[r.Name] = true
-			}
-			hasUnrankedProxy := false
-			for _, p := range proxies {
-				if !rankedNodes[p.Name()] {
-					hasUnrankedProxy = true
-					break
-				}
-			}
-
-			if !hasUnrankedProxy {
-				if cacheAge <= 10 * time.Minute {
-					return
-				}
-				proxyMap := make(map[string]C.Proxy, len(proxies))
-				for _, p := range proxies {
-					proxyMap[p.Name()] = p
-				}
-				hasDeadRankedNode := false
-				for _, r := range rankingWrapper.Result {
-					if r.Rank != smart.RankRarelyUsed {
-						if p, exists := proxyMap[r.Name]; exists {
-							if !p.AliveForTestUrl(s.testUrl) {
-								hasDeadRankedNode = true
-								break
-							}
-						}
-					}
-				}
-				if !hasDeadRankedNode {
-					return
-				}
-			}
-		}
-	}
-
-	log.Debugln("[Smart] Starting node ranking update for policy group [%s]", s.Name())
-
-	rankingWrapper, err := s.store.GetNodeWeightRanking(s.Name(), s.configName, s.testUrl, proxies)
-	if err != nil {
-		log.Warnln("[Smart] Failed to update node ranking: %v", err)
-		return
-	}
-	if len(rankingWrapper.Result) == 0 {
-		log.Debugln("[Smart] Policy group [%s] doesn't have enough data to generate node ranking", s.Name())
-		return
-	}
-	categoryCounts := make(map[string]int)
-	for _, rank := range rankingWrapper.Result {
-		categoryCounts[rank.Rank]++
-	}
-
-	log.Debugln("[Smart] Policy group [%s] node ranking update completed: %d nodes total (%s: %d, %s: %d, %s: %d)",
-		s.Name(), len(rankingWrapper.Result),
-		smart.RankMostUsed, categoryCounts[smart.RankMostUsed],
-		smart.RankOccasional, categoryCounts[smart.RankOccasional],
-		smart.RankRarelyUsed, categoryCounts[smart.RankRarelyUsed])
+	log.Debugln("[Smart-TS] Node ranking skipped (TS uses on-demand OU ranking) group=[%s] proxies=%d",
+		s.Name(), len(proxies))
 }
 
 func (s *Smart) cleanupOrphanedGroups() {

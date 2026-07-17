@@ -1,11 +1,13 @@
 package smart
 
 import (
+	"encoding/json"
 	"math"
 	"math/rand"
 	"sort"
-	"sync"
 	"time"
+
+	"github.com/metacubex/mihomo/common/lru"
 )
 
 // ────────────────────────────────────────────────────────────
@@ -86,60 +88,90 @@ func TSRank(states map[string]*CellState, prior CellPrior, wr, wt, uFail float64
 }
 
 // ────────────────────────────────────────────────────────────
-// In-memory OU state store (temporary; Phase 5 replaces with DB)
+// OU state DB-backed persistence via *Store
 // ────────────────────────────────────────────────────────────
 
-// ouStateKey builds the in-memory key for a cell.
-// Format: "{group}/{config}/{node}/{asn}_{protocol}"
-func ouStateKey(group, config, node, asn string, isUDP bool) string {
+// ouStateDBKey builds the bbolt key for a cell.
+// Format: "smart/ou_state/{config}/{group}/{node}_{protocol}_{asn}"
+func ouStateDBKey(config, group, node, asn string, isUDP bool) string {
 	proto := "tcp"
 	if isUDP {
 		proto = "udp"
 	}
-	return group + "/" + config + "/" + node + "/" + asn + "_" + proto
+	return FormatDBKey(KeyTypeOUState, config, group, node+"_"+proto+"_"+asn)
 }
 
-// ouStateStore is a temporary in-memory store for OU states.
-// Phase 5 will replace this with bbolt-backed persistence via *Store.
-var (
-	ouStateStoreMu sync.RWMutex
-	ouStateStore   = make(map[string]*CellState)
-)
-
-// getOUState retrieves a cell state from the in-memory store.
-// Returns nil if not found.
-func getOUState(group, config, node, asn string, isUDP bool) *CellState {
-	ouStateStoreMu.RLock()
-	defer ouStateStoreMu.RUnlock()
-	return ouStateStore[ouStateKey(group, config, node, asn, isUDP)]
+// cacheKey builds the in-memory cache key for a cell.
+func ouStateCacheKey(config, group, node, asn string, isUDP bool) string {
+	proto := "tcp"
+	if isUDP {
+		proto = "udp"
+	}
+	return config + "/" + group + "/" + node + "/" + asn + "_" + proto
 }
 
-// putOUState stores a cell state in the in-memory store.
-func putOUState(group, config, node, asn string, isUDP bool, st *CellState) {
-	ouStateStoreMu.Lock()
-	defer ouStateStoreMu.Unlock()
-	ouStateStore[ouStateKey(group, config, node, asn, isUDP)] = st
+// GetOrCreateOUState returns the CellState for a (node, ASN, protocol) cell.
+// It tries the LRU cache first, then bbolt DB, then creates a new state
+// initialised from the prior.
+// ensureOUStateCache initialises ouStateCache lazily (needed for tests).
+func ensureOUStateCache() {
+	if ouStateCache == nil {
+		ouStateCache = lru.New[string, *CellState](
+			lru.WithSize[string, *CellState](500),
+			lru.WithAge[string, *CellState](600),
+		)
+	}
 }
 
-// ────────────────────────────────────────────────────────────
-// Store methods (to be wired into *Store in Phase 5)
-// ────────────────────────────────────────────────────────────
-
-// GetOrCreateOUState returns the CellState for a (node, ASN, protocol) cell,
-// creating one from the given prior if it does not already exist.
 func (s *Store) GetOrCreateOUState(group, config, node, asn string, isUDP bool, prior CellPrior) *CellState {
-	st := getOUState(group, config, node, asn, isUDP)
-	if st != nil {
-		return st
+	ensureOUStateCache()
+	ck := ouStateCacheKey(config, group, node, asn, isUDP)
+
+	// 1. LRU cache hit.
+	if cached, ok := ouStateCache.Get(ck); ok {
+		return cached
 	}
 
+	// 2. Try bbolt DB.
+	dbKey := ouStateDBKey(config, group, node, asn, isUDP)
+	if data, err := s.DBViewGetItem(dbKey); err == nil && len(data) > 0 {
+		var st CellState
+		if json.Unmarshal(data, &st) == nil {
+			ouStateCache.Set(ck, &st)
+			return &st
+		}
+	}
+
+	// 3. Create new.
 	now := time.Now().Unix()
-	st = NewCellState(now, prior)
-	putOUState(group, config, node, asn, isUDP, st)
+	st := NewCellState(now, prior)
+	ouStateCache.Set(ck, st)
 	return st
 }
 
-// UpdateOUState applies an observation to a cell's OU state.
+// saveOUState persists a CellState to the async write queue.
+func (s *Store) saveOUState(group, config, node, asn string, isUDP bool, st *CellState) {
+	data, err := json.Marshal(st)
+	if err != nil {
+		return
+	}
+	s.AppendToGlobalQueue(StoreOperation{
+		Type:   OpSaveOUState,
+		Group:  group,
+		Config: config,
+		Node:   node + "_" + boolToUDPStr(isUDP) + "_" + asn,
+		Data:   data,
+	})
+}
+
+func boolToUDPStr(isUDP bool) string {
+	if isUDP {
+		return "udp"
+	}
+	return "tcp"
+}
+
+// UpdateOUState applies an observation to a cell's OU state and persists.
 func (s *Store) UpdateOUState(group, config, node, asn string, isUDP bool, prior CellPrior, obs ObsResult) {
 	st := s.GetOrCreateOUState(group, config, node, asn, isUDP, prior)
 	now := time.Now().Unix()
@@ -154,6 +186,9 @@ func (s *Store) UpdateOUState(group, config, node, asn string, isUDP bool, prior
 		Yt:   obs.Yt,
 	}
 	st.ApplyObservation(now, prior, ev)
+
+	// Persist to bbolt via async queue.
+	s.saveOUState(group, config, node, asn, isUDP, st)
 }
 
 // GetTSProxyRankingForTarget is the TS replacement for GetUCB1ProxyRankingForTarget.
@@ -229,6 +264,25 @@ func (s *Store) GetTSProxyRankingForTarget(
 	return nodes, scores, nil
 }
 
+// peekOUState looks up a cell state without creating.  Returns nil if
+// not found in cache or DB.
+func (s *Store) peekOUState(group, config, node, asn string, isUDP bool) *CellState {
+	ensureOUStateCache()
+	ck := ouStateCacheKey(config, group, node, asn, isUDP)
+	if cached, ok := ouStateCache.Get(ck); ok {
+		return cached
+	}
+	dbKey := ouStateDBKey(config, group, node, asn, isUDP)
+	if data, err := s.DBViewGetItem(dbKey); err == nil && len(data) > 0 {
+		var st CellState
+		if json.Unmarshal(data, &st) == nil {
+			ouStateCache.Set(ck, &st)
+			return &st
+		}
+	}
+	return nil
+}
+
 // GetStaleNodes returns nodes that have not received a bandit update
 // for more than StaleThreshold * H hours, sorted oldest-first.
 func (s *Store) GetStaleNodes(group, config, asn string, isUDP bool, proxyNames []string) []string {
@@ -236,13 +290,13 @@ func (s *Store) GetStaleNodes(group, config, asn string, isUDP bool, proxyNames 
 	basePrior := DefaultPrior()
 
 	type staleEntry struct {
-		name         string
+		name           string
 		lastUpdateTime int64
 	}
 	var stale []staleEntry
 
 	for _, name := range proxyNames {
-		st := getOUState(group, config, name, asn, isUDP)
+		st := s.peekOUState(group, config, name, asn, isUDP)
 		if st == nil {
 			// Never observed — definitely stale.
 			stale = append(stale, staleEntry{name, 0})

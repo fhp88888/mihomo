@@ -22,6 +22,8 @@ var (
 	blockedNodesCache *lru.LruCache[string, map[string]bool]
 
 	hostStatusCache *lru.LruCache[string, *HostStatus]
+
+	ouStateCache *lru.LruCache[string, *CellState]
 )
 
 type (
@@ -96,6 +98,11 @@ func InitCache() {
 	hostStatusCache = lru.New[string, *HostStatus](
 		lru.WithSize[string, *HostStatus](globalCacheParams.MaxTargets / 4),
 		lru.WithAge[string, *HostStatus](300),
+	)
+
+	ouStateCache = lru.New[string, *CellState](
+		lru.WithSize[string, *CellState](globalCacheParams.MaxTargets / 2),
+		lru.WithAge[string, *CellState](600),
 	)
 }
 
@@ -383,6 +390,7 @@ func (s *Store) AdjustCacheParameters() {
 	dbResultCache = lru.ResetLRU(dbResultCache, cacheSize, lru.WithAge[string, map[string][]byte](300))
 	blockedNodesCache = lru.ResetLRU(blockedNodesCache, cacheSize, lru.WithAge[string, map[string]bool](300))
 	hostStatusCache = lru.ResetLRU(hostStatusCache, cacheSize, lru.WithAge[string, *HostStatus](300))
+	ouStateCache = lru.ResetLRU(ouStateCache, cacheSize*2, lru.WithAge[string, *CellState](600))
 	go s.FlushQueue(true)
 }
 
@@ -397,6 +405,7 @@ func (s *Store) clearCache(level string, config string, group string) {
 		dbResultCache.Clear()
 		blockedNodesCache.Clear()
 		hostStatusCache.Clear()
+		ouStateCache.Clear()
 		return
 	}
 

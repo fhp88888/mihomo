@@ -136,6 +136,10 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 		if depth == 5 {
 			strict = true
 		}
+	case KeyTypeOUState:
+		if depth == 4 {
+			strict = true
+		}
 	case KeyTypeRanking:
 		if depth == 4 {
 			strict = true
@@ -192,6 +196,13 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 				}
 				result[FormatDBKey(KeyTypeHostFailures, op.Config, op.Group, op.Target)] = op.Data
 			}
+		case KeyTypeOUState:
+			if op.Type == OpSaveOUState && op.Node != "" {
+				if depth >= 5 && seg4 != op.Node {
+					continue
+				}
+				result[FormatDBKey(KeyTypeOUState, op.Config, op.Group, op.Node)] = op.Data
+			}
 		}
 	}
 
@@ -208,7 +219,7 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 	var groupPrefix string
 
 	switch keyType {
-	case KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures, KeyTypeRanking:
+	case KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures, KeyTypeRanking, KeyTypeOUState:
 		if depth >= 4 {
 			hasGroupLevel = true
 			groupPrefix = FormatDBKey(keyType, config, group)

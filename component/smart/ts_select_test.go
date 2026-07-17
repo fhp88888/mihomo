@@ -7,13 +7,6 @@ import (
 	"time"
 )
 
-// clearOUStore resets the in-memory OU state store between tests.
-func clearOUStore() {
-	ouStateStoreMu.Lock()
-	defer ouStateStoreMu.Unlock()
-	ouStateStore = make(map[string]*CellState)
-}
-
 // ── TSScore ──────────────────────────────────────────────────────────
 
 func TestTSScore_ConfidentGood(t *testing.T) {
@@ -198,7 +191,6 @@ func TestTSRank_Deterministic(t *testing.T) {
 // ── GetOrCreateOUState ───────────────────────────────────────────────
 
 func TestGetOrCreateOUState_CreatesNew(t *testing.T) {
-	clearOUStore()
 	s := &Store{}
 	prior := DefaultPrior()
 
@@ -212,7 +204,6 @@ func TestGetOrCreateOUState_CreatesNew(t *testing.T) {
 }
 
 func TestGetOrCreateOUState_ReturnsExisting(t *testing.T) {
-	clearOUStore()
 	s := &Store{}
 	prior := DefaultPrior()
 
@@ -226,7 +217,6 @@ func TestGetOrCreateOUState_ReturnsExisting(t *testing.T) {
 }
 
 func TestGetOrCreateOUState_DifferentCells(t *testing.T) {
-	clearOUStore()
 	s := &Store{}
 	prior := DefaultPrior()
 
@@ -253,7 +243,6 @@ func TestGetOrCreateOUState_DifferentCells(t *testing.T) {
 // ── UpdateOUState ────────────────────────────────────────────────────
 
 func TestUpdateOUState_AppliesObservation(t *testing.T) {
-	clearOUStore()
 	s := &Store{}
 	prior := DefaultPrior()
 
@@ -270,7 +259,6 @@ func TestUpdateOUState_AppliesObservation(t *testing.T) {
 // ── GetTSProxyRankingForTarget ───────────────────────────────────────
 
 func TestGetTSProxyRankingForTarget_Basic(t *testing.T) {
-	clearOUStore()
 	s := &Store{}
 
 	// Pre-populate one good and one bad node.
@@ -304,7 +292,6 @@ func TestGetTSProxyRankingForTarget_Basic(t *testing.T) {
 }
 
 func TestGetTSProxyRankingForTarget_Empty(t *testing.T) {
-	clearOUStore()
 	s := &Store{}
 
 	nodes, scores, err := s.GetTSProxyRankingForTarget("g", "c", "t", "", false, nil)
@@ -320,7 +307,6 @@ func TestGetTSProxyRankingForTarget_Empty(t *testing.T) {
 }
 
 func TestGetTSProxyRankingForTarget_ASNHierarchical(t *testing.T) {
-	clearOUStore()
 	s := &Store{}
 	prior := DefaultPrior()
 
@@ -341,7 +327,7 @@ func TestGetTSProxyRankingForTarget_ASNHierarchical(t *testing.T) {
 	}
 
 	// The child should exist separately.
-	child := getOUState("g", "c", "node", "AS1234", false)
+	child := s.peekOUState("g", "c", "node", "AS1234", false)
 	if child == nil {
 		t.Fatal("expected child state to be created")
 	}
@@ -355,7 +341,6 @@ func TestGetTSProxyRankingForTarget_ASNHierarchical(t *testing.T) {
 // ── GetStaleNodes ────────────────────────────────────────────────────
 
 func TestGetStaleNodes_NeverObserved(t *testing.T) {
-	clearOUStore()
 	s := &Store{}
 
 	stale := s.GetStaleNodes("g", "c", "", false, []string{"new_node"})
@@ -368,7 +353,6 @@ func TestGetStaleNodes_NeverObserved(t *testing.T) {
 }
 
 func TestGetStaleNodes_RecentlyUpdated(t *testing.T) {
-	clearOUStore()
 	s := &Store{}
 	prior := DefaultPrior()
 
@@ -382,7 +366,6 @@ func TestGetStaleNodes_RecentlyUpdated(t *testing.T) {
 }
 
 func TestGetStaleNodes_OldUpdate(t *testing.T) {
-	clearOUStore()
 	s := &Store{}
 	prior := DefaultPrior()
 

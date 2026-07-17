@@ -23,6 +23,7 @@ const (
 	OpSavePrefetch
 	OpSaveRanking
 	OpSaveHostFailures
+	OpSaveOUState
 )
 
 const (
@@ -31,6 +32,7 @@ const (
 	KeyTypeStats            = "stats"
 	KeyTypeRanking          = "ranking"
 	KeyTypeHostFailures     = "failures"
+	KeyTypeOUState          = "ou_state"
 
 	WeightTypeTCP           = "tcp"
 	WeightTypeUDP           = "udp"
@@ -159,6 +161,8 @@ func formatOperationKey(op *StoreOperation) string {
 		return FormatDBKey(KeyTypeRanking, op.Config, op.Group)
 	case OpSaveHostFailures:
 		return FormatDBKey(KeyTypeHostFailures, op.Config, op.Group, op.Target)
+	case OpSaveOUState:
+		return FormatDBKey(KeyTypeOUState, op.Config, op.Group, op.Node)
 	default:
 		return ""
 	}
