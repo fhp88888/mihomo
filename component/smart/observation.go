@@ -51,6 +51,8 @@ func ExtractObservations(
 	downloadTotal float64,
 	uploadTotal float64,
 	connectionDur int64,
+	maxDownloadRate float64,
+	maxUploadRate float64,
 	hardTimeout time.Duration,
 ) ObsResult {
 	var r ObsResult
@@ -65,11 +67,9 @@ func ExtractObservations(
 	}
 
 	// ── Yt: transfer quality (only when enough traffic) ───────
-	// Forward-looking: currently wt=0 so this is always false.
-	// Kept for future use when wt > 0.
 	if downloadTotal+uploadTotal >= minTrafficMB && float64(connectionDur) >= minTrafficDuration {
 		r.HasT = true
-		r.Yt = extractTransferQuality(downloadTotal, uploadTotal, connectionDur)
+		r.Yt = extractTransferQuality(maxDownloadRate, maxUploadRate)
 	}
 
 	return r
@@ -140,21 +140,15 @@ func extractResponseQuality(connectTime, latency int64, hardTimeout time.Duratio
 }
 
 // extractTransferQuality computes the logit-transformed transfer-quality
-// score Yt from throughput and loss rate.
+// score Yt from the maximum recorded download and upload rates.
 //
-// This is a placeholder for future use (wt > 0).  The scoring formula
-// will be refined when Yt observations are enabled.
-func extractTransferQuality(downloadMB, uploadMB float64, connectionDur int64) float64 {
-	durSec := float64(connectionDur) / 1000.0
-	if durSec <= 0 {
-		durSec = 0.001
-	}
-
+//	throughput = maxDownloadRate + maxUploadRate  (MB/s)
+func extractTransferQuality(maxDownloadRate, maxUploadRate float64) float64 {
 	// Throughput in MB/s — higher is better.
-	throughput := (downloadMB + uploadMB) / durSec
+	throughput := maxDownloadRate + maxUploadRate
 
-	// Log-scale score: ~1 MB/s → 0.5, ~10 MB/s → ~0.8, ~100 MB/s → ~0.95
-	rawScore := 1.0 - math.Exp(-throughput/5.0)
+	// Log-scale score.
+	rawScore := 1.0 - math.Exp(-throughput/1.5)
 
 	Yt := clampEps(rawScore)
 	return Logit(Yt)

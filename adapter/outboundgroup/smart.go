@@ -1415,10 +1415,13 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	// ── Extract OU observations ─────────────────────────────
 	uploadTotalMB := float64(uploadTotal) / (1024.0 * 1024.0)
 	downloadTotalMB := float64(downloadTotal) / (1024.0 * 1024.0)
+	maxUploadRateMB := float64(maxUploadRate) / (1024.0 * 1024.0)
+	maxDownloadRateMB := float64(maxDownloadRate) / (1024.0 * 1024.0)
 
 	obs := smart.ExtractObservations(
 		err, connectTime, latency,
 		downloadTotalMB, uploadTotalMB, connectionDuration,
+		maxDownloadRateMB, maxUploadRateMB,
 		C.DefaultTCPTimeout,
 	)
 
