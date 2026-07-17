@@ -53,7 +53,6 @@ const (
 	maxSelected              = 10
 
 	parallelDials            = 5
-	connectThreshold         = 5.0
 )
 
 var (
@@ -90,7 +89,11 @@ type Smart struct {
 	sampleRate             float64
 	useLightGBM            bool
 	collectData            bool
-	preferASN	           bool
+	preferASN              bool
+
+	// Tracks which connection UUIDs are bandit-eligible (first serial attempt
+	// or stale probe).  Entries are cleaned up in recordConnectionStats.
+	banditEligible         sync.Map
 }
 
 type dialResult struct {
@@ -247,14 +250,12 @@ func (s *Smart) singleDialContext(ctx context.Context, proxy C.Proxy, metadata *
 func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	getBatch := func(proxies []C.Proxy, i int) ([]C.Proxy, time.Duration) {
 		var batch []C.Proxy
-		var historyConnectTime int64
-		var timeout time.Duration
 		if len(proxies) == 1 {
 			batch = proxies[0:1]
 		} else if i == 0 {
 			batch = proxies[0:1]
 		} else {
-			begin := 1 + (i-1) * parallelDials
+			begin := 1 + (i-1)*parallelDials
 			if begin >= len(proxies) {
 				return nil, 0
 			}
@@ -265,22 +266,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			batch = proxies[begin:end]
 		}
 
-		for _, p := range batch {
-			hct := s.getHistoryConnectStats(metadata, p)
-			if hct > historyConnectTime {
-				historyConnectTime = hct
-			}
-		}
-
-		if historyConnectTime > 0 {
-			timeout = time.Duration(float64(historyConnectTime) * connectThreshold) * time.Millisecond
-		}
-
-		if timeout > C.DefaultTCPTimeout || timeout <= 0 {
-			timeout = C.DefaultTCPTimeout
-		}
-
-		return batch, timeout
+		return batch, C.DefaultTCPTimeout
 	}
 
 	tryDial := func(proxies []C.Proxy, asnNumber string) (C.Conn, error) {
@@ -289,6 +275,13 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			batch, timeout := getBatch(proxies, i)
 			if len(batch) == 0 {
 				break
+			}
+
+			// First batch (i=0) and stale probes are bandit-eligible.
+			if i == 0 || metadata.SmartBlock == "stale-probe" {
+				metaKey := fmt.Sprintf("%p", metadata)
+			log.Debugln("[Smart-TS] STORE bandit key=[%s] uuid=[%s]", metaKey, metadata.UUID)
+			s.banditEligible.Store(metaKey, true)
 			}
 
 			ctxDial, cancel := context.WithTimeout(ctx, timeout)
@@ -337,14 +330,14 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 		}
 
 		for a := 0; a < attempts; a++ {
-			historyConnectTime := s.getHistoryConnectStats(metadata, proxy)
-			var timeout time.Duration
-			if historyConnectTime > 0 {
-				timeout = time.Duration(float64(historyConnectTime)*connectThreshold) * time.Millisecond
+			// First attempt of first proxy (or stale probe) is bandit-eligible.
+			if i == 0 && a == 0 || metadata.SmartBlock == "stale-probe" {
+				metaKey := fmt.Sprintf("%p", metadata)
+			log.Debugln("[Smart-TS] STORE bandit key=[%s] uuid=[%s]", metaKey, metadata.UUID)
+			s.banditEligible.Store(metaKey, true)
 			}
-			if timeout > C.DefaultUDPTimeout || timeout <= 0 {
-				timeout = C.DefaultUDPTimeout
-			}
+
+			timeout := C.DefaultUDPTimeout
 			ctxDial, cancel := context.WithTimeout(ctx, timeout)
 			start := time.Now()
 			pc, err = proxy.ListenPacketContext(ctxDial, metadata)
@@ -693,34 +686,44 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 		}
 	}
 
+	proxyNames := make([]string, len(proxies))
+	for i, p := range proxies {
+		proxyNames[i] = p.Name()
+	}
+
 	trySelector := func(isUDP bool) ([]string, []float64) {
-		// 检查匹配缓存
-		// if proxiesName := s.store.GetUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber); len(proxiesName) > 0 {
-		// 	return proxiesName, nil
-		// }
-
-		// 检查预解析缓存
-		// if proxiesName, weights := s.store.GetPrefetchResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); len(proxiesName) > 0 {
-		// 	return proxiesName, weights
-		// }
-
-		// 实时计算 UCB1-Tuned 节点排名
-		if proxiesName, scores, err := s.store.GetUCB1ProxyRankingForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
+		// Thompson Sampling 排名 (OU + TS, replaces UCB1).
+		if proxiesName, scores, err := s.store.GetTSProxyRankingForTarget(
+			s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP, proxyNames,
+		); err == nil && len(proxiesName) > 0 {
 			return proxiesName, scores
 		}
-
-		// 原 Smart 权重排名暂时停用，使用新的UCB Ranking
-
-		// if proxiesName, weights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, metadata.SmartTarget, asnNumber, isUDP); err == nil && len(proxiesName) > 0 {
-		// 	return proxiesName, weights
-		// }
-
 		return nil, nil
 	}
 
 	isUDP := metadata.NetWork == C.UDP
 	resultNames, resultWeights := trySelector(isUDP)
 	result := s.filterProxies(metadata, wildcardTarget, resultNames, resultWeights, proxies, maxSelected, isUDP)
+
+	// ── Stale probe prepend ──────────────────────────────────
+	// Bump the oldest stale node (if any) to the front so it gets a
+	// bandit-eligible dial on the next request.
+	if len(result) > 1 {
+		staleNames := s.store.GetStaleNodes(s.Name(), s.configName, asnNumber, isUDP, proxyNames)
+		if len(staleNames) > 0 {
+			oldest := staleNames[0]
+			for i, p := range result {
+				if p.Name() == oldest && i > 0 {
+					// Move to front.
+					copy(result[1:i+1], result[0:i])
+					result[0] = p
+					break
+				}
+			}
+			// Mark as stale probe so it becomes bandit-eligible.
+			metadata.SmartBlock = "stale-probe"
+		}
+	}
 
 	return result, asnNumber
 }
@@ -960,15 +963,6 @@ func (s *Smart) cleanupOrphanedNodeCache() {
 			log.Warnln("[Smart] Failed to clean up non-existent node caches: %v", err)
 		}
 	}
-}
-
-// 获取历史 connectTime
-func (s *Smart) getHistoryConnectStats(metadata *C.Metadata, proxy C.Proxy) int64 {
-	target := metadata.SmartTarget
-	proxyName := proxy.Name()
-	cacheKey := smart.FormatDBKey(smart.KeyTypeStats, s.configName, s.Name(), target, proxyName)
-	atomicRecord := s.store.GetOrCreateAtomicRecord(cacheKey, s.Name(), s.configName, target, proxyName)
-	return atomicRecord.Get("connectTime").(int64)
 }
 
 // 连接持续时间更新
@@ -1321,6 +1315,36 @@ func (s *Smart) logConnectionStats(err error, record *smart.StatsRecord, metadat
 	)
 }
 
+// logTSConnectionStats logs connection results for the Thompson Sampling path.
+func (s *Smart) logTSConnectionStats(err error, obs smart.ObsResult, isBandit bool,
+	addressDisplay, proxyName string, metadata *C.Metadata,
+	connectTime, latency int64, uploadTotal, downloadTotal float64,
+	connectionDuration int64, asnInfo string, isUDP bool) {
+
+	statusStr := "closed"
+	if err != nil {
+		statusStr = "failed"
+	}
+
+	banditStr := "safety-only"
+	if isBandit {
+		banditStr = "bandit"
+	}
+
+	protoStr := "tcp"
+	if isUDP {
+		protoStr = "udp"
+	}
+
+	log.Debugln("[Smart-TS] Connection: [%s] bandit=[%s] proto=[%s] S=[%v/%v] Yr=[%v/%.3f] Yt=[%v/%.3f] "+
+		"For (Group: [%s] - Node: [%s] - Address: [%s]) "+
+		"- Metrics: connect=%dms latency=%dms up=%.2fMB down=%.2fMB dur=%dms asn=[%s]",
+		statusStr, banditStr, protoStr, obs.HasS, obs.S, obs.HasR, obs.Yr, obs.HasT, obs.Yt,
+		s.Name(), proxyName, addressDisplay,
+		connectTime, latency, uploadTotal, downloadTotal, connectionDuration, asnInfo,
+	)
+}
+
 // 数据收集
 func (s *Smart) collectConnectionData(input *smart.ModelInput, metadata *C.Metadata,
 	baseWeight float64, proxyName string, ModelPredicted bool) {
@@ -1363,18 +1387,12 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		return
 	}
 
-	var lossRate float64
-	var cumulLossRate float64
-	var calculatedWeight float64
-	var ModelPredicted bool
-
 	proxyName := proxy.Name()
 	isUDP := metadata.NetWork == C.UDP
 	networkStr := metadata.NetWork.String()
 
 	target := metadata.SmartTarget
 	wildcardTarget := smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
-	cacheKey := smart.FormatDBKey(smart.KeyTypeStats, s.configName, s.Name(), target, proxyName)
 	asnInfo := s.getASNCode(metadata)
 	priorityFactor := s.getPriorityFactor(proxyName)
 
@@ -1389,21 +1407,33 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 		addressDisplay = fmt.Sprintf("IP: [%s] - Target: [%s] - ASN: [%s]", metadata.DstIP.String(), target, asnDisplay)
 	}
 
-	weightType := smart.WeightTypeTCP
-	if asnInfo != "" {
-		if isUDP {
-			weightType = smart.WeightTypeUDPASN + ":" + asnInfo
-		} else {
-			weightType = smart.WeightTypeTCPASN + ":" + asnInfo
-		}
-	} else if isUDP {
-		weightType = smart.WeightTypeUDP
+	// ── Bandit eligibility (logging only) ───────────────────
+	metaKey := fmt.Sprintf("%p", metadata)
+	_, isBandit := s.banditEligible.LoadAndDelete(metaKey)
+	log.Debugln("[Smart-TS] LOAD bandit key=[%s] uuid=[%s] found=[%v]", metaKey, metadata.UUID, isBandit)
+
+	// ── Extract OU observations ─────────────────────────────
+	uploadTotalMB := float64(uploadTotal) / (1024.0 * 1024.0)
+	downloadTotalMB := float64(downloadTotal) / (1024.0 * 1024.0)
+
+	obs := smart.ExtractObservations(
+		err, connectTime, latency,
+		downloadTotalMB, uploadTotalMB, connectionDuration,
+		C.DefaultTCPTimeout,
+	)
+
+	// ── OU state update (bandit learning) ───────────────────
+	if obs.Observed() {
+		prior := smart.DefaultPrior()
+		s.store.UpdateOUState(s.Name(), s.configName, proxyName, asnInfo, isUDP, prior, obs)
 	}
 
+	// ── Safety / health metrics (always updated) ────────────
 	lock := smart.GetTargetNodeLock(target, s.Name(), proxyName)
 	lock.Lock()
 	defer lock.Unlock()
 
+	cacheKey := smart.FormatDBKey(smart.KeyTypeStats, s.configName, s.Name(), target, proxyName)
 	atomicRecord := s.store.GetOrCreateAtomicRecord(cacheKey, s.Name(), s.configName, target, proxyName)
 
 	switch {
@@ -1417,20 +1447,19 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	if connectTime > 0 {
 		oldConnectTime := atomicRecord.Get("connectTime").(int64)
-		newConnectTime := updateEMAInt(oldConnectTime, connectTime)
-		atomicRecord.Set("connectTime", newConnectTime)
+		atomicRecord.Set("connectTime", updateEMAInt(oldConnectTime, connectTime))
 	}
 
 	if latency > 0 {
 		oldLatency := atomicRecord.Get("latency").(int64)
-		newLatency := updateEMAInt(oldLatency, latency)
-		atomicRecord.Set("latency", newLatency)
+		atomicRecord.Set("latency", updateEMAInt(oldLatency, latency))
 	}
 
 	if connectionDuration > 0 {
 		s.updateConnectionDuration(atomicRecord, connectionDuration)
 	}
 
+	var lossRate, cumulLossRate float64
 	if tcpStats != nil {
 		atomicRecord.Add("cumulSent", int64(tcpStats.TotalSent()))
 		atomicRecord.Add("cumulRetrans", int64(tcpStats.TotalRetrans()))
@@ -1443,81 +1472,79 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	if lossRate > 0 {
 		oldLossRate := atomicRecord.Get("lossRate").(float64)
-		newLossRate := updateEMAFloat(oldLossRate, lossRate)
-		atomicRecord.Set("lossRate", newLossRate)
+		atomicRecord.Set("lossRate", updateEMAFloat(oldLossRate, lossRate))
 	}
 
-	oldWeight := atomicRecord.GetWeight(weightType)
-	uploadTotalMB := float64(uploadTotal) / (1024.0 * 1024.0)
-	downloadTotalMB := float64(downloadTotal) / (1024.0 * 1024.0)
 	maxUploadRateKB := float64(maxUploadRate) / 1024.0
 	maxDownloadRateKB := float64(maxDownloadRate) / 1024.0
 
 	atomicRecord.Add("uploadTotal", uploadTotalMB)
 	atomicRecord.Add("downloadTotal", downloadTotalMB)
 
-	oldMaxUploadRate := atomicRecord.Get("maxUploadRate").(float64)
-	if maxUploadRateKB > oldMaxUploadRate {
+	if oldMaxUR := atomicRecord.Get("maxUploadRate").(float64); maxUploadRateKB > oldMaxUR {
 		atomicRecord.Set("maxUploadRate", maxUploadRateKB)
 	}
-
-	oldMaxDownloadRate := atomicRecord.Get("maxDownloadRate").(float64)
-	if maxDownloadRateKB > oldMaxDownloadRate {
+	if oldMaxDR := atomicRecord.Get("maxDownloadRate").(float64); maxDownloadRateKB > oldMaxDR {
 		atomicRecord.Set("maxDownloadRate", maxDownloadRateKB)
 	}
 
-	input := lightgbm.CreateModelInputFromStatsRecord(
-		atomicRecord, metadata,
-		uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, float64(connectionDuration) / 60000.0, wildcardTarget,
-		lossRate, cumulLossRate,
-	)
-	input.ConnectionFailed = err != nil
+	atomicRecord.Set("lastUsed", time.Now().Unix())
 
-	if s.useLightGBM && s.weightModel != nil {
-		calculatedWeight, ModelPredicted = s.weightModel.PredictWeight(input, priorityFactor)
-	} else {
-		calculatedWeight, ModelPredicted = smart.CalculateWeight(input, priorityFactor)
-	}
-
-	// 额外检查和权重调整
-	// 不再进行强制权重调整，仅在异常时对特定域名屏蔽节点，防止优秀节点被整个 target 完全屏蔽
-	adjWeight, isDegraded, checked, blockCode := s.checkNodeQuality(
+	// ── Quality / degradation checks (safety, not bandit) ───
+	isDegraded, checked, blockCode := s.checkNodeQuality(
 		err, metadata, proxy, wildcardTarget,
-		addressDisplay, proxyName, calculatedWeight, oldWeight,
+		addressDisplay, proxyName,
 		connectionDuration, uploadTotalMB, downloadTotalMB,
 		networkStr, asnInfo, isUDP)
 
-	// 针对具体 域名/IP 屏蔽节点
 	failedBlock := s.store.UpdateHostStatus(s.Name(), s.configName, wildcardTarget, metadata, proxyName, s.maxFailedTimes, isDegraded, checked, blockCode)
 
 	if isDegraded || failedBlock {
 		s.findSameConnection(metadata, proxyName, target, asnInfo)
 	}
 
-	// 平均权重(适应 target 调整为 rule based 和 asn based 的情况)
-	newWeight := updateEMAFloat(oldWeight, adjWeight)
-	atomicRecord.Set("lastUsed", time.Now().Unix())
-	atomicRecord.SetWeight(weightType, newWeight, isUDP)
-	statsSnapshot := atomicRecord.CreateStatsSnapshot(cacheKey)
-	s.saveStatsRecord(target, proxy, statsSnapshot)
-
-	if s.collectData {
-		collectedWeight := adjWeight / priorityFactor
-		if isDegraded || failedBlock {
-			// 对于异常连接强制调整，便于模型训练时进行识别
-			if collectedWeight >= smart.AllowedWeight {
-				collectedWeight = collectedWeight * 0.1
+	// ── LightGBM path (optional, preserved as-is) ───────────
+	if s.useLightGBM && s.weightModel != nil {
+		weightType := smart.WeightTypeTCP
+		if asnInfo != "" {
+			if isUDP {
+				weightType = smart.WeightTypeUDPASN + ":" + asnInfo
 			} else {
-				if collectedWeight == 0 {
-					collectedWeight = smart.AllowedWeight * rand.Float64()
-				}
+				weightType = smart.WeightTypeTCPASN + ":" + asnInfo
 			}
+		} else if isUDP {
+			weightType = smart.WeightTypeUDP
 		}
-		s.collectConnectionData(input, metadata, collectedWeight, proxyName, ModelPredicted)
-	}
 
-	s.logConnectionStats(err, statsSnapshot, metadata, calculatedWeight / priorityFactor, priorityFactor, addressDisplay, proxyName,
-		connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, asnInfo, ModelPredicted, lossRate, cumulLossRate)
+		input := lightgbm.CreateModelInputFromStatsRecord(
+			atomicRecord, metadata,
+			uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, float64(connectionDuration)/60000.0, wildcardTarget,
+			lossRate, cumulLossRate,
+		)
+		input.ConnectionFailed = err != nil
+
+		calculatedWeight, ModelPredicted := s.weightModel.PredictWeight(input, priorityFactor)
+		oldWeight := atomicRecord.GetWeight(weightType)
+		newWeight := updateEMAFloat(oldWeight, calculatedWeight)
+		atomicRecord.SetWeight(weightType, newWeight, isUDP)
+
+		if s.collectData {
+			collectedWeight := calculatedWeight / priorityFactor
+			s.collectConnectionData(input, metadata, collectedWeight, proxyName, ModelPredicted)
+		}
+
+		statsSnapshot := atomicRecord.CreateStatsSnapshot(cacheKey)
+		s.saveStatsRecord(target, proxy, statsSnapshot)
+		s.logConnectionStats(err, statsSnapshot, metadata, calculatedWeight/priorityFactor, priorityFactor, addressDisplay, proxyName,
+			connectTime, latency, uploadTotalMB, downloadTotalMB, maxUploadRateKB, maxDownloadRateKB, connectionDuration, asnInfo, true, lossRate, cumulLossRate)
+	} else {
+		// Save safety stats even without LightGBM.
+		statsSnapshot := atomicRecord.CreateStatsSnapshot(cacheKey)
+		s.saveStatsRecord(target, proxy, statsSnapshot)
+
+		// Log TS decision details.
+		s.logTSConnectionStats(err, obs, isBandit, addressDisplay, proxyName, metadata, connectTime, latency, uploadTotalMB, downloadTotalMB, connectionDuration, asnInfo, isUDP)
+	}
 }
 
 func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, firstReadLatency *atomic.Int64, firstReadErr *atomic.TypedValue[error], firstWriteErr *atomic.TypedValue[error]) C.Conn {
@@ -1575,15 +1602,16 @@ func (s *Smart) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Pr
 	})
 }
 
+// checkNodeQuality performs safety / health checks that may degrade or block
+// a node independently of the bandit state.  Returns (isDegraded, checked, blockCode).
 func (s *Smart) checkNodeQuality(
 	err error, metadata *C.Metadata, proxy C.Proxy, wildcardTarget string,
 	addressDisplay, proxyName string,
-	newWeight, oldWeight float64,
 	connectionDuration int64, uploadTotal, downloadTotal float64,
-	networkType string, asnInfo string, isUDP bool) (float64, bool, bool, int64) {
+	networkType string, asnInfo string, isUDP bool) (bool, bool, int64) {
 
 	if s.selected != "" {
-		return newWeight, false, false, 0
+		return false, false, 0
 	}
 
 	now := time.Now().Unix()
@@ -1591,39 +1619,35 @@ func (s *Smart) checkNodeQuality(
 	// 用户手动/智能屏蔽
 	if metadata.SmartBlock == "blocked" || metadata.SmartBlock == "degraded" {
 		if metadata.SmartBlock == "degraded" {
-			return oldWeight, false, false, 0
+			return false, false, 0
 		}
 		log.Debugln("[Smart] Connection Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s] detected manual block...",
 			s.Name(), proxyName, networkType, addressDisplay)
-		return newWeight, true, true, 1
+		return true, true, 1
 	}
 
 	_, wtLastCheck, wtLastFailure, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget)
 
 	if wtBlocked {
-		return newWeight, false, false, 0
-	}
-
-	if newWeight > 0 && newWeight < smart.AllowedWeight {
-		return newWeight, true, true, 5
+		return false, false, 0
 	}
 
 	if err != nil {
-		return newWeight, false, true, 3
+		return false, true, 3
 	}
 
 	// 零流量连接
 	if connectionDuration > 100 && downloadTotal == 0 && uploadTotal == 0 && metadata.DstPort == 443 && !isUDP {
 		log.Debugln("[Smart] Connection Group: [%s] - Node: [%s] - Network: [%s] - Address: [%s] detected zero-traffic...",
 			s.Name(), proxyName, networkType, addressDisplay)
-		return newWeight, true, true, 4
+		return true, true, 4
 	}
 
 	// 异常状态码检测
 	if downloadTotal < 0.03 && metadata.Host != "" && metadata.DstPort == 443 && !isUDP {
 		var failure bool
 		var checked bool
-		if now - wtLastCheck > 300 || now - wtLastFailure < 300 {
+		if now-wtLastCheck > 300 || now-wtLastFailure < 300 {
 			checked = true
 			status, ok, err := s.StatusTest(proxy, metadata.Host)
 			if err == nil {
@@ -1635,12 +1659,12 @@ func (s *Smart) checkNodeQuality(
 			}
 		}
 		if failure {
-			return newWeight, true, checked, 2
+			return true, checked, 2
 		}
-		return newWeight, false, checked, 0
+		return false, checked, 0
 	}
 
-	return newWeight, false, false, 0
+	return false, false, 0
 }
 
 func (s *Smart) findSameConnection(metadata *C.Metadata, proxyName, target, asnInfo string) {
