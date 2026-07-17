@@ -21,8 +21,8 @@ import (
 	"github.com/dlclark/regexp2"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
-	"github.com/metacubex/mihomo/common/xsync"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/mmdb"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
@@ -280,7 +280,6 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			// First batch (i=0) and stale probes are bandit-eligible.
 			if i == 0 || metadata.SmartBlock == "stale-probe" {
 				metaKey := fmt.Sprintf("%p", metadata)
-			log.Debugln("[Smart-TS] STORE bandit key=[%s] uuid=[%s]", metaKey, metadata.UUID)
 			s.banditEligible.Store(metaKey, true)
 			}
 
@@ -333,7 +332,6 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 			// First attempt of first proxy (or stale probe) is bandit-eligible.
 			if i == 0 && a == 0 || metadata.SmartBlock == "stale-probe" {
 				metaKey := fmt.Sprintf("%p", metadata)
-			log.Debugln("[Smart-TS] STORE bandit key=[%s] uuid=[%s]", metaKey, metadata.UUID)
 			s.banditEligible.Store(metaKey, true)
 			}
 
@@ -1348,7 +1346,6 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	// ── Bandit eligibility (logging only) ───────────────────
 	metaKey := fmt.Sprintf("%p", metadata)
 	_, isBandit := s.banditEligible.LoadAndDelete(metaKey)
-	log.Debugln("[Smart-TS] LOAD bandit key=[%s] uuid=[%s] found=[%v]", metaKey, metadata.UUID, isBandit)
 
 	// ── Extract OU observations ─────────────────────────────
 	uploadTotalMB := float64(uploadTotal) / (1024.0 * 1024.0)
