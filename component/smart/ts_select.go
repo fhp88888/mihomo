@@ -17,15 +17,15 @@ import (
 const (
 	// DefaultUfail is the utility assigned to a failed connection.
 	// p·q + (1-p)·Ufail penalises nodes with low success probability.
-	DefaultUfail = -0.1
+	DefaultUfail = -0.2
 
 	// DefaultWr is the default weight for response quality in the
 	// composite quality score q = wr·g(zr) + wt·g(zt).
-	DefaultWr = 0.5
+	DefaultWr = 0.6
 
 	// DefaultWt is the default weight for transfer quality.
 	// Set to 0 initially; can be raised when Yt observations are enabled.
-	DefaultWt = 0.0
+	DefaultWt = 0.2
 )
 
 // ────────────────────────────────────────────────────────────
