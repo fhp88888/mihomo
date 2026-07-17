@@ -69,10 +69,17 @@ func TSScore(state *CellState, prior CellPrior, wr, wt, uFail float64, rng *rand
 // Each node's state is PredictToNow'd before sampling.  The same *rand.Rand
 // is used for all nodes, ensuring a consistent comparison within one request.
 //
+// priors maps node names to their per-node OU prior (mean-reversion centre
+// and noise).  If a node has no entry, DefaultPrior() is used.
+//
 // Returns nodes sorted by score descending, then by name for determinism.
-func TSRank(states map[string]*CellState, prior CellPrior, wr, wt, uFail float64, rng *rand.Rand) []NodeWithWeight {
+func TSRank(states map[string]*CellState, priors map[string]CellPrior, wr, wt, uFail float64, rng *rand.Rand) []NodeWithWeight {
 	result := make([]NodeWithWeight, 0, len(states))
 	for name, st := range states {
+		prior, ok := priors[name]
+		if !ok {
+			prior = DefaultPrior()
+		}
 		score := TSScore(st, prior, wr, wt, uFail, rng)
 		result = append(result, NodeWithWeight{Node: name, Weight: score})
 	}
@@ -191,6 +198,81 @@ func (s *Store) UpdateOUState(group, config, node, asn string, isUDP bool, prior
 	s.saveOUState(group, config, node, asn, isUDP, st)
 }
 
+// warmStartParentPrior computes a warm-start prior for a node × protocol
+// parent by aggregating the node's success/failure counts across all known
+// targets from the old stats table.  If insufficient data exists it falls
+// back to DefaultPrior().
+func (s *Store) warmStartParentPrior(group, config, node string, isUDP bool) CellPrior {
+	// If no DB backend (tests), return neutral prior.
+	if db == nil {
+		return DefaultPrior()
+	}
+	// Try to read aggregate stats from the old stats table.
+	allStats, err := s.GetAllStats(group, config)
+	if err != nil || len(allStats) == 0 {
+		return DefaultPrior()
+	}
+
+	var totalSuccess, totalFailure int64
+	var sumConnectTime, sumLatency int64
+	var sumMaxDR, sumMaxUR float64
+	var countWithLatency, countWithRate float64
+
+	for _, nodeStats := range allStats {
+		data, ok := nodeStats[node]
+		if !ok {
+			continue
+		}
+		var record StatsRecord
+		if json.Unmarshal(data, &record) != nil {
+			continue
+		}
+		totalSuccess += record.Success
+		totalFailure += record.Failure
+
+		if record.ConnectTime > 0 || record.Latency > 0 {
+			sumConnectTime += record.ConnectTime
+			sumLatency += record.Latency
+			countWithLatency++
+		}
+		if record.MaxDownloadRate > 0 || record.MaxUploadRate > 0 {
+			sumMaxDR += record.MaxDownloadRate
+			sumMaxUR += record.MaxUploadRate
+			countWithRate++
+		}
+	}
+
+	total := totalSuccess + totalFailure
+	if total < 3 {
+		return DefaultPrior()
+	}
+
+	prior := DefaultPrior()
+
+	// S: aggregate success rate → log-odds (shrink toward 0.5).
+	shrunkRate := float64(totalSuccess+1) / float64(total+2)
+	prior.MS = Logit(clampEps(shrunkRate))
+	prior.VfS = DefaultVfS / math.Sqrt(float64(total)+1)
+
+	// Yr: reuse extractResponseQuality on avg response time.
+	if countWithLatency > 0 {
+		avgCT := sumConnectTime / int64(countWithLatency)
+		avgLat := sumLatency / int64(countWithLatency)
+		prior.MR = extractResponseQuality(avgCT, avgLat, 5*time.Second)
+		prior.VfR = DefaultVfR / math.Sqrt(countWithLatency+1)
+	}
+
+	// Yt: reuse extractTransferQuality on avg throughput.
+	if countWithRate > 0 {
+		avgDR := sumMaxDR / countWithRate
+		avgUR := sumMaxUR / countWithRate
+		prior.MT = extractTransferQuality(avgDR, avgUR)
+		prior.VfT = DefaultVfT / math.Sqrt(countWithRate+1)
+	}
+
+	return prior
+}
+
 // GetTSProxyRankingForTarget is the TS replacement for GetUCB1ProxyRankingForTarget.
 //
 // It ranks the given proxyNames for the specified (target, asn, protocol) using
@@ -208,7 +290,6 @@ func (s *Store) GetTSProxyRankingForTarget(
 		return nil, nil, nil
 	}
 
-	basePrior := DefaultPrior()
 	wr := DefaultWr
 	wt := DefaultWt
 	uFail := DefaultUfail
@@ -219,40 +300,40 @@ func (s *Store) GetTSProxyRankingForTarget(
 
 	// ── Build states map ────────────────────────────────────
 	states := make(map[string]*CellState, len(proxyNames))
+	priors := make(map[string]CellPrior, len(proxyNames))
 	isASN := asn != "" && !CdnASNs[asn]
 
 	for _, name := range proxyNames {
 		var st *CellState
+		var scoringPrior CellPrior
+		scoringPrior = DefaultPrior()
 
 		if isASN {
 			// Hierarchical: parent = node × protocol, child = node × ASN × protocol.
-			parent := s.GetOrCreateOUState(group, config, name, "", isUDP, basePrior)
+			parentPrior := s.warmStartParentPrior(group, config, name, isUDP)
+			parent := s.GetOrCreateOUState(group, config, name, "", isUDP, parentPrior)
 			childPrior := parent.DerivedPrior(2.0) // inflate parent variance ×2
 			st = s.GetOrCreateOUState(group, config, name, asn, isUDP, childPrior)
+
 			// Wire the child's mean-reversion centre to the parent's current mean.
-			childPrior.MS = parent.MuS
-			childPrior.MR = parent.MuR
-			childPrior.MT = parent.MuT
-			// Update the child's prior (only the m parameters change over time).
-			st.PredictToNow(time.Now().Unix(), childPrior)
-			// Use child for scoring, but with the parent-wired prior.
-			states[name] = st
-			// Override prior for scoring:
-			// we pass childPrior (with parent means) to TSRank through a
-			// per-node prior.  For simplicity we use basePrior with parent
-			// means baked in.
-			_ = childPrior
+			scoringPrior = childPrior
+			scoringPrior.MS = parent.MuS
+			scoringPrior.MR = parent.MuR
+			scoringPrior.MT = parent.MuT
+
+			// Predict child to now using the parent-wired prior.
+			st.PredictToNow(time.Now().Unix(), scoringPrior)
 		} else {
-			st = s.GetOrCreateOUState(group, config, name, asn, isUDP, basePrior)
+			parentPrior := s.warmStartParentPrior(group, config, name, isUDP)
+			st = s.GetOrCreateOUState(group, config, name, asn, isUDP, parentPrior)
+			scoringPrior = parentPrior
 		}
 		states[name] = st
+		priors[name] = scoringPrior
 	}
 
-	// ── Rank ────────────────────────────────────────────────
-	// For the per-node prior we use basePrior; the hierarchical wiring
-	// is applied through the cell's own OU transition (m is baked into
 	// each cell via the prior it was created with).
-	ranked := TSRank(states, basePrior, wr, wt, uFail, rng)
+	ranked := TSRank(states, priors, wr, wt, uFail, rng)
 
 	nodes := make([]string, len(ranked))
 	scores := make([]float64, len(ranked))

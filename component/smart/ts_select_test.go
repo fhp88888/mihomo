@@ -151,7 +151,7 @@ func TestTSRank_Sorting(t *testing.T) {
 
 	states := map[string]*CellState{"good": good, "bad": bad}
 	rng := rand.New(rand.NewSource(77))
-	ranked := TSRank(states, prior, 0.5, 0.0, -0.1, rng)
+	ranked := TSRank(states, nil, 0.5, 0.0, -0.1, rng)
 
 	if len(ranked) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(ranked))
@@ -178,10 +178,10 @@ func TestTSRank_Deterministic(t *testing.T) {
 	states := map[string]*CellState{"a": st}
 
 	rng1 := rand.New(rand.NewSource(42))
-	r1 := TSRank(states, prior, 0.5, 0.0, -0.1, rng1)
+	r1 := TSRank(states, nil, 0.5, 0.0, -0.1, rng1)
 
 	rng2 := rand.New(rand.NewSource(42))
-	r2 := TSRank(states, prior, 0.5, 0.0, -0.1, rng2)
+	r2 := TSRank(states, nil, 0.5, 0.0, -0.1, rng2)
 
 	if r1[0].Weight != r2[0].Weight {
 		t.Errorf("same seed should give same score: %.6f != %.6f", r1[0].Weight, r2[0].Weight)
