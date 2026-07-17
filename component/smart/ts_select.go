@@ -377,6 +377,7 @@ func (s *Store) peekOUState(group, config, node, asn string, isUDP bool) *CellSt
 func (s *Store) GetStaleNodes(group, config, asn string, isUDP bool, proxyNames []string) []string {
 	now := time.Now().Unix()
 	basePrior := DefaultPrior()
+	isASN := asn != "" && !CdnASNs[asn]
 
 	type staleEntry struct {
 		name             string
@@ -392,7 +393,15 @@ func (s *Store) GetStaleNodes(group, config, asn string, isUDP bool, proxyNames 
 			continue
 		}
 		if st.IsStale(now, basePrior) {
-			stale = append(stale, staleEntry{name, st.LastObservedAt()})
+			lastObserved := st.LastObservedAt()
+			if lastObserved == 0 && isASN {
+				if parent := s.peekOUState(group, config, name, "", isUDP); parent != nil && !parent.IsStale(now, basePrior) {
+					continue
+				} else if parent != nil {
+					lastObserved = parent.LastObservedAt()
+				}
+			}
+			stale = append(stale, staleEntry{name, lastObserved})
 		}
 	}
 

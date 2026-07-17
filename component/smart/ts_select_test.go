@@ -380,6 +380,21 @@ func TestGetStaleNodes_OldUpdate(t *testing.T) {
 	}
 }
 
+func TestGetStaleNodes_ASNChildUsesFreshParent(t *testing.T) {
+	s := &Store{}
+	prior := DefaultPrior()
+
+	parent := s.GetOrCreateOUState("g", "c", "node", "", false, prior)
+	parent.LastObservationTime = time.Now().Unix()
+	child := s.GetOrCreateOUState("g", "c", "node", "AS1234", false, parent.DerivedPrior(2.0))
+	child.LastObservationTime = 0
+
+	stale := s.GetStaleNodes("g", "c", "AS1234", false, []string{"node"})
+	if len(stale) != 0 {
+		t.Errorf("fresh parent should prevent ASN child stale probe: got %v", stale)
+	}
+}
+
 // ── sampleNormal ─────────────────────────────────────────────────────
 
 func TestSampleNormal_ZeroStd(t *testing.T) {

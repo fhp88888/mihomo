@@ -531,14 +531,19 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 	for _, name := range names {
 		proxy := proxyByName[name]
 		if proxy != nil && !blockedNodes[name] && (wtBlocked || !wtFailNodes[name]) && proxy.AliveForTestUrl(s.testUrl) && (!isUDP || proxy.SupportUDP()) {
-			if weights == nil {
-				selected = append(selected, proxy)
-				continue
-			}
-			// TS scores are utilities, not legacy UCB weights; do not apply the
-			// old absolute AllowedWeight threshold here.
 			selected = append(selected, proxy)
 		}
+	}
+
+	if weights != nil && len(s.policyPriority) > 0 && len(selected) > 1 {
+		sort.SliceStable(selected, func(i, j int) bool {
+			ni, nj := selected[i].Name(), selected[j].Name()
+			fi, fj := s.getPriorityFactor(ni), s.getPriorityFactor(nj)
+			if fi != fj {
+				return fi > fj
+			}
+			return false
+		})
 	}
 
 	// Unwrap result should not filled
@@ -1365,7 +1370,15 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	// ── OU state update (bandit learning) ───────────────────
 	if isBandit && obs.Observed() {
 		prior := smart.DefaultPrior()
-		s.store.UpdateOUState(s.Name(), s.configName, proxyName, asnInfo, isUDP, prior, obs)
+		if asnInfo != "" && !smart.CdnASNs[asnInfo] {
+			// Keep the node×protocol parent learning alongside the ASN child so
+			// hierarchical warm starts reflect recent ASN-scoped observations.
+			s.store.UpdateOUState(s.Name(), s.configName, proxyName, "", isUDP, prior, obs)
+			parent := s.store.GetOrCreateOUState(s.Name(), s.configName, proxyName, "", isUDP, prior)
+			s.store.UpdateOUState(s.Name(), s.configName, proxyName, asnInfo, isUDP, parent.DerivedPrior(2.0), obs)
+		} else {
+			s.store.UpdateOUState(s.Name(), s.configName, proxyName, asnInfo, isUDP, prior, obs)
+		}
 	}
 
 	// ── Safety / health metrics (always updated) ────────────
