@@ -51,8 +51,7 @@ const (
 
 	maxRetries               = 3
 	maxSelected              = 10
-
-	parallelDials            = 5
+	waveDialInterval         = 200 * time.Millisecond
 )
 
 var (
@@ -171,8 +170,13 @@ func (s *Smart) GetConfigFilename() string {
 	return s.configName
 }
 
-// ref: component/dialer/dialer.go:314
-func (s *Smart) ParallelDialContext(ctx context.Context, proxies []C.Proxy, metadata *C.Metadata, start time.Time, singleDialFunc func(context.Context, C.Proxy, *C.Metadata, time.Time) (C.Conn, int64, error)) (C.Proxy, C.Conn, int64, error) {
+func (s *Smart) WaveDialContext(ctx context.Context, proxies []C.Proxy, metadata *C.Metadata, start time.Time, singleDialFunc func(context.Context, C.Proxy, *C.Metadata, time.Time) (C.Conn, int64, error)) (C.Proxy, C.Conn, int64, error) {
+	if len(proxies) > maxSelected {
+		proxies = proxies[:maxSelected]
+	}
+	if len(proxies) == 0 {
+		return nil, nil, 0, os.ErrDeadlineExceeded
+	}
 	if len(proxies) == 1 {
 		conn, connectTime, err := singleDialFunc(ctx, proxies[0], metadata, start)
 		return proxies[0], conn, connectTime, err
@@ -184,16 +188,32 @@ func (s *Smart) ParallelDialContext(ctx context.Context, proxies []C.Proxy, meta
 
 	results := make(chan dialResult, n)
 
-	for i := 0; i < n; i++ {
-		go func(proxyIndex int) {
-			conn, connectTime, err := singleDialFunc(childCtx, proxies[proxyIndex], metadata, start)
-			results <- dialResult{
-				proxyIndex:  proxyIndex,
-				conn:        conn,
-				connectTime: connectTime,
-				error:       err,
-			}
-		}(i)
+	nextIndex := 0
+	launched := 0
+	waveSize := 1
+	launchWave := func(waveStart time.Time) {
+		count := waveSize
+		if remaining := n - nextIndex; count > remaining {
+			count = remaining
+		}
+
+		for i := 0; i < count; i++ {
+			proxyIndex := nextIndex
+			nextIndex++
+			launched++
+
+			go func(proxyIndex int) {
+				conn, connectTime, err := singleDialFunc(childCtx, proxies[proxyIndex], metadata, waveStart)
+				results <- dialResult{
+					proxyIndex:  proxyIndex,
+					conn:        conn,
+					connectTime: connectTime,
+					error:       err,
+				}
+			}(proxyIndex)
+		}
+
+		waveSize *= 2
 	}
 
 	drainRemaining := func(pending int) {
@@ -206,19 +226,53 @@ func (s *Smart) ParallelDialContext(ctx context.Context, proxies []C.Proxy, meta
 		}()
 	}
 
+	var waveTimer *time.Timer
+	var waveC <-chan time.Time
+	scheduleNextWave := func() {
+		if nextIndex >= n {
+			waveC = nil
+			return
+		}
+		if waveTimer == nil {
+			waveTimer = time.NewTimer(waveDialInterval)
+		} else {
+			waveTimer.Reset(waveDialInterval)
+		}
+		waveC = waveTimer.C
+	}
+	defer func() {
+		if waveTimer != nil {
+			waveTimer.Stop()
+		}
+	}()
+
+	launchWave(start)
+	scheduleNextWave()
+
 	errs := make([]error, 0, n)
-	for received := 0; received < n; received++ {
+	for received := 0; received < launched || nextIndex < n; {
 		select {
 		case res := <-results:
+			received++
 			if res.error == nil {
 				cancel()
-				drainRemaining(n - received - 1)
+				drainRemaining(launched - received)
 				return proxies[res.proxyIndex], res.conn, res.connectTime, nil
+			}
+			if tunnel.ShouldStopRetry(res.error) {
+				cancel()
+				drainRemaining(launched - received)
+				return nil, nil, 0, res.error
 			}
 			errs = append(errs, res.error)
 
+		case <-waveC:
+			launchWave(time.Now())
+			scheduleNextWave()
+
 		case <-ctx.Done():
-			drainRemaining(n - received)
+			cancel()
+			drainRemaining(launched - received)
 			return nil, nil, 0, ctx.Err()
 		}
 	}
@@ -248,67 +302,31 @@ func (s *Smart) singleDialContext(ctx context.Context, proxy C.Proxy, metadata *
 }
 
 func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	getBatch := func(proxies []C.Proxy, i int) ([]C.Proxy, time.Duration) {
-		var batch []C.Proxy
-		if len(proxies) == 1 {
-			batch = proxies[0:1]
-		} else if i == 0 {
-			batch = proxies[0:1]
-		} else {
-			begin := 1 + (i-1)*parallelDials
-			if begin >= len(proxies) {
-				return nil, 0
-			}
-			end := begin + parallelDials
-			if end > len(proxies) {
-				end = len(proxies)
-			}
-			batch = proxies[begin:end]
-		}
-
-		return batch, C.DefaultTCPTimeout
+	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
+	if len(proxies) > maxSelected {
+		proxies = proxies[:maxSelected]
 	}
 
-	tryDial := func(proxies []C.Proxy, asnNumber string) (C.Conn, error) {
-		var finalErr error
-		for i := 0; i < maxRetries; i++ {
-			batch, timeout := getBatch(proxies, i)
-			if len(batch) == 0 {
-				break
-			}
+	// The first ranked attempt is bandit-eligible. Later waves are safety-only
+	// because they are part of the rescue race rather than a clean choice sample.
+	if len(proxies) > 1 {
+		s.banditEligible.Store(s.banditKey(metadata, proxies[0].Name()), true)
+	}
 
-			// The first serial attempt is bandit-eligible. Single-proxy fallback and
-			// later parallel batches are safety-only because there is no clean choice
-			// sample to learn from.
-			if len(proxies) > 1 && i == 0 {
-				s.banditEligible.Store(s.banditKey(metadata, batch[0].Name()), true)
-			}
+	ctxDial, cancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
+	defer cancel()
 
-			ctxDial, cancel := context.WithTimeout(ctx, timeout)
-			start := time.Now()
-			p, c, connectTime, err := s.ParallelDialContext(ctxDial, batch, metadata, start, s.singleDialContext)
-			cancel()
-
-			if err != nil {
-				if tunnel.ShouldStopRetry(err) {
-					return nil, err
-				}
-				finalErr = err
-			} else {
-				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, []C.Proxy{p})
-				return s.WrapConnWithMetric(c, p, metadata, connectTime), nil
-			}
-		}
-
+	start := time.Now()
+	p, c, connectTime, err := s.WaveDialContext(ctxDial, proxies, metadata, start, s.singleDialContext)
+	if err != nil {
 		if len(proxies) == 1 {
 			s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber)
 		}
-
-		return nil, finalErr
+		return nil, err
 	}
 
-	proxies, asnNumber := s.selectProxies(metadata, s.GetProxies(true))
-	return tryDial(proxies, asnNumber)
+	s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, []C.Proxy{p})
+	return s.WrapConnWithMetric(c, p, metadata, connectTime), nil
 }
 
 func (s *Smart) banditKey(metadata *C.Metadata, proxyName string) string {
