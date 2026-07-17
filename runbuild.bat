@@ -1,0 +1,1 @@
+$env:GOOS="windows"; $env:GOARCH="amd64"; $env:GOAMD64="v3"; go build -o mihomo-windows-amd64.exe .
