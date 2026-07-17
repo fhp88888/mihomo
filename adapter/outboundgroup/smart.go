@@ -277,10 +277,11 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 				break
 			}
 
-			// First batch (i=0) and stale probes are bandit-eligible.
-			if i == 0 || metadata.SmartBlock == "stale-probe" {
-				metaKey := fmt.Sprintf("%p", metadata)
-			s.banditEligible.Store(metaKey, true)
+			// The first serial attempt is bandit-eligible. Single-proxy fallback and
+			// later parallel batches are safety-only because there is no clean choice
+			// sample to learn from.
+			if len(proxies) > 1 && i == 0 {
+				s.banditEligible.Store(s.banditKey(metadata, batch[0].Name()), true)
 			}
 
 			ctxDial, cancel := context.WithTimeout(ctx, timeout)
@@ -310,6 +311,10 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 	return tryDial(proxies, asnNumber)
 }
 
+func (s *Smart) banditKey(metadata *C.Metadata, proxyName string) string {
+	return fmt.Sprintf("%p/%s", metadata, proxyName)
+}
+
 func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (pc C.PacketConn, err error) {
 	var finalErr error
 
@@ -329,10 +334,10 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 		}
 
 		for a := 0; a < attempts; a++ {
-			// First attempt of first proxy (or stale probe) is bandit-eligible.
-			if i == 0 && a == 0 || metadata.SmartBlock == "stale-probe" {
-				metaKey := fmt.Sprintf("%p", metadata)
-			s.banditEligible.Store(metaKey, true)
+			// The first serial attempt is bandit-eligible. Single-proxy retry and later
+			// fallbacks are safety-only because there is no clean choice sample to learn from.
+			if !singleProxyRetry && i == 0 && a == 0 {
+				s.banditEligible.Store(s.banditKey(metadata, proxy.Name()), true)
 			}
 
 			timeout := C.DefaultUDPTimeout
@@ -523,16 +528,16 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 	}
 
 	selected := make([]C.Proxy, 0, minCount+1)
-	for i, name := range names {
+	for _, name := range names {
 		proxy := proxyByName[name]
 		if proxy != nil && !blockedNodes[name] && (wtBlocked || !wtFailNodes[name]) && proxy.AliveForTestUrl(s.testUrl) && (!isUDP || proxy.SupportUDP()) {
-			w := 0.0
-			if weights != nil && i < len(weights) {
-				w = weights[i]
-			}
-			if weights == nil || w >= smart.AllowedWeight {
+			if weights == nil {
 				selected = append(selected, proxy)
+				continue
 			}
+			// TS scores are utilities, not legacy UCB weights; do not apply the
+			// old absolute AllowedWeight threshold here.
+			selected = append(selected, proxy)
 		}
 	}
 
@@ -704,22 +709,20 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 	result := s.filterProxies(metadata, wildcardTarget, resultNames, resultWeights, proxies, maxSelected, isUDP)
 
 	// ── Stale probe prepend ──────────────────────────────────
-	// Bump the oldest stale node (if any) to the front so it gets a
-	// bandit-eligible dial on the next request.
+	// Bump the oldest stale node (if any) to the front so the normal first
+	// serial attempt records a bandit sample for it.
 	if len(result) > 1 {
 		staleNames := s.store.GetStaleNodes(s.Name(), s.configName, asnNumber, isUDP, proxyNames)
-		if len(staleNames) > 0 {
-			oldest := staleNames[0]
+		for _, staleName := range staleNames {
 			for i, p := range result {
-				if p.Name() == oldest && i > 0 {
-					// Move to front.
-					copy(result[1:i+1], result[0:i])
-					result[0] = p
-					break
+				if p.Name() == staleName {
+					if i > 0 {
+						copy(result[1:i+1], result[0:i])
+						result[0] = p
+					}
+					return result, asnNumber
 				}
 			}
-			// Mark as stale probe so it becomes bandit-eligible.
-			metadata.SmartBlock = "stale-probe"
 		}
 	}
 
@@ -1344,8 +1347,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	}
 
 	// ── Bandit eligibility (logging only) ───────────────────
-	metaKey := fmt.Sprintf("%p", metadata)
-	_, isBandit := s.banditEligible.LoadAndDelete(metaKey)
+	_, isBandit := s.banditEligible.LoadAndDelete(s.banditKey(metadata, proxyName))
 
 	// ── Extract OU observations ─────────────────────────────
 	uploadTotalMB := float64(uploadTotal) / (1024.0 * 1024.0)
@@ -1361,7 +1363,7 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 	)
 
 	// ── OU state update (bandit learning) ───────────────────
-	if obs.Observed() {
+	if isBandit && obs.Observed() {
 		prior := smart.DefaultPrior()
 		s.store.UpdateOUState(s.Name(), s.configName, proxyName, asnInfo, isUDP, prior, obs)
 	}

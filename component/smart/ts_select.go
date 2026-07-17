@@ -43,14 +43,24 @@ const (
 // The caller provides a *rand.Rand so that all nodes in one request
 // share the same random source (one sample per request).
 func TSScore(state *CellState, prior CellPrior, wr, wt, uFail float64, rng *rand.Rand) float64 {
+	if state == nil {
+		return uFail
+	}
+
+	// Score on a copy so ranking/prediction never mutates persisted freshness.
+	scoringState := state.Clone()
+	if scoringState == nil {
+		return uFail
+	}
+
 	// Predict to now.
 	now := time.Now().Unix()
-	state.PredictToNow(now, prior)
+	scoringState.PredictToNow(now, prior)
 
 	// Sample from posteriors.
-	zs := sampleNormal(state.MuS, math.Sqrt(state.PS), rng)
-	zr := sampleNormal(state.MuR, math.Sqrt(state.PR), rng)
-	zt := sampleNormal(state.MuT, math.Sqrt(state.PT), rng)
+	zs := sampleNormal(scoringState.MuS, math.Sqrt(scoringState.PS), rng)
+	zr := sampleNormal(scoringState.MuR, math.Sqrt(scoringState.PR), rng)
+	zt := sampleNormal(scoringState.MuT, math.Sqrt(scoringState.PT), rng)
 
 	// Success probability.
 	p := sigmoid(zs)
@@ -321,8 +331,6 @@ func (s *Store) GetTSProxyRankingForTarget(
 			scoringPrior.MR = parent.MuR
 			scoringPrior.MT = parent.MuT
 
-			// Predict child to now using the parent-wired prior.
-			st.PredictToNow(time.Now().Unix(), scoringPrior)
 		} else {
 			parentPrior := s.warmStartParentPrior(group, config, name, isUDP)
 			st = s.GetOrCreateOUState(group, config, name, asn, isUDP, parentPrior)
@@ -371,8 +379,8 @@ func (s *Store) GetStaleNodes(group, config, asn string, isUDP bool, proxyNames 
 	basePrior := DefaultPrior()
 
 	type staleEntry struct {
-		name           string
-		lastUpdateTime int64
+		name             string
+		lastObservedTime int64
 	}
 	var stale []staleEntry
 
@@ -384,12 +392,12 @@ func (s *Store) GetStaleNodes(group, config, asn string, isUDP bool, proxyNames 
 			continue
 		}
 		if st.IsStale(now, basePrior) {
-			stale = append(stale, staleEntry{name, st.LastUpdateTime})
+			stale = append(stale, staleEntry{name, st.LastObservedAt()})
 		}
 	}
 
 	sort.Slice(stale, func(i, j int) bool {
-		return stale[i].lastUpdateTime < stale[j].lastUpdateTime
+		return stale[i].lastObservedTime < stale[j].lastObservedTime
 	})
 
 	result := make([]string, len(stale))

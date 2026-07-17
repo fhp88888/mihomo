@@ -85,9 +85,14 @@ type CellState struct {
 	MuT float64 `json:"mu_t"`
 	PT  float64 `json:"p_t"`
 
-	// LastUpdateTime is the Unix timestamp (seconds) of the most recent
-	// observation that was applied to this cell.
+	// LastUpdateTime is the Unix timestamp (seconds) of the current latent
+	// state after any time-propagation step.
 	LastUpdateTime int64 `json:"last_update_time"`
+
+	// LastObservationTime is the Unix timestamp (seconds) of the most recent
+	// real observation that was applied to this cell. Pure scoring/ranking must
+	// not mutate this value.
+	LastObservationTime int64 `json:"last_observation_time,omitempty"`
 
 	// ── Fixed-lag checkpoint buffer ──────────────────────────
 	// The checkpoint stores the cell state at CheckpointTime.
@@ -152,13 +157,14 @@ func DefaultPrior() CellPrior {
 // variance (×4), reflecting high initial uncertainty.
 func NewCellState(now int64, prior CellPrior) *CellState {
 	return &CellState{
-		MuS:            prior.MS,
-		PS:             prior.VfS * 4.0,
-		MuR:            prior.MR,
-		PR:             prior.VfR * 4.0,
-		MuT:            prior.MT,
-		PT:             prior.VfT * 4.0,
-		LastUpdateTime: now,
+		MuS:                 prior.MS,
+		PS:                  prior.VfS * 4.0,
+		MuR:                 prior.MR,
+		PR:                  prior.VfR * 4.0,
+		MuT:                 prior.MT,
+		PT:                  prior.VfT * 4.0,
+		LastUpdateTime:      now,
+		LastObservationTime: 0,
 	}
 }
 
@@ -186,10 +192,17 @@ func (cs *CellState) DerivedPrior(inflation float64) CellPrior {
 	return p
 }
 
-// IsStale returns true when the cell has not received an observation for
+// LastObservedAt returns the Unix timestamp of the most recent real
+// observation. A zero value means the cell has never observed a bandit sample.
+func (cs *CellState) LastObservedAt() int64 {
+	return cs.LastObservationTime
+}
+
+// IsStale returns true when the cell has not received a real observation for
 // more than StaleThreshold * H hours.
 func (cs *CellState) IsStale(now int64, prior CellPrior) bool {
-	hoursSince := float64(now-cs.LastUpdateTime) / 3600.0
+	lastObserved := cs.LastObservedAt()
+	hoursSince := float64(now-lastObserved) / 3600.0
 	return hoursSince > StaleThreshold*prior.H
 }
 
@@ -230,6 +243,19 @@ func (cs *CellState) PredictToNow(now int64, prior CellPrior) {
 	cs.PT = clampMinP(rho2*cs.PT + prior.VfT*oneMinusRho2)
 
 	cs.LastUpdateTime = now
+}
+
+// Clone returns a deep copy of the cell state so callers can score or predict
+// without mutating the persisted state.
+func (cs *CellState) Clone() *CellState {
+	if cs == nil {
+		return nil
+	}
+	clone := *cs
+	if len(cs.EventsAfterCP) > 0 {
+		clone.EventsAfterCP = append([]CellEvent(nil), cs.EventsAfterCP...)
+	}
+	return &clone
 }
 
 // ────────────────────────────────────────────────────────────
@@ -297,6 +323,10 @@ func (cs *CellState) UpdateTransfer(now int64, prior CellPrior, yt float64) {
 // It handles out-of-order arrival by rolling back to the checkpoint when
 // necessary and replaying buffered events in chronological order.
 func (cs *CellState) ApplyObservation(now int64, prior CellPrior, ev CellEvent) {
+	if ev.Time > cs.LastObservationTime {
+		cs.LastObservationTime = ev.Time
+	}
+
 	// Common case: event arrives in order (or this is the first event).
 	if ev.Time >= cs.LastUpdateTime {
 		cs.applyEventInPlace(now, prior, ev)

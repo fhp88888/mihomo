@@ -357,7 +357,7 @@ func TestGetStaleNodes_RecentlyUpdated(t *testing.T) {
 	prior := DefaultPrior()
 
 	st := s.GetOrCreateOUState("g", "c", "active", "", false, prior)
-	st.LastUpdateTime = time.Now().Unix() // just now
+	st.LastObservationTime = time.Now().Unix() // just now
 
 	stale := s.GetStaleNodes("g", "c", "", false, []string{"active"})
 	if len(stale) != 0 {
@@ -370,9 +370,9 @@ func TestGetStaleNodes_OldUpdate(t *testing.T) {
 	prior := DefaultPrior()
 
 	st := s.GetOrCreateOUState("g", "c", "old", "", false, prior)
-	// Set last update to 4*H hours ago (> 2*H threshold).
+	// Set last observation to 4*H hours ago (> 2*H threshold).
 	hoursAgo := int64(4.0 * prior.H * 3600)
-	st.LastUpdateTime = time.Now().Unix() - hoursAgo
+	st.LastObservationTime = time.Now().Unix() - hoursAgo
 
 	stale := s.GetStaleNodes("g", "c", "", false, []string{"old"})
 	if len(stale) != 1 {
