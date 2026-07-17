@@ -251,6 +251,21 @@ func TestApplyObservation_OutOfOrder_Fallback(t *testing.T) {
 	_ = muAfter
 }
 
+func TestApplyObservation_RecordsEventsForReplay(t *testing.T) {
+	prior := DefaultPrior()
+	cs := NewCellState(0, prior)
+
+	cs.ApplyObservation(10, prior, CellEvent{Time: 1, HasS: true, S: true})
+	cs.ApplyObservation(10, prior, CellEvent{Time: 5, HasS: true, S: true})
+
+	if len(cs.EventsAfterCP) != 2 {
+		t.Fatalf("expected 2 replay events, got %d", len(cs.EventsAfterCP))
+	}
+	if cs.EventsAfterCP[0].Time != 1 || cs.EventsAfterCP[1].Time != 5 {
+		t.Fatalf("events not recorded in order: %#v", cs.EventsAfterCP)
+	}
+}
+
 func TestApplyObservation_OutOfOrder_Replay(t *testing.T) {
 	prior := DefaultPrior()
 	cs := NewCellState(0, prior)

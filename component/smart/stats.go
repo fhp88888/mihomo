@@ -66,9 +66,10 @@ type AtomicStatsRecord struct {
 }
 
 type CodeNodeSet struct {
-	Nodes      map[string]int64  `json:"nodes"`
-	FailCounts map[string]int    `json:"fail_counts,omitempty"`
-	NodeHosts  map[string]string `json:"node_hosts,omitempty"`
+	Nodes            map[string]int64  `json:"nodes"`
+	FailCounts       map[string]int    `json:"fail_counts,omitempty"`
+	NodeLastFailures map[string]int64  `json:"node_last_failures,omitempty"`
+	NodeHosts        map[string]string `json:"node_hosts,omitempty"`
 }
 
 type HostStatus struct {
@@ -1492,14 +1493,16 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 				if codeSet.FailCounts != nil {
 					delete(codeSet.FailCounts, nodeName)
 				}
+				if codeSet.NodeLastFailures != nil {
+					delete(codeSet.NodeLastFailures, nodeName)
+				}
 			}
 		}
-		if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 {
+		if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 && len(codeSet.NodeLastFailures) == 0 {
 			delete(hs.Codes, code)
 		}
 	}
 
-	oldLastFailure := hs.LastFailure
 	currentCode := -1
 
 	for code, codeSet := range hs.Codes {
@@ -1529,6 +1532,9 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			if codeSet.FailCounts != nil {
 				delete(codeSet.FailCounts, name)
 			}
+			if codeSet.NodeLastFailures != nil {
+				delete(codeSet.NodeLastFailures, name)
+			}
 			if codeSet.NodeHosts != nil {
 				delete(codeSet.NodeHosts, name)
 			}
@@ -1547,6 +1553,9 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			delete(codeSet.Nodes, name)
 			if codeSet.FailCounts != nil {
 				delete(codeSet.FailCounts, name)
+			}
+			if codeSet.NodeLastFailures != nil {
+				delete(codeSet.NodeLastFailures, name)
 			}
 			if codeSet.NodeHosts != nil {
 				delete(codeSet.NodeHosts, name)
@@ -1580,15 +1589,21 @@ func (s *Store) UpdateHostStatus(group, config, wildcardTarget string, metadata 
 			if codeSet.FailCounts == nil {
 				codeSet.FailCounts = make(map[string]int)
 			}
+			if codeSet.NodeLastFailures == nil {
+				codeSet.NodeLastFailures = make(map[string]int64)
+			}
 			count := codeSet.FailCounts[name]
-			if oldLastFailure == 0 || now-oldLastFailure > 300 {
+			lastFailure := codeSet.NodeLastFailures[name]
+			if lastFailure == 0 || now-lastFailure > 300 {
 				count = 1
 			} else {
 				count++
 			}
+			codeSet.NodeLastFailures[name] = now
 			if count >= maxFailedTimes {
 				codeSet.Nodes[name] = time.Now().Add(HostFailureNodeTTL).Unix()
 				delete(codeSet.FailCounts, name)
+				delete(codeSet.NodeLastFailures, name)
 				failedBlock = true
 			} else {
 				codeSet.FailCounts[name] = count
@@ -1615,7 +1630,7 @@ saveAndReturn:
 	}
 
 	for code, codeSet := range hs.Codes {
-		if codeSet == nil || (len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0) {
+		if codeSet == nil || (len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 && len(codeSet.NodeLastFailures) == 0) {
 			delete(hs.Codes, code)
 		}
 	}
@@ -1873,6 +1888,9 @@ func (s *Store) RemoveNodesData(group, config string, nodes []string) error {
 						if codeSet.NodeHosts != nil {
 							delete(codeSet.NodeHosts, nodeName)
 						}
+						if codeSet.NodeLastFailures != nil {
+							delete(codeSet.NodeLastFailures, nodeName)
+						}
 						changed = true
 					}
 				}
@@ -1880,11 +1898,22 @@ func (s *Store) RemoveNodesData(group, config string, nodes []string) error {
 					for nodeName := range codeSet.FailCounts {
 						if _, toRemove := nodeSet[nodeName]; toRemove {
 							delete(codeSet.FailCounts, nodeName)
+							if codeSet.NodeLastFailures != nil {
+								delete(codeSet.NodeLastFailures, nodeName)
+							}
 							changed = true
 						}
 					}
 				}
-				if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 {
+				if codeSet.NodeLastFailures != nil {
+					for nodeName := range codeSet.NodeLastFailures {
+						if _, toRemove := nodeSet[nodeName]; toRemove {
+							delete(codeSet.NodeLastFailures, nodeName)
+							changed = true
+						}
+					}
+				}
+				if len(codeSet.Nodes) == 0 && len(codeSet.FailCounts) == 0 && len(codeSet.NodeLastFailures) == 0 {
 					delete(hs.Codes, code)
 				}
 			}

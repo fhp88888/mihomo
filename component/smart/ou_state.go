@@ -326,44 +326,35 @@ func (cs *CellState) ApplyObservation(now int64, prior CellPrior, ev CellEvent) 
 	if ev.Time > cs.LastObservationTime {
 		cs.LastObservationTime = ev.Time
 	}
+	if cs.CheckpointTime == 0 {
+		cs.PredictToNow(ev.Time, prior)
+		cs.setCheckpoint(ev.Time)
+	}
 
 	// Common case: event arrives in order (or this is the first event).
 	if ev.Time >= cs.LastUpdateTime {
 		cs.applyEventInPlace(now, prior, ev)
+		cs.appendEventAfterCP(ev)
 		return
 	}
 
 	// Out-of-order: if the event is older than the checkpoint we cannot
 	// replay perfectly.  Fall back to a direct application at event time
 	// followed by predict-to-now (the "approximate" path).
-	if cs.CheckpointTime == 0 || ev.Time < cs.CheckpointTime {
+	if ev.Time < cs.CheckpointTime {
 		// No usable checkpoint – approximate.
 		cs.forceApplyAtEventTime(now, prior, ev)
 		return
 	}
 
-	// Roll back to checkpoint, replay events up to ev, apply ev,
-	// replay the rest, then predict to now.
+	// Roll back to checkpoint, replay all events in chronological order, then
+	// predict to now.
+	events := cs.insertEventAfterCP(ev)
 	cs.restoreCheckpoint()
-
-	inserted := false
-	newEvents := make([]CellEvent, 0, len(cs.EventsAfterCP)+1)
-	for _, e := range cs.EventsAfterCP {
-		if !inserted && ev.Time < e.Time {
-			cs.applyEventInPlace(ev.Time, prior, ev)
-			cs.setCheckpoint(ev.Time)
-			inserted = true
-		}
+	for _, e := range events {
 		cs.applyEventInPlace(e.Time, prior, e)
-		cs.setCheckpoint(e.Time)
-		newEvents = append(newEvents, e)
 	}
-	if !inserted {
-		cs.applyEventInPlace(ev.Time, prior, ev)
-		cs.setCheckpoint(ev.Time)
-	}
-	// Rebuild the event buffer (all events are now "after" the new checkpoint).
-	cs.EventsAfterCP = newEvents
+	cs.EventsAfterCP = events
 	cs.PredictToNow(now, prior)
 }
 
@@ -375,7 +366,6 @@ func (cs *CellState) ApplyObservation(now int64, prior CellPrior, ev CellEvent) 
 // Caller must ensure ev.Time >= cs.LastUpdateTime.
 func (cs *CellState) applyEventInPlace(now int64, prior CellPrior, ev CellEvent) {
 	cs.PredictToNow(ev.Time, prior)
-	cs.setCheckpoint(ev.Time)
 
 	if ev.HasS {
 		cs.UpdateSuccess(ev.Time, prior, ev.S)
@@ -422,13 +412,34 @@ func (cs *CellState) forceApplyAtEventTime(now int64, prior CellPrior, ev CellEv
 	cs.PredictToNow(now, prior)
 }
 
-// saveCheckpoint snapshots the current state as a checkpoint and appends
-// an event placeholder.  The actual event is stored separately via
-// appendEvent.
+// saveCheckpoint snapshots the current state when no replay checkpoint exists.
 func (cs *CellState) saveCheckpoint(atTime int64) {
 	if cs.CheckpointTime == 0 {
 		cs.setCheckpoint(atTime)
 	}
+}
+
+func (cs *CellState) appendEventAfterCP(ev CellEvent) {
+	if ev.Time < cs.CheckpointTime {
+		return
+	}
+	cs.EventsAfterCP = append(cs.EventsAfterCP, ev)
+}
+
+func (cs *CellState) insertEventAfterCP(ev CellEvent) []CellEvent {
+	events := make([]CellEvent, 0, len(cs.EventsAfterCP)+1)
+	inserted := false
+	for _, e := range cs.EventsAfterCP {
+		if !inserted && ev.Time < e.Time {
+			events = append(events, ev)
+			inserted = true
+		}
+		events = append(events, e)
+	}
+	if !inserted {
+		events = append(events, ev)
+	}
+	return events
 }
 
 // setCheckpoint records the current state at the given time.
