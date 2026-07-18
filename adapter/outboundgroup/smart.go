@@ -306,6 +306,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 	if len(proxies) > maxSelected {
 		proxies = proxies[:maxSelected]
 	}
+	topRankedNames := proxyNamesForDebug(proxies)
 
 	// The first ranked attempt is bandit-eligible. Later waves are safety-only
 	// because they are part of the rescue race rather than a clean choice sample.
@@ -325,8 +326,20 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 		return nil, err
 	}
 
+	log.Debugln("[Smart-Conn] Rank top%d target=[%s] top=[%s] selected=[%s]", len(topRankedNames), metadata.SmartTarget, strings.Join(topRankedNames, ", "), p.Name())
 	s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, []C.Proxy{p})
 	return s.WrapConnWithMetric(c, p, metadata, connectTime), nil
+}
+
+func proxyNamesForDebug(proxies []C.Proxy) []string {
+	names := make([]string, 0, len(proxies))
+	for _, p := range proxies {
+		if p == nil {
+			continue
+		}
+		names = append(names, p.Name())
+	}
+	return names
 }
 
 func (s *Smart) banditKey(metadata *C.Metadata, proxyName string) string {

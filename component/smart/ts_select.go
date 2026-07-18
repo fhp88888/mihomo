@@ -25,7 +25,7 @@ const (
 
 	// DefaultWt is the default weight for transfer quality.
 	// Set to 0 initially; can be raised when Yt observations are enabled.
-	DefaultWt = 0.2
+	DefaultWt = 0.1
 )
 
 // ────────────────────────────────────────────────────────────
