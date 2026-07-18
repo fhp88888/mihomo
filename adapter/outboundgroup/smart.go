@@ -51,7 +51,7 @@ const (
 
 	maxRetries               = 3
 	maxSelected              = 10
-	waveDialInterval         = 200 * time.Millisecond
+	waveDialInterval         = 300 * time.Millisecond
 )
 
 var (

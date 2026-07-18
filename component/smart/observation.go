@@ -20,7 +20,7 @@ const (
 	// Minimum traffic threshold for transfer-quality observation (Yt).
 	// Only connections that transfer at least this much data are eligible.
 	minTrafficMB       = 0.05  // MB
-	minTrafficDuration = 500.0 // ms
+	minTrafficDuration = 200.0 // ms
 )
 
 // ObsResult bundles the extracted observations for one connection.
