@@ -47,7 +47,7 @@ func NewProbeCoordinator() *ProbeCoordinator {
 
 // Discover runs a discovery for the given route key. If another goroutine is
 // already discovering this key, the caller waits for that result. Otherwise,
-// this goroutine becomes the leader and probes the top-K proxies concurrently,
+// this goroutine becomes the leader and probes the proxies sequentially,
 // returning the first successful connection.
 func (pc *ProbeCoordinator) Discover(
 	ctx context.Context,
@@ -112,7 +112,7 @@ func (pc *ProbeCoordinator) Discover(
 		pc.wg.Done()
 	}()
 
-	// Probe top-K in batches
+	// Probe proxies sequentially in pre-ranked order
 	proxy := pc.probeSequential(leaderCtx, key, proxies, metadata, preRanked, singleDial, rt)
 
 	ds.mu.Lock()
