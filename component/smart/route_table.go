@@ -203,7 +203,7 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 func calculateScore(latency int64, speed float64) float64 {
 	score := 0.0
 	if latency > 0 {
-		score = 1.0 / float64(latency)
+		score = 100.0 / float64(latency)
 	}
 	if speed > 0 {
 		score += math.Log1p(speed / 1024.0 / 1024.0)
@@ -483,7 +483,7 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 }
 
 // DebugDumpRow returns a debug string of a single row's proxies map.
-// Format: "proxy1(lat=30,use=5,loss=0.01,spd=1024,score=0.033333) proxy2(lat=80,use=1,loss=0,spd=0,score=0.012500) ..."
+// Format: "proxy1(lat=30,use=5,loss=0.01,spd=1024,latScore=0.033333,speedScore=0.000976,score=0.034309) ..."
 func (rt *RouteTable) DebugDumpRow(key string) string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
@@ -495,22 +495,26 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 
 	// Collect and sort by latency for readable output
 	type entry struct {
-		name    string
-		latency int64
-		use     int64
-		loss    float64
-		speed   float64
-		score   float64
+		name         string
+		latency      int64
+		use          int64
+		loss         float64
+		speed        float64
+		latencyScore float64
+		speedScore   float64
+		score        float64
 	}
 	entries := make([]entry, 0, len(row.proxies))
 	for _, cell := range row.proxies {
 		entries = append(entries, entry{
-			name:    cell.name,
-			latency: cell.latency,
-			use:     cell.useCount,
-			loss:    cell.pkgLoss,
-			speed:   cell.speed,
-			score:   cell.score,
+			name:         cell.name,
+			latency:      cell.latency,
+			use:          cell.useCount,
+			loss:         cell.pkgLoss,
+			speed:        cell.speed,
+			latencyScore: calculateScore(cell.latency, 0),
+			speedScore:   calculateScore(0, cell.speed),
+			score:        cell.score,
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool {
@@ -527,8 +531,8 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 		if i > 0 {
 			sb.WriteString(" ")
 		}
-		sb.WriteString(fmt.Sprintf("%s(lat=%d,use=%d,loss=%.3f,spd=%.0f,score=%.6f)",
-			e.name, e.latency, e.use, e.loss, e.speed, e.score))
+		sb.WriteString(fmt.Sprintf("%s(lat=%d,use=%d,loss=%.3f,spd=%.0f,[latScore=%.4f,speedScore=%.4f,score=%.4f])",
+			e.name, e.latency, e.use, e.loss, e.speed, e.latencyScore, e.speedScore, e.score))
 	}
 	sb.WriteString("]")
 	return sb.String()
