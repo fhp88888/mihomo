@@ -173,14 +173,14 @@ func applyEMA(old, new float64, hasSample bool) float64 {
 	if !hasSample {
 		return new
 	}
-	return old*2.0/3.0 + new/3.0
+	return old*3.0/4.0 + new/4.0
 }
 
 func applyEMAInt64(old, new int64, hasSample bool) int64 {
 	if !hasSample {
 		return new
 	}
-	return int64(float64(old)*2.0/3.0 + float64(new)/3.0)
+	return int64(float64(old)*3.0/4.0 + float64(new)/4.0)
 }
 
 // UpdateLatency updates the EMA latency for a (key, proxy) pair.
