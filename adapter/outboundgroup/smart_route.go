@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"time"
 
@@ -50,8 +51,11 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 		}
 	}
 
-	// Fast path: known route with TCP-probed best proxy
-	if s.routeTable.IsTCPProbed(key) {
+	// Fast path: known route with TCP-probed best proxy.
+	// 2% of requests intentionally skip the fast path to trigger re-discovery,
+	// giving the pre-ranker a chance to use accumulated per-key latency data
+	// from earlier loser measurements and potentially find a better proxy.
+	if s.routeTable.IsTCPProbed(key) && rand.Intn(100)%50 != 0 {
 		if bestName, ok := s.routeTable.GetBestProxy(key); ok {
 			for _, p := range proxies {
 				if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {

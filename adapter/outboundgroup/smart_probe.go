@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/component/smart"
+	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/tunnel"
 )
 
@@ -131,6 +131,12 @@ type probeResult struct {
 	err         error
 }
 
+// probeMetric records a single proxy's connectTime during parallel dial.
+type probeMetric struct {
+	proxyName   string
+	connectTime int64
+}
+
 // probeBatch probes proxies in batches of topK. Returns the first successful result.
 func (pc *ProbeCoordinator) probeBatch(
 	ctx context.Context,
@@ -162,7 +168,13 @@ func (pc *ProbeCoordinator) probeBatch(
 			break
 		}
 
-		result := pc.parallelDial(ctx, batch, metadata, singleDial)
+		result, metrics := pc.parallelDial(ctx, batch, metadata, singleDial)
+		// Record all successful connectTimes to the route table so losers'
+		// measurements are not wasted — they improve prerank accuracy for
+		// subsequent discoveries on this route key.
+		for _, m := range metrics {
+			rt.UpdateLatency(key, m.proxyName, m.connectTime)
+		}
 		if result.err == nil {
 			return result
 		}
@@ -188,17 +200,17 @@ func (pc *ProbeCoordinator) probeBatch(
 
 // parallelDial concurrently dials all proxies in the batch.
 // Waits for ALL goroutines to complete, then returns the connection with the
-// lowest connectTime.  This avoids the "first goroutine wins" scheduling bias
-// that previously caused the same proxy to win every probe race on localhost.
+// lowest connectTime plus all successful (proxyName, connectTime) pairs so
+// losers' measurements are also recorded in the route table.
 func (pc *ProbeCoordinator) parallelDial(
 	ctx context.Context,
 	batch []C.Proxy,
 	metadata *C.Metadata,
 	singleDial func(context.Context, C.Proxy, *C.Metadata, time.Time) (C.Conn, int64, error),
-) probeResult {
+) (probeResult, []probeMetric) {
 	n := len(batch)
 	if n == 0 {
-		return probeResult{err: errors.New("empty batch")}
+		return probeResult{err: errors.New("empty batch")}, nil
 	}
 
 	type dialResult struct {
@@ -209,6 +221,7 @@ func (pc *ProbeCoordinator) parallelDial(
 	}
 
 	results := make(chan dialResult, n)
+	var allMetrics []probeMetric
 
 	for i := 0; i < n; i++ {
 		pc.wg.Add(1)
@@ -225,6 +238,7 @@ func (pc *ProbeCoordinator) parallelDial(
 		select {
 		case res := <-results:
 			if res.err == nil {
+				allMetrics = append(allMetrics, probeMetric{proxyName: res.proxy.Name(), connectTime: res.connectTime})
 				if best == nil || res.connectTime < best.connectTime {
 					// Close previous best connection
 					if best != nil && best.conn != nil {
@@ -250,16 +264,16 @@ func (pc *ProbeCoordinator) parallelDial(
 			}(n - received - 1)
 			// If we already have a best, return it
 			if best != nil {
-				return probeResult{proxy: best.proxy, conn: best.conn, connectTime: best.connectTime}
+				return probeResult{proxy: best.proxy, conn: best.conn, connectTime: best.connectTime}, allMetrics
 			}
-			return probeResult{err: ctx.Err()}
+			return probeResult{err: ctx.Err()}, allMetrics
 		}
 	}
 
 	if best != nil {
-		return probeResult{proxy: best.proxy, conn: best.conn, connectTime: best.connectTime}
+		return probeResult{proxy: best.proxy, conn: best.conn, connectTime: best.connectTime}, allMetrics
 	}
-	return probeResult{err: errors.New("all proxies failed")}
+	return probeResult{err: errors.New("all proxies failed")}, nil
 }
 
 // Close cancels all active discoveries and waits for workers to finish.
