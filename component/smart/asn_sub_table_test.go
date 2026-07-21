@@ -78,4 +78,25 @@ func TestASNSubTableConcurrent(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+
+	// Verify all 5 targets have entries with non-zero sizes
+	for i := 0; i < 5; i++ {
+		target := "host" + string(rune('a'+i)) + ".com"
+		size, ok := st.GetAvgConnSize(target)
+		if !ok {
+			t.Errorf("expected %s to exist after concurrent updates", target)
+		}
+		if size <= 0 {
+			t.Errorf("expected %s size > 0, got %.0f", target, size)
+		}
+	}
+
+	// Verify non-existent target returns (0, false)
+	size, ok := st.GetAvgConnSize("hostf.com")
+	if ok {
+		t.Error("expected hostf.com to not exist")
+	}
+	if size != 0 {
+		t.Errorf("expected size 0 for missing target, got %.0f", size)
+	}
 }
