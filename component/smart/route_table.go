@@ -1,8 +1,10 @@
 package smart
 
 import (
+	"fmt"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -393,4 +395,54 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 		RowCount: len(rows),
 		Rows:     rows,
 	}
+}
+
+// DebugDumpRow returns a debug string of a single row's proxies map.
+// Format: "proxy1(lat=30,use=5,loss=0.01,spd=1024) proxy2(lat=80,use=1,loss=0,spd=0) ..."
+func (rt *RouteTable) DebugDumpRow(key string) string {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+
+	row, ok := rt.rows[key]
+	if !ok || len(row.proxies) == 0 {
+		return fmt.Sprintf("key=%s proxies=<empty>", key)
+	}
+
+	// Collect and sort by latency for readable output
+	type entry struct {
+		name    string
+		latency int64
+		use     int64
+		loss    float64
+		speed   float64
+	}
+	entries := make([]entry, 0, len(row.proxies))
+	for _, cell := range row.proxies {
+		entries = append(entries, entry{
+			name:    cell.name,
+			latency: cell.latency,
+			use:     cell.useCount,
+			loss:    cell.pkgLoss,
+			speed:   cell.speed,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].latency != entries[j].latency {
+			return entries[i].latency < entries[j].latency
+		}
+		return entries[i].name < entries[j].name
+	})
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("key=%s best=%s tcpProbed=%v proxies=[",
+		key, row.bestProxy, row.tcpProbed))
+	for i, e := range entries {
+		if i > 0 {
+			sb.WriteString(" ")
+		}
+		sb.WriteString(fmt.Sprintf("%s(lat=%d,use=%d,loss=%.3f,spd=%.0f)",
+			e.name, e.latency, e.use, e.loss, e.speed))
+	}
+	sb.WriteString("]")
+	return sb.String()
 }

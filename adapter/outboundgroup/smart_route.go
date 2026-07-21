@@ -52,10 +52,10 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 	}
 
 	// Fast path: known route with TCP-probed best proxy.
-	// 2% of requests intentionally skip the fast path to trigger re-discovery,
+	// 8% of requests intentionally skip the fast path to trigger re-discovery,
 	// giving the pre-ranker a chance to use accumulated per-key latency data
 	// from earlier loser measurements and potentially find a better proxy.
-	if s.routeTable.IsTCPProbed(key) && rand.Intn(100)%50 != 0 {
+	if s.routeTable.IsTCPProbed(key) && rand.Intn(100)%12 != 0 {
 		if bestName, ok := s.routeTable.GetBestProxy(key); ok {
 			for _, p := range proxies {
 				if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
@@ -106,7 +106,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 		}
 	}
 
-	// Cold start, 2% re-discover, or all serial fallbacks exhausted:
+	// Cold start, 8% re-discover, or all serial fallbacks exhausted:
 	// full parallel discovery.
 	return s.discoverAndRoute(ctx, metadata, key, proxies)
 }
@@ -160,6 +160,9 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 		}
 		return 0xffff
 	}, key)
+
+	// Debug: dump the route table row before rerank probe
+	log.Debugln("[Smart] Rerank for group [%s]: %s", s.Name(), s.routeTable.DebugDumpRow(key))
 
 	// Concurrent discovery through probe coordinator
 	proxy, conn, connectTime, err := s.probeCoordinator.Discover(
