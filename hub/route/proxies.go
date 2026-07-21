@@ -29,6 +29,7 @@ func proxyRouter() http.Handler {
 		r.Use(parseProxyName, findProxyByName)
 		r.Get("/", getProxy)
 		r.Get("/delay", getProxyDelay)
+		r.Get("/smart-table", getSmartTable)
 		r.Put("/", updateProxy)
 		r.Delete("/", unfixedProxy)
 	})
@@ -157,4 +158,23 @@ func unfixedProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	render.Status(r, http.StatusBadRequest)
 	render.JSON(w, r, ErrBadRequest)
+}
+
+func getSmartTable(w http.ResponseWriter, r *http.Request) {
+	proxy := r.Context().Value(CtxKeyProxy).(C.Proxy)
+
+	if proxy.Type() != C.Smart {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("Proxy is not a Smart group"))
+		return
+	}
+
+	if sp, ok := proxy.Adapter().(*outboundgroup.Smart); ok {
+		snapshot := sp.RouteTableSnapshot()
+		render.JSON(w, r, snapshot)
+		return
+	}
+
+	render.Status(r, http.StatusBadRequest)
+	render.JSON(w, r, newError("Proxy does not expose a smart table"))
 }
