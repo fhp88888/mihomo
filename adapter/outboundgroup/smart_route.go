@@ -90,7 +90,26 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 			return 0xffff
 		}, key)
 
-		for _, name := range preRanked {
+		topKCount := topK
+		if len(preRanked) < topKCount {
+			topKCount = len(preRanked)
+		}
+		secondaryRanked := s.routeTable.SecondaryRank(
+			key,
+			metadata.Host,
+			preRanked[:topKCount],
+			func(proxyName string) uint16 {
+				if p, ok := proxyMap[proxyName]; ok {
+					return p.LastDelayForTestUrl(s.testUrl)
+				}
+				return 0xffff
+			},
+		)
+		if len(preRanked) > topKCount {
+			secondaryRanked = append(secondaryRanked, preRanked[topKCount:]...)
+		}
+
+		for _, name := range secondaryRanked {
 			p, ok := proxyMap[name]
 			if !ok {
 				continue
@@ -164,9 +183,32 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	// Debug: dump the route table row before rerank probe
 	log.Debugln("[Smart] Rerank for group [%s]: %s", s.Name(), s.routeTable.DebugDumpRow(key))
 
-	// Concurrent discovery through probe coordinator
+	// Secondary rank: re-sort top-K by predicted completion time
+	topKCount := topK
+	if len(preRanked) < topKCount {
+		topKCount = len(preRanked)
+	}
+	secondaryRanked := s.routeTable.SecondaryRank(
+		key,
+		metadata.Host,
+		preRanked[:topKCount],
+		func(proxyName string) uint16 {
+			for _, p := range proxies {
+				if p.Name() == proxyName {
+					return p.LastDelayForTestUrl(s.testUrl)
+				}
+			}
+			return 0xffff
+		},
+	)
+	// Append any remaining proxies (beyond top-K) unchanged as fallbacks
+	if len(preRanked) > topKCount {
+		secondaryRanked = append(secondaryRanked, preRanked[topKCount:]...)
+	}
+
+	// Sequential discovery through probe coordinator
 	proxy, conn, connectTime, err := s.probeCoordinator.Discover(
-		ctx, key, available, metadata, preRanked,
+		ctx, key, available, metadata, secondaryRanked,
 		func(ctx context.Context, p C.Proxy, m *C.Metadata, start time.Time) (C.Conn, int64, error) {
 			conn, err := p.DialContext(ctx, m)
 			elapsed := time.Since(start).Milliseconds()
@@ -241,6 +283,14 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 						s.routeTable.UpdatePkgLoss(key, proxy.Name(), lossRate)
 					}
 				}
+			}
+
+			// Collect total connection size for ASN sub-table
+			uploadTotal := tracker.Info().UploadTotal.Load()
+			downloadTotal := tracker.Info().DownloadTotal.Load()
+			totalBytes := float64(uploadTotal + downloadTotal)
+			if totalBytes > 0 {
+				s.routeTable.UpdateTargetConnSize(key, metadata.Host, totalBytes)
 			}
 		}
 
