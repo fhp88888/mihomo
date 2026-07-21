@@ -63,7 +63,6 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 					if err == nil {
 						return conn, nil
 					}
-					// Route failed — fall through to discovery
 					s.routeTable.MarkFailed(key, bestName)
 					if tunnel.ShouldStopRetry(err) {
 						return nil, err
@@ -72,9 +71,43 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 				}
 			}
 		}
+
+		// Best proxy failed.  Instead of an expensive parallel re-probe,
+		// try the remaining per-key-ranked proxies serially using the
+		// latency data already in the route table.
+		names := make([]string, 0, len(proxies))
+		proxyMap := make(map[string]C.Proxy, len(proxies))
+		for _, p := range proxies {
+			if p.AliveForTestUrl(s.testUrl) {
+				names = append(names, p.Name())
+				proxyMap[p.Name()] = p
+			}
+		}
+		preRanked := s.routeTable.PreRankLatency(names, func(proxyName string) uint16 {
+			if p, ok := proxyMap[proxyName]; ok {
+				return p.LastDelayForTestUrl(s.testUrl)
+			}
+			return 0xffff
+		}, key)
+
+		for _, name := range preRanked {
+			p, ok := proxyMap[name]
+			if !ok {
+				continue
+			}
+			conn, err := s.dialAndWrap(ctx, p, metadata, key)
+			if err == nil {
+				return conn, nil
+			}
+			s.routeTable.MarkFailed(key, name)
+			if tunnel.ShouldStopRetry(err) {
+				return nil, err
+			}
+		}
 	}
 
-	// Slow path: pre-rank + concurrent discovery
+	// Cold start, 2% re-discover, or all serial fallbacks exhausted:
+	// full parallel discovery.
 	return s.discoverAndRoute(ctx, metadata, key, proxies)
 }
 
