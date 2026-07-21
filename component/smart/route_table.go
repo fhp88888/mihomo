@@ -227,41 +227,68 @@ func (rt *RouteTable) IncrementUseCount(key, proxy string) {
 	rt.touchLRU(key)
 }
 
-// PreRankLatency sorts proxies by their mean latency across all observed rows.
-// Proxies with no route table data fall back to the healthCheckLatency function.
+// PreRankLatency sorts proxies by latency, preferring data from the given key's
+// row when available.  When key is non-empty only the matching row is consulted;
+// proxies without a sample in that row fall back to healthCheckLatency.  This
+// prevents a positive-feedback loop where the winner of the first target's
+// probe biases all subsequent probes via cross-row aggregation.
+//
+// When key is empty the old cross-row mean behaviour is preserved (used by
+// Unwrap when no metadata is available).
+//
 // Sort is stable — equal latencies preserve input order.
-func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(string) uint16) []string {
+func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(string) uint16, key string) []string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
-	// Compute mean latency per proxy across all rows
-	type sumCount struct {
-		sum   int64
-		count int
-	}
-	stats := make(map[string]*sumCount, len(proxies))
-	for _, proxy := range proxies {
-		stats[proxy] = &sumCount{}
-	}
+	meanLatency := make(map[string]float64, len(proxies))
 
-	for _, row := range rt.rows {
+	if key != "" {
+		// Per-key: only use the specific row's data
+		row, ok := rt.rows[key]
 		for _, proxy := range proxies {
-			if cell, ok := row.proxies[proxy]; ok && cell.hasSample {
-				s := stats[proxy]
-				s.sum += cell.latency
-				s.count++
+			if ok {
+				if cell, cOk := row.proxies[proxy]; cOk && cell.hasSample {
+					meanLatency[proxy] = float64(cell.latency)
+					continue
+				}
+			}
+			// Fall back to health check
+			if healthCheckLatency != nil {
+				meanLatency[proxy] = float64(healthCheckLatency(proxy))
+			} else {
+				meanLatency[proxy] = 1e9
 			}
 		}
-	}
+	} else {
+		// Cross-row mean (legacy — used when no key is available)
+		type sumCount struct {
+			sum   int64
+			count int
+		}
+		stats := make(map[string]*sumCount, len(proxies))
+		for _, proxy := range proxies {
+			stats[proxy] = &sumCount{}
+		}
 
-	meanLatency := make(map[string]float64, len(proxies))
-	for proxy, sc := range stats {
-		if sc.count > 0 {
-			meanLatency[proxy] = float64(sc.sum) / float64(sc.count)
-		} else if healthCheckLatency != nil {
-			meanLatency[proxy] = float64(healthCheckLatency(proxy))
-		} else {
-			meanLatency[proxy] = 1e9 // very high — no data
+		for _, row := range rt.rows {
+			for _, proxy := range proxies {
+				if cell, cOk := row.proxies[proxy]; cOk && cell.hasSample {
+					s := stats[proxy]
+					s.sum += cell.latency
+					s.count++
+				}
+			}
+		}
+
+		for proxy, sc := range stats {
+			if sc.count > 0 {
+				meanLatency[proxy] = float64(sc.sum) / float64(sc.count)
+			} else if healthCheckLatency != nil {
+				meanLatency[proxy] = float64(healthCheckLatency(proxy))
+			} else {
+				meanLatency[proxy] = 1e9
+			}
 		}
 	}
 

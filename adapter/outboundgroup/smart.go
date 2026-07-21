@@ -216,7 +216,7 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 			}
 		}
 		return 0xffff
-	})
+	}, key)
 
 	for _, name := range ranked {
 		for _, p := range proxies {

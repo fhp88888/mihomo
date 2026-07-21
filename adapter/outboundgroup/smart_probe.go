@@ -187,7 +187,9 @@ func (pc *ProbeCoordinator) probeBatch(
 }
 
 // parallelDial concurrently dials all proxies in the batch.
-// Returns the first successful connection immediately; drains the rest in background.
+// Waits for ALL goroutines to complete, then returns the connection with the
+// lowest connectTime.  This avoids the "first goroutine wins" scheduling bias
+// that previously caused the same proxy to win every probe race on localhost.
 func (pc *ProbeCoordinator) parallelDial(
 	ctx context.Context,
 	batch []C.Proxy,
@@ -207,40 +209,37 @@ func (pc *ProbeCoordinator) parallelDial(
 	}
 
 	results := make(chan dialResult, n)
-	childCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	for i := 0; i < n; i++ {
 		pc.wg.Add(1)
 		go func(p C.Proxy) {
 			defer pc.wg.Done()
 			start := time.Now()
-			conn, connectTime, err := singleDial(childCtx, p, metadata, start)
+			conn, connectTime, err := singleDial(ctx, p, metadata, start)
 			results <- dialResult{proxy: p, conn: conn, connectTime: connectTime, err: err}
 		}(batch[i])
 	}
 
-	var firstErr error
+	var best *dialResult
 	for received := 0; received < n; received++ {
 		select {
 		case res := <-results:
 			if res.err == nil {
-				// Cancel remaining dials
-				cancel()
-				// Drain remaining results in background
-				go func(remaining int) {
-					for i := 0; i < remaining; i++ {
-						r := <-results
-						if r.conn != nil && r.err == nil {
-							r.conn.Close()
-						}
+				if best == nil || res.connectTime < best.connectTime {
+					// Close previous best connection
+					if best != nil && best.conn != nil {
+						best.conn.Close()
 					}
-				}(n - received - 1)
-				return probeResult{proxy: res.proxy, conn: res.conn, connectTime: res.connectTime}
+					best = &res
+				} else {
+					// This one is slower — close it
+					if res.conn != nil {
+						res.conn.Close()
+					}
+				}
 			}
-			firstErr = res.err
 		case <-ctx.Done():
-			// Drain remaining
+			// Drain remaining in background
 			go func(remaining int) {
 				for i := 0; i < remaining; i++ {
 					r := <-results
@@ -249,11 +248,18 @@ func (pc *ProbeCoordinator) parallelDial(
 					}
 				}
 			}(n - received - 1)
+			// If we already have a best, return it
+			if best != nil {
+				return probeResult{proxy: best.proxy, conn: best.conn, connectTime: best.connectTime}
+			}
 			return probeResult{err: ctx.Err()}
 		}
 	}
 
-	return probeResult{err: firstErr}
+	if best != nil {
+		return probeResult{proxy: best.proxy, conn: best.conn, connectTime: best.connectTime}
+	}
+	return probeResult{err: errors.New("all proxies failed")}
 }
 
 // Close cancels all active discoveries and waits for workers to finish.

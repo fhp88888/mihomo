@@ -110,7 +110,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 		return nil, errors.New("no alive proxies available")
 	}
 
-	// Pre-rank
+	// Pre-rank using per-key latency (not cross-row) to avoid bias from other targets
 	names := make([]string, len(available))
 	for i, p := range available {
 		names[i] = p.Name()
@@ -122,7 +122,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 			}
 		}
 		return 0xffff
-	})
+	}, key)
 
 	// Concurrent discovery through probe coordinator
 	proxy, conn, connectTime, err := s.probeCoordinator.Discover(
@@ -273,7 +273,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 			}
 		}
 		return 0xffff
-	})
+	}, key)
 
 	// Build ordered list by pre-rank
 	ordered := make([]C.Proxy, 0, len(preRanked))

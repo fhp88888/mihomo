@@ -139,7 +139,7 @@ func TestPreRankLatency(t *testing.T) {
 	rt.UpdateLatency("ASN:1", "proxy-c", 80)
 
 	proxies := []string{"proxy-a", "proxy-c", "proxy-b"}
-	ranked := rt.PreRankLatency(proxies, nil)
+	ranked := rt.PreRankLatency(proxies, nil, "")
 
 	// proxy-b (30) < proxy-a (50) < proxy-c (80)
 	expected := []string{"proxy-b", "proxy-a", "proxy-c"}
@@ -159,7 +159,7 @@ func TestPreRankStableSort(t *testing.T) {
 	rt.UpdateLatency("ASN:1", "proxy-c", 50)
 
 	proxies := []string{"proxy-c", "proxy-a", "proxy-b"}
-	ranked := rt.PreRankLatency(proxies, nil)
+	ranked := rt.PreRankLatency(proxies, nil, "")
 
 	// All same latency, stable sort keeps input order
 	for i := range proxies {
@@ -184,7 +184,7 @@ func TestPreRankWithHealthCheckFallback(t *testing.T) {
 	}
 
 	proxies := []string{"proxy-a", "proxy-b", "proxy-d"}
-	ranked := rt.PreRankLatency(proxies, healthCheck)
+	ranked := rt.PreRankLatency(proxies, healthCheck, "")
 
 	// proxy-d (20 health) < proxy-b (30) < proxy-a (50)
 	expected := []string{"proxy-d", "proxy-b", "proxy-a"}
@@ -298,7 +298,7 @@ func TestConcurrentSafety(t *testing.T) {
 			rt.SetBestProxy(key, "proxy-a")
 			rt.GetBestProxy(key)
 			rt.IsTCPProbed(key)
-			rt.PreRankLatency([]string{"proxy-a", "proxy-b"}, nil)
+			rt.PreRankLatency([]string{"proxy-a", "proxy-b"}, nil, "")
 			rt.Snapshot("test")
 		}(i)
 	}
