@@ -113,7 +113,7 @@ func (pc *ProbeCoordinator) Discover(
 	}()
 
 	// Probe top-K in batches
-	proxy := pc.probeBatch(leaderCtx, key, proxies, metadata, preRanked, singleDial, rt)
+	proxy := pc.probeSequential(leaderCtx, key, proxies, metadata, preRanked, singleDial, rt)
 
 	ds.mu.Lock()
 	ds.proxy = proxy.proxy
@@ -131,149 +131,48 @@ type probeResult struct {
 	err         error
 }
 
-// probeMetric records a single proxy's connectTime during parallel dial.
-type probeMetric struct {
-	proxyName   string
-	connectTime int64
-}
-
-// probeBatch probes proxies in batches of topK. Returns the first successful result.
-func (pc *ProbeCoordinator) probeBatch(
+// probeSequential tries proxies in the given order (pre-ranked by SecondaryRank).
+// Returns the first successful connection. Failed proxies are marked in the
+// route table and skipped.
+func (pc *ProbeCoordinator) probeSequential(
 	ctx context.Context,
 	key string,
 	proxies []C.Proxy,
 	metadata *C.Metadata,
-	preRanked []string,
+	ranked []string,
 	singleDial func(context.Context, C.Proxy, *C.Metadata, time.Time) (C.Conn, int64, error),
 	rt *smart.RouteTable,
 ) probeResult {
-	// Build a name→proxy lookup
 	proxyMap := make(map[string]C.Proxy, len(proxies))
 	for _, p := range proxies {
 		proxyMap[p.Name()] = p
 	}
 
-	n := len(preRanked)
-	for offset := 0; offset < n; {
-		// Take up to topK proxies from the current offset
-		batch := make([]C.Proxy, 0, topK)
-		for i := offset; i < n && len(batch) < topK; i++ {
-			if p, ok := proxyMap[preRanked[i]]; ok {
-				batch = append(batch, p)
-			}
-		}
-		offset += len(batch)
-
-		if len(batch) == 0 {
-			break
-		}
-
-		result, metrics := pc.parallelDial(ctx, batch, metadata, singleDial)
-		// Record all successful connectTimes to the route table so losers'
-		// measurements are not wasted — they improve prerank accuracy for
-		// subsequent discoveries on this route key.
-		for _, m := range metrics {
-			rt.UpdateLatency(key, m.proxyName, m.connectTime)
-		}
-		if result.err == nil {
-			return result
-		}
-
-		// All failed in this batch; update route table and try next batch
-		for _, p := range batch {
-			rt.MarkFailed(key, p.Name())
-		}
-
-		// Check for fatal error
-		if tunnel.ShouldStopRetry(result.err) {
-			return result
-		}
-
-		// If ctx is done, stop
+	for _, name := range ranked {
 		if ctx.Err() != nil {
 			return probeResult{err: ctx.Err()}
 		}
+
+		p, ok := proxyMap[name]
+		if !ok {
+			continue
+		}
+
+		start := time.Now()
+		conn, connectTime, err := singleDial(ctx, p, metadata, start)
+		if err != nil {
+			rt.MarkFailed(key, name)
+			if tunnel.ShouldStopRetry(err) {
+				return probeResult{err: err}
+			}
+			continue
+		}
+
+		rt.UpdateLatency(key, name, connectTime)
+		return probeResult{proxy: p, conn: conn, connectTime: connectTime}
 	}
 
 	return probeResult{err: errors.New("all proxies failed")}
-}
-
-// parallelDial concurrently dials all proxies in the batch.
-// Waits for ALL goroutines to complete, then returns the connection with the
-// lowest connectTime plus all successful (proxyName, connectTime) pairs so
-// losers' measurements are also recorded in the route table.
-func (pc *ProbeCoordinator) parallelDial(
-	ctx context.Context,
-	batch []C.Proxy,
-	metadata *C.Metadata,
-	singleDial func(context.Context, C.Proxy, *C.Metadata, time.Time) (C.Conn, int64, error),
-) (probeResult, []probeMetric) {
-	n := len(batch)
-	if n == 0 {
-		return probeResult{err: errors.New("empty batch")}, nil
-	}
-
-	type dialResult struct {
-		proxy       C.Proxy
-		conn        C.Conn
-		connectTime int64
-		err         error
-	}
-
-	results := make(chan dialResult, n)
-	var allMetrics []probeMetric
-
-	for i := 0; i < n; i++ {
-		pc.wg.Add(1)
-		go func(p C.Proxy) {
-			defer pc.wg.Done()
-			start := time.Now()
-			conn, connectTime, err := singleDial(ctx, p, metadata, start)
-			results <- dialResult{proxy: p, conn: conn, connectTime: connectTime, err: err}
-		}(batch[i])
-	}
-
-	var best *dialResult
-	for received := 0; received < n; received++ {
-		select {
-		case res := <-results:
-			if res.err == nil {
-				allMetrics = append(allMetrics, probeMetric{proxyName: res.proxy.Name(), connectTime: res.connectTime})
-				if best == nil || res.connectTime < best.connectTime {
-					// Close previous best connection
-					if best != nil && best.conn != nil {
-						best.conn.Close()
-					}
-					best = &res
-				} else {
-					// This one is slower — close it
-					if res.conn != nil {
-						res.conn.Close()
-					}
-				}
-			}
-		case <-ctx.Done():
-			// Drain remaining in background
-			go func(remaining int) {
-				for i := 0; i < remaining; i++ {
-					r := <-results
-					if r.conn != nil && r.err == nil {
-						r.conn.Close()
-					}
-				}
-			}(n - received - 1)
-			// If we already have a best, return it
-			if best != nil {
-				return probeResult{proxy: best.proxy, conn: best.conn, connectTime: best.connectTime}, allMetrics
-			}
-			return probeResult{err: ctx.Err()}, allMetrics
-		}
-	}
-
-	if best != nil {
-		return probeResult{proxy: best.proxy, conn: best.conn, connectTime: best.connectTime}, allMetrics
-	}
-	return probeResult{err: errors.New("all proxies failed")}, nil
 }
 
 // Close cancels all active discoveries and waits for workers to finish.
