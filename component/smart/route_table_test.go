@@ -322,3 +322,103 @@ func TestSnapshotRowOrder(t *testing.T) {
 	}
 }
 
+func TestSecondaryRankColdStart(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:8075"
+
+	rt.UpdateLatency(key, "proxy-fast", 89)
+	rt.UpdateLatency(key, "proxy-mid", 163)
+	rt.UpdateLatency(key, "proxy-slow", 275)
+
+	topK := []string{"proxy-fast", "proxy-mid", "proxy-slow"}
+
+	// No ASN data → cold start → rank = 1.33*lat. Order preserved.
+	ranked := rt.SecondaryRank(key, "example.com", topK, nil)
+	if ranked[0] != "proxy-fast" || ranked[1] != "proxy-mid" || ranked[2] != "proxy-slow" {
+		t.Fatalf("cold start: expected latency order, got %v", ranked)
+	}
+}
+
+func TestSecondaryRankBandwidthBoost(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:8075"
+
+	rt.UpdateLatency(key, "proxy-low-lat", 89)
+	rt.UpdateSpeed(key, "proxy-low-lat", 51804) // 50KB/s
+
+	rt.UpdateLatency(key, "proxy-high-bw", 163)
+	rt.UpdateSpeed(key, "proxy-high-bw", 189613) // 190KB/s
+
+	// Large connection: avg 10MB
+	rt.UpdateTargetConnSize(key, "bigfile.example.com", 10*1024*1024)
+
+	ranked := rt.SecondaryRank(key, "bigfile.example.com", []string{"proxy-low-lat", "proxy-high-bw"}, nil)
+
+	// 10MB/50KB = ~202s transmit vs 10MB/190KB = ~55s → high-bw wins
+	if ranked[0] != "proxy-high-bw" {
+		t.Fatalf("large file: expected proxy-high-bw first, got %s", ranked[0])
+	}
+}
+
+func TestSecondaryRankLossPenalty(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:8075"
+
+	rt.UpdateLatency(key, "proxy-clean", 100)
+	rt.UpdatePkgLoss(key, "proxy-clean", 0.0)
+	rt.UpdateLatency(key, "proxy-lossy", 100)
+	rt.UpdatePkgLoss(key, "proxy-lossy", 0.15)
+
+	ranked := rt.SecondaryRank(key, "example.com", []string{"proxy-clean", "proxy-lossy"}, nil)
+
+	// clean: 133/1=133, lossy: 133/0.85=156.5 → clean wins
+	if ranked[0] != "proxy-clean" {
+		t.Fatalf("loss penalty: expected proxy-clean first, got %s", ranked[0])
+	}
+}
+
+func TestSecondaryRankSmallConnection(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:8075"
+
+	rt.UpdateLatency(key, "proxy-low-lat", 89)
+	rt.UpdateSpeed(key, "proxy-low-lat", 51804)
+	rt.UpdateLatency(key, "proxy-high-bw", 163)
+	rt.UpdateSpeed(key, "proxy-high-bw", 189613)
+
+	// Small connection: avg 2KB
+	rt.UpdateTargetConnSize(key, "api.example.com", 2048)
+
+	ranked := rt.SecondaryRank(key, "api.example.com", []string{"proxy-low-lat", "proxy-high-bw"}, nil)
+
+	// 2KB/speed < 1ms for both → hit floor 0.33*lat → low-lat wins
+	if ranked[0] != "proxy-low-lat" {
+		t.Fatalf("small conn: expected proxy-low-lat first, got %s", ranked[0])
+	}
+}
+
+func TestSecondaryRankEmptyAndFallback(t *testing.T) {
+	rt := NewRouteTable(100)
+	if len(rt.SecondaryRank("ASN:1", "x.com", nil, nil)) != 0 {
+		t.Fatal("expected empty for nil input")
+	}
+	if len(rt.SecondaryRank("ASN:1", "x.com", []string{}, nil)) != 0 {
+		t.Fatal("expected empty for empty input")
+	}
+
+	// Health check fallback: proxy-b has no cell, uses healthCheck=50
+	rt.UpdateLatency("ASN:1", "proxy-a", 100)
+	hc := func(name string) uint16 {
+		if name == "proxy-b" {
+			return 50
+		}
+		return 200
+	}
+	ranked := rt.SecondaryRank("ASN:1", "x.com", []string{"proxy-a", "proxy-b"}, hc)
+	// proxy-b (50+16.5=66.5) < proxy-a (100+33=133)
+	if ranked[0] != "proxy-b" {
+		t.Fatalf("health check fallback: expected proxy-b first, got %s", ranked[0])
+	}
+}
+
+

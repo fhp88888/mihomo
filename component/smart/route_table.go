@@ -32,6 +32,7 @@ type rowEntry struct {
 	tcpProbed bool
 	lastUsed  int64
 	proxies   map[string]*proxyCell
+	asnSub    *ASNSubTable // per-row ASN-level sub-table for conn size tracking (memory-only)
 }
 
 type proxyCell struct {
@@ -219,6 +220,21 @@ func (rt *RouteTable) UpdateSpeed(key, proxy string, speed float64) {
 	rt.touchLRU(key)
 }
 
+// UpdateTargetConnSize records the total bidirectional bytes for a target
+// in the row's ASN sub-table (in-memory only, no persistence).
+func (rt *RouteTable) UpdateTargetConnSize(key, target string, totalBytes float64) {
+	if target == "" || totalBytes <= 0 {
+		return
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row := rt.getOrCreateRow(key)
+	if row.asnSub == nil {
+		row.asnSub = NewASNSubTable()
+	}
+	row.asnSub.Update(target, totalBytes)
+}
+
 // IncrementUseCount increments the use counter for a proxy within a row.
 func (rt *RouteTable) IncrementUseCount(key, proxy string) {
 	rt.mu.Lock()
@@ -317,6 +333,110 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 		return meanLatency[result[i]] < meanLatency[result[j]]
 	})
 
+	return result
+}
+
+// SecondaryRank re-ranks the top-K pre-ranked proxies using the predicted
+// completion time formula:
+//
+//	Rank = (establish_time_ms + transmit_time_ms) / (1.0 - P_loss)
+//
+// This accounts for both bandwidth (via avg_conn_size / avg_speed) and
+// packet loss, while still honoring latency for small connections.
+func (rt *RouteTable) SecondaryRank(
+	key string,
+	target string,
+	proxies []string,
+	healthCheckLatency func(string) uint16,
+) []string {
+	if len(proxies) == 0 {
+		return proxies
+	}
+
+	const epsilon = 1.0
+
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+
+	row, ok := rt.rows[key]
+	var asnSub *ASNSubTable
+	if ok && row.asnSub != nil {
+		asnSub = row.asnSub
+	}
+
+	type rankEntry struct {
+		name string
+		rank float64
+	}
+
+	entries := make([]rankEntry, 0, len(proxies))
+
+	for _, proxyName := range proxies {
+		var establishTimeMs float64
+		var avgSpeed float64
+		var pLoss float64
+		var hasCell bool
+
+		if ok {
+			if cell, cOk := row.proxies[proxyName]; cOk && cell.hasSample {
+				establishTimeMs = float64(cell.latency)
+				avgSpeed = cell.speed
+				pLoss = cell.pkgLoss
+				hasCell = true
+			}
+		}
+
+		if !hasCell {
+			if healthCheckLatency != nil {
+				establishTimeMs = float64(healthCheckLatency(proxyName))
+			} else {
+				establishTimeMs = 1e9
+			}
+		}
+
+		// Compute transmit_time_ms
+		var transmitTimeMs float64
+		avgConnSize, hasSize := float64(0), false
+		if asnSub != nil {
+			avgConnSize, hasSize = asnSub.GetAvgConnSize(target)
+		}
+
+		if hasSize && avgConnSize > 0 && avgSpeed > epsilon {
+			actualTransmitMs := (avgConnSize / avgSpeed) * 1000.0
+			floorTransmitMs := 0.33 * establishTimeMs
+			if actualTransmitMs > floorTransmitMs {
+				transmitTimeMs = actualTransmitMs
+			} else {
+				transmitTimeMs = floorTransmitMs
+			}
+		} else {
+			transmitTimeMs = 0.33 * establishTimeMs
+		}
+
+		// Rank = (establish + transmit) / (1 - pLoss)
+		lossPenalty := pLoss
+		if lossPenalty > 0.99 {
+			lossPenalty = 0.99
+		}
+		if lossPenalty < 0 {
+			lossPenalty = 0
+		}
+		rank := (establishTimeMs + transmitTimeMs) / (1.0 - lossPenalty)
+
+		entries = append(entries, rankEntry{name: proxyName, rank: rank})
+	}
+
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].rank != entries[j].rank {
+			return entries[i].rank < entries[j].rank
+		}
+		return entries[i].name < entries[j].name
+	})
+
+	result := make([]string, len(entries))
+	for i, e := range entries {
+		result[i] = e.name
+	}
 	return result
 }
 
