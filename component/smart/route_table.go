@@ -1,6 +1,7 @@
 package smart
 
 import (
+	"math/rand"
 	"sort"
 	"sync"
 	"time"
@@ -246,10 +247,12 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 	if key != "" {
 		// Per-key: only use the specific row's data
 		row, ok := rt.rows[key]
+		hasKeyData := false
 		for _, proxy := range proxies {
 			if ok {
 				if cell, cOk := row.proxies[proxy]; cOk && cell.hasSample {
 					meanLatency[proxy] = float64(cell.latency)
+					hasKeyData = true
 					continue
 				}
 			}
@@ -259,6 +262,19 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 			} else {
 				meanLatency[proxy] = 1e9
 			}
+		}
+		// When no proxy has per-key data, all latencies come from the
+		// health-check fallback.  On localhost this means every proxy
+		// ties at ~0 ms, so stable-sort would always put the same five
+		// proxies in the first probe batch.  Shuffle to give every proxy
+		// a fair chance on each new target.
+		if !hasKeyData {
+			result := make([]string, len(proxies))
+			copy(result, proxies)
+			rand.Shuffle(len(result), func(i, j int) {
+				result[i], result[j] = result[j], result[i]
+			})
+			return result
 		}
 	} else {
 		// Cross-row mean (legacy — used when no key is available)
