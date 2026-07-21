@@ -44,8 +44,8 @@ type SmartOption struct {
 type Smart struct {
 	*GroupBase
 
-	wg  sync.WaitGroup
-	ctx context.Context
+	wg     sync.WaitGroup
+	ctx    context.Context
 	cancel context.CancelFunc
 
 	configName     string
@@ -191,7 +191,7 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 	s.getASNCode(metadata)
 
 	key := routeKey(metadata)
-	if bestName, ok := s.routeTable.GetBestProxy(key); ok {
+	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
 		for _, p := range proxies {
 			if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
 				return p
@@ -199,7 +199,7 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 		}
 	}
 
-	// Fallback: pre-rank by latency
+	// Fallback: rank by score
 	names := make([]string, 0, len(proxies))
 	for _, p := range proxies {
 		if p.AliveForTestUrl(s.testUrl) {
@@ -209,7 +209,8 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 	if len(names) == 0 {
 		return proxies[0]
 	}
-	ranked := s.routeTable.PreRankLatency(names, func(proxyName string) uint16 {
+	s.routeTable.RefreshScores(key, names)
+	ranked := s.routeTable.RankByScore(names, func(proxyName string) uint16 {
 		for _, p := range proxies {
 			if p.Name() == proxyName {
 				return p.LastDelayForTestUrl(s.testUrl)

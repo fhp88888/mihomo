@@ -1,6 +1,7 @@
 package smart
 
 import (
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -65,11 +66,11 @@ func TestEMALatency(t *testing.T) {
 		t.Fatalf("expected first latency=100, got %d", rec.Attributes.Latency)
 	}
 
-	// Second sample: EMA = old*2/3 + new*1/3 = 100*2/3 + 40*1/3 = 80
+	// Second sample: EMA = old*3/4 + new*1/4 = 100*3/4 + 40*1/4 = 85
 	rt.UpdateLatency(key, proxy, 40)
 	snap = rt.Snapshot("test")
 	rec = snap.Rows[0].Proxies[proxy]
-	expected := int64(float64(100)*2.0/3.0 + float64(40)/3.0)
+	expected := int64(float64(100)*3.0/4.0 + float64(40)/4.0)
 	if rec.Attributes.Latency != expected {
 		t.Fatalf("expected EMA latency=%d, got %d", expected, rec.Attributes.Latency)
 	}
@@ -88,7 +89,7 @@ func TestEMAPkgLoss(t *testing.T) {
 
 	rt.UpdatePkgLoss(key, proxy, 0.04)
 	snap = rt.Snapshot("test")
-	expected := 0.01*2.0/3.0 + 0.04/3.0
+	expected := 0.01*3.0/4.0 + 0.04/4.0
 	got := snap.Rows[0].Proxies[proxy].Attributes.PkgLoss
 	if got < expected-0.001 || got > expected+0.001 {
 		t.Fatalf("expected EMA pkg_loss=%.4f, got %.4f", expected, got)
@@ -108,7 +109,7 @@ func TestEMASpeed(t *testing.T) {
 
 	rt.UpdateSpeed(key, proxy, 20971520)
 	snap = rt.Snapshot("test")
-	expected := 10485760.0*2.0/3.0 + 20971520.0/3.0
+	expected := 10485760.0*3.0/4.0 + 20971520.0/4.0
 	got := snap.Rows[0].Proxies[proxy].Attributes.Speed
 	if got < expected-1 || got > expected+1 {
 		t.Fatalf("expected EMA speed=%.0f, got %.0f", expected, got)
@@ -125,6 +126,148 @@ func TestIncrementUseCount(t *testing.T) {
 	snap := rt.Snapshot("test")
 	if snap.Rows[0].Proxies[proxy].UseCount != 2 {
 		t.Fatalf("expected use_count=2, got %d", snap.Rows[0].Proxies[proxy].UseCount)
+	}
+}
+
+func TestCalculateScoreFromLatency(t *testing.T) {
+	cases := []struct {
+		latency int64
+		expect  float64
+	}{
+		{latency: 100, expect: 0.01},
+		{latency: 50, expect: 0.02},
+		{latency: 0, expect: 0},
+		{latency: -10, expect: 0},
+	}
+
+	for _, tc := range cases {
+		got := calculateScoreFromLatency(tc.latency)
+		if math.Abs(got-tc.expect) > 0.000001 {
+			t.Fatalf("latency=%d: expected score %.6f, got %.6f", tc.latency, tc.expect, got)
+		}
+	}
+}
+
+func TestRefreshScoresStoresNonEMA(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	proxy := "proxy-a"
+
+	rt.UpdateLatency(key, proxy, 100)
+	rt.RefreshScores(key, []string{proxy})
+	snap := rt.Snapshot("test")
+	got := snap.Rows[0].Proxies[proxy].Attributes.Score
+	if math.Abs(got-0.01) > 0.000001 {
+		t.Fatalf("expected initial score 0.010000, got %.6f", got)
+	}
+
+	rt.UpdateLatency(key, proxy, 20)
+	rt.RefreshScores(key, []string{proxy})
+	snap = rt.Snapshot("test")
+	rec := snap.Rows[0].Proxies[proxy]
+	expected := 1.0 / float64(rec.Attributes.Latency)
+	if math.Abs(rec.Attributes.Score-expected) > 0.000001 {
+		t.Fatalf("expected score from current latency %.6f, got %.6f", expected, rec.Attributes.Score)
+	}
+}
+
+func TestRankByScore(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	rt.UpdateLatency(key, "proxy-a", 100)
+	rt.UpdateLatency(key, "proxy-b", 50)
+	rt.UpdateLatency(key, "proxy-c", 200)
+	rt.RefreshScores(key, []string{"proxy-a", "proxy-b", "proxy-c"})
+
+	proxies := []string{"proxy-a", "proxy-c", "proxy-b"}
+	ranked := rt.RankByScore(proxies, nil, key)
+	expected := []string{"proxy-b", "proxy-a", "proxy-c"}
+	for i := range expected {
+		if ranked[i] != expected[i] {
+			t.Fatalf("ranked[%d]: expected %s, got %s", i, expected[i], ranked[i])
+		}
+	}
+}
+
+func TestRankByScoreStableSort(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	rt.UpdateLatency(key, "proxy-a", 50)
+	rt.UpdateLatency(key, "proxy-b", 50)
+	rt.UpdateLatency(key, "proxy-c", 50)
+	rt.RefreshScores(key, []string{"proxy-a", "proxy-b", "proxy-c"})
+
+	proxies := []string{"proxy-c", "proxy-a", "proxy-b"}
+	ranked := rt.RankByScore(proxies, nil, key)
+	for i := range proxies {
+		if ranked[i] != proxies[i] {
+			t.Fatalf("stable sort broken at [%d]: expected %s, got %s", i, proxies[i], ranked[i])
+		}
+	}
+}
+
+func TestRankByScoreWithHealthCheckFallback(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	rt.UpdateLatency(key, "proxy-a", 100)
+	rt.RefreshScores(key, []string{"proxy-a"})
+
+	healthCheck := func(name string) uint16 {
+		switch name {
+		case "proxy-b":
+			return 50
+		case "proxy-zero":
+			return 0
+		case "proxy-max":
+			return 0xffff
+		default:
+			return 100
+		}
+	}
+
+	proxies := []string{"proxy-zero", "proxy-a", "proxy-max", "proxy-b"}
+	ranked := rt.RankByScore(proxies, healthCheck, key)
+	expected := []string{"proxy-b", "proxy-a", "proxy-zero", "proxy-max"}
+	for i := range expected {
+		if ranked[i] != expected[i] {
+			t.Fatalf("ranked[%d]: expected %s, got %s", i, expected[i], ranked[i])
+		}
+	}
+}
+
+func TestSnapshotIncludesScore(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	proxy := "proxy-a"
+
+	rt.UpdateLatency(key, proxy, 100)
+	rt.RefreshScores(key, []string{proxy})
+	snap := rt.Snapshot("test")
+	got := snap.Rows[0].Proxies[proxy].Attributes.Score
+	if math.Abs(got-0.01) > 0.000001 {
+		t.Fatalf("expected snapshot score 0.010000, got %.6f", got)
+	}
+}
+
+func TestGetBestProxyIfFresh(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	rt.SetBestProxy(key, "proxy-a")
+
+	name, ok := rt.GetBestProxyIfFresh(key, 20*time.Second)
+	if !ok || name != "proxy-a" {
+		t.Fatalf("expected fresh proxy-a, got %s ok=%v", name, ok)
+	}
+
+	rt.mu.Lock()
+	rt.rows[key].lastUsed = time.Now().Add(-21 * time.Second).Unix()
+	rt.mu.Unlock()
+
+	if name, ok := rt.GetBestProxyIfFresh(key, 20*time.Second); ok {
+		t.Fatalf("expected stale best proxy to be unavailable, got %s", name)
 	}
 }
 
@@ -299,6 +442,9 @@ func TestConcurrentSafety(t *testing.T) {
 			rt.GetBestProxy(key)
 			rt.IsTCPProbed(key)
 			rt.PreRankLatency([]string{"proxy-a", "proxy-b"}, nil, "")
+			rt.RefreshScores(key, []string{"proxy-a", "proxy-b"})
+			rt.RankByScore([]string{"proxy-a", "proxy-b"}, nil, key)
+			rt.GetBestProxyIfFresh(key, time.Second)
 			rt.Snapshot("test")
 		}(i)
 	}
@@ -313,7 +459,7 @@ func TestSnapshotRowOrder(t *testing.T) {
 	rt.SetBestProxy("ASN:3", "p3")
 	rt.SetBestProxy("ASN:2", "p2")
 	time.Sleep(time.Second) // ensure distinct timestamp
-	rt.TouchRow("ASN:2") // make ASN:2 most recent
+	rt.TouchRow("ASN:2")    // make ASN:2 most recent
 
 	snap := rt.Snapshot("test")
 	// Should be sorted by LastUsed descending
@@ -321,4 +467,3 @@ func TestSnapshotRowOrder(t *testing.T) {
 		t.Fatalf("expected ASN:2 first (most recent), got %s", snap.Rows[0].Key)
 	}
 }
-

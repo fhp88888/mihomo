@@ -11,11 +11,12 @@ import (
 
 const DefaultMaxRows = 5000
 
-// ProxyAttributes holds EMA-tracked connection quality metrics.
+// ProxyAttributes holds tracked connection quality metrics.
 type ProxyAttributes struct {
 	PkgLoss float64 `json:"pkg_loss"`
 	Latency int64   `json:"latency"`
 	Speed   float64 `json:"speed"`
+	Score   float64 `json:"score"`
 }
 
 // ProxyRecord is the per-proxy entry in a route table row.
@@ -40,16 +41,17 @@ type proxyCell struct {
 	latency   int64   // EMA, 0 means no sample yet
 	pkgLoss   float64 // EMA
 	speed     float64 // EMA
+	score     float64 // non-EMA score derived from latency
 	hasSample bool
 }
 
 // RowSnapshot is a read-only copy of a row for the REST API.
 type RowSnapshot struct {
-	Key       string                  `json:"key"`
-	BestProxy string                  `json:"best_proxy"`
-	TCPProbed bool                    `json:"tcp_probed"`
-	LastUsed  int64                   `json:"last_used"`
-	Proxies   map[string]ProxyRecord  `json:"proxies"`
+	Key       string                 `json:"key"`
+	BestProxy string                 `json:"best_proxy"`
+	TCPProbed bool                   `json:"tcp_probed"`
+	LastUsed  int64                  `json:"last_used"`
+	Proxies   map[string]ProxyRecord `json:"proxies"`
 }
 
 // TableSnapshot is a read-only copy of the full route table.
@@ -98,9 +100,9 @@ func (rt *RouteTable) getOrCreateRow(key string) *rowEntry {
 	}
 
 	row = &rowEntry{
-		key:     key,
+		key:      key,
 		lastUsed: time.Now().Unix(),
-		proxies: make(map[string]*proxyCell),
+		proxies:  make(map[string]*proxyCell),
 	}
 	rt.rows[key] = row
 	rt.lruOrder = append(rt.lruOrder, key)
@@ -125,6 +127,20 @@ func (rt *RouteTable) GetBestProxy(key string) (string, bool) {
 	defer rt.mu.RUnlock()
 	row, ok := rt.rows[key]
 	if !ok || row.bestProxy == "" {
+		return "", false
+	}
+	return row.bestProxy, true
+}
+
+// GetBestProxyIfFresh returns the current best proxy when the route row is younger than maxAge.
+func (rt *RouteTable) GetBestProxyIfFresh(key string, maxAge time.Duration) (string, bool) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	row, ok := rt.rows[key]
+	if !ok || row.bestProxy == "" {
+		return "", false
+	}
+	if time.Since(time.Unix(row.lastUsed, 0)) >= maxAge {
 		return "", false
 	}
 	return row.bestProxy, true
@@ -168,7 +184,7 @@ func (rt *RouteTable) getOrCreateCell(row *rowEntry, proxy string) *proxyCell {
 	return cell
 }
 
-// applyEMA applies exponential moving average with 1/3 weight for the new sample.
+// applyEMA applies exponential moving average with 1/4 weight for the new sample.
 func applyEMA(old, new float64, hasSample bool) float64 {
 	if !hasSample {
 		return new
@@ -181,6 +197,37 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 		return new
 	}
 	return int64(float64(old)*3.0/4.0 + float64(new)/4.0)
+}
+
+func calculateScoreFromLatency(latency int64) float64 {
+	if latency <= 0 {
+		return 0
+	}
+	return 1.0 / float64(latency)
+}
+
+func scoreFromHealthCheckLatency(latency uint16) float64 {
+	if latency == 0 || latency == 0xffff {
+		return 0
+	}
+	return calculateScoreFromLatency(int64(latency))
+}
+
+// RefreshScores updates non-EMA scores for existing proxy samples in a route row.
+func (rt *RouteTable) RefreshScores(key string, proxies []string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return
+	}
+	for _, proxy := range proxies {
+		cell, ok := row.proxies[proxy]
+		if !ok || !cell.hasSample {
+			continue
+		}
+		cell.score = calculateScoreFromLatency(cell.latency)
+	}
 }
 
 // UpdateLatency updates the EMA latency for a (key, proxy) pair.
@@ -320,6 +367,38 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 	return result
 }
 
+// RankByScore sorts proxies by score descending, falling back to latency-derived scores.
+func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(string) uint16, key string) []string {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+
+	scores := make(map[string]float64, len(proxies))
+	row, rowOK := rt.rows[key]
+	for _, proxy := range proxies {
+		if rowOK {
+			if cell, ok := row.proxies[proxy]; ok && cell.hasSample {
+				if cell.score > 0 {
+					scores[proxy] = cell.score
+				} else {
+					scores[proxy] = calculateScoreFromLatency(cell.latency)
+				}
+				continue
+			}
+		}
+		if healthCheckLatency != nil {
+			scores[proxy] = scoreFromHealthCheckLatency(healthCheckLatency(proxy))
+		}
+	}
+
+	result := make([]string, len(proxies))
+	copy(result, proxies)
+	sort.SliceStable(result, func(i, j int) bool {
+		return scores[result[i]] > scores[result[j]]
+	})
+
+	return result
+}
+
 // TouchRow updates the last-used timestamp for LRU tracking.
 func (rt *RouteTable) TouchRow(key string) {
 	rt.mu.Lock()
@@ -374,6 +453,7 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 					PkgLoss: cell.pkgLoss,
 					Latency: cell.latency,
 					Speed:   cell.speed,
+					Score:   cell.score,
 				},
 			}
 		}
@@ -398,7 +478,7 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 }
 
 // DebugDumpRow returns a debug string of a single row's proxies map.
-// Format: "proxy1(lat=30,use=5,loss=0.01,spd=1024) proxy2(lat=80,use=1,loss=0,spd=0) ..."
+// Format: "proxy1(lat=30,use=5,loss=0.01,spd=1024,score=0.033333) proxy2(lat=80,use=1,loss=0,spd=0,score=0.012500) ..."
 func (rt *RouteTable) DebugDumpRow(key string) string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
@@ -415,6 +495,7 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 		use     int64
 		loss    float64
 		speed   float64
+		score   float64
 	}
 	entries := make([]entry, 0, len(row.proxies))
 	for _, cell := range row.proxies {
@@ -424,6 +505,7 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 			use:     cell.useCount,
 			loss:    cell.pkgLoss,
 			speed:   cell.speed,
+			score:   cell.score,
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool {
@@ -440,8 +522,8 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 		if i > 0 {
 			sb.WriteString(" ")
 		}
-		sb.WriteString(fmt.Sprintf("%s(lat=%d,use=%d,loss=%.3f,spd=%.0f)",
-			e.name, e.latency, e.use, e.loss, e.speed))
+		sb.WriteString(fmt.Sprintf("%s(lat=%d,use=%d,loss=%.3f,spd=%.0f,score=%.6f)",
+			e.name, e.latency, e.use, e.loss, e.speed, e.score))
 	}
 	sb.WriteString("]")
 	return sb.String()

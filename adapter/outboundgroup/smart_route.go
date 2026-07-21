@@ -20,6 +20,8 @@ import (
 	"github.com/metacubex/mihomo/tunnel/statistic"
 )
 
+const smartBestProxyFreshness = 20 * time.Second
+
 // routeKey returns the route table key for a connection's metadata.
 // Format: "ASN:<number>" when ASN is available and valid,
 // otherwise "TARGET:<effective-target>".
@@ -56,7 +58,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 	// giving the pre-ranker a chance to use accumulated per-key latency data
 	// from earlier loser measurements and potentially find a better proxy.
 	if s.routeTable.IsTCPProbed(key) && rand.Intn(100)%12 != 0 {
-		if bestName, ok := s.routeTable.GetBestProxy(key); ok {
+		if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
 			for _, p := range proxies {
 				if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
 					conn, err := s.dialAndWrap(ctx, p, metadata, key)
@@ -72,9 +74,8 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 			}
 		}
 
-		// Best proxy failed.  Instead of an expensive parallel re-probe,
-		// try the remaining per-key-ranked proxies serially using the
-		// latency data already in the route table.
+		// Best proxy is stale, unavailable, or failed. Try the remaining
+		// per-key proxies serially by score, recalculated from current latency.
 		names := make([]string, 0, len(proxies))
 		proxyMap := make(map[string]C.Proxy, len(proxies))
 		for _, p := range proxies {
@@ -83,14 +84,15 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 				proxyMap[p.Name()] = p
 			}
 		}
-		preRanked := s.routeTable.PreRankLatency(names, func(proxyName string) uint16 {
+		s.routeTable.RefreshScores(key, names)
+		ranked := s.routeTable.RankByScore(names, func(proxyName string) uint16 {
 			if p, ok := proxyMap[proxyName]; ok {
 				return p.LastDelayForTestUrl(s.testUrl)
 			}
 			return 0xffff
 		}, key)
 
-		for _, name := range preRanked {
+		for _, name := range ranked {
 			p, ok := proxyMap[name]
 			if !ok {
 				continue
@@ -284,8 +286,8 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 		return nil, errors.New("no UDP-capable proxies available")
 	}
 
-	// Try best proxy first
-	if bestName, ok := s.routeTable.GetBestProxy(key); ok {
+	// Try fresh best proxy first
+	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
 		for _, p := range udpProxies {
 			if p.Name() == bestName {
 				pc, err := s.dialUDPAndWrap(ctx, p, metadata, key)
@@ -301,12 +303,13 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 		}
 	}
 
-	// Pre-rank remaining
+	// Rank remaining by score
 	names := make([]string, len(udpProxies))
 	for i, p := range udpProxies {
 		names[i] = p.Name()
 	}
-	preRanked := s.routeTable.PreRankLatency(names, func(proxyName string) uint16 {
+	s.routeTable.RefreshScores(key, names)
+	ranked := s.routeTable.RankByScore(names, func(proxyName string) uint16 {
 		for _, p := range proxies {
 			if p.Name() == proxyName {
 				return p.LastDelayForTestUrl(s.testUrl)
@@ -315,13 +318,13 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 		return 0xffff
 	}, key)
 
-	// Build ordered list by pre-rank
-	ordered := make([]C.Proxy, 0, len(preRanked))
+	// Build ordered list by score rank
+	ordered := make([]C.Proxy, 0, len(ranked))
 	proxyMap := make(map[string]C.Proxy, len(udpProxies))
 	for _, p := range udpProxies {
 		proxyMap[p.Name()] = p
 	}
-	for _, name := range preRanked {
+	for _, name := range ranked {
 		if p, ok := proxyMap[name]; ok {
 			ordered = append(ordered, p)
 		}
