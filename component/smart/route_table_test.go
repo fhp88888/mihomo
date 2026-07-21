@@ -129,21 +129,23 @@ func TestIncrementUseCount(t *testing.T) {
 	}
 }
 
-func TestCalculateScoreFromLatency(t *testing.T) {
+func TestCalculateScore(t *testing.T) {
 	cases := []struct {
 		latency int64
+		speed   float64
 		expect  float64
 	}{
-		{latency: 100, expect: 0.01},
-		{latency: 50, expect: 0.02},
-		{latency: 0, expect: 0},
-		{latency: -10, expect: 0},
+		{latency: 100, speed: 0, expect: 0.01},
+		{latency: 50, speed: 0, expect: 0.02},
+		{latency: 100, speed: 10485760, expect: 0.01 + math.Log1p(10)},
+		{latency: 0, speed: 1048576, expect: math.Log1p(1)},
+		{latency: -10, speed: 0, expect: 0},
 	}
 
 	for _, tc := range cases {
-		got := calculateScoreFromLatency(tc.latency)
+		got := calculateScore(tc.latency, tc.speed)
 		if math.Abs(got-tc.expect) > 0.000001 {
-			t.Fatalf("latency=%d: expected score %.6f, got %.6f", tc.latency, tc.expect, got)
+			t.Fatalf("latency=%d speed=%.0f: expected score %.6f, got %.6f", tc.latency, tc.speed, tc.expect, got)
 		}
 	}
 }
@@ -154,20 +156,24 @@ func TestRefreshScoresStoresNonEMA(t *testing.T) {
 	proxy := "proxy-a"
 
 	rt.UpdateLatency(key, proxy, 100)
+	rt.UpdateSpeed(key, proxy, 10485760)
 	rt.RefreshScores(key, []string{proxy})
 	snap := rt.Snapshot("test")
 	got := snap.Rows[0].Proxies[proxy].Attributes.Score
-	if math.Abs(got-0.01) > 0.000001 {
-		t.Fatalf("expected initial score 0.010000, got %.6f", got)
+	rec := snap.Rows[0].Proxies[proxy]
+	expected := 1.0/float64(rec.Attributes.Latency) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0)
+	if math.Abs(got-expected) > 0.000001 {
+		t.Fatalf("expected initial score %.6f, got %.6f", expected, got)
 	}
 
 	rt.UpdateLatency(key, proxy, 20)
+	rt.UpdateSpeed(key, proxy, 20971520)
 	rt.RefreshScores(key, []string{proxy})
 	snap = rt.Snapshot("test")
-	rec := snap.Rows[0].Proxies[proxy]
-	expected := 1.0 / float64(rec.Attributes.Latency)
+	rec = snap.Rows[0].Proxies[proxy]
+	expected = 1.0/float64(rec.Attributes.Latency) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0)
 	if math.Abs(rec.Attributes.Score-expected) > 0.000001 {
-		t.Fatalf("expected score from current latency %.6f, got %.6f", expected, rec.Attributes.Score)
+		t.Fatalf("expected score from current latency/speed %.6f, got %.6f", expected, rec.Attributes.Score)
 	}
 }
 
@@ -178,11 +184,12 @@ func TestRankByScore(t *testing.T) {
 	rt.UpdateLatency(key, "proxy-a", 100)
 	rt.UpdateLatency(key, "proxy-b", 50)
 	rt.UpdateLatency(key, "proxy-c", 200)
+	rt.UpdateSpeed(key, "proxy-c", 10485760)
 	rt.RefreshScores(key, []string{"proxy-a", "proxy-b", "proxy-c"})
 
 	proxies := []string{"proxy-a", "proxy-c", "proxy-b"}
 	ranked := rt.RankByScore(proxies, nil, key)
-	expected := []string{"proxy-b", "proxy-a", "proxy-c"}
+	expected := []string{"proxy-c", "proxy-b", "proxy-a"}
 	for i := range expected {
 		if ranked[i] != expected[i] {
 			t.Fatalf("ranked[%d]: expected %s, got %s", i, expected[i], ranked[i])
@@ -244,11 +251,14 @@ func TestSnapshotIncludesScore(t *testing.T) {
 	proxy := "proxy-a"
 
 	rt.UpdateLatency(key, proxy, 100)
+	rt.UpdateSpeed(key, proxy, 10485760)
 	rt.RefreshScores(key, []string{proxy})
 	snap := rt.Snapshot("test")
 	got := snap.Rows[0].Proxies[proxy].Attributes.Score
-	if math.Abs(got-0.01) > 0.000001 {
-		t.Fatalf("expected snapshot score 0.010000, got %.6f", got)
+	rec := snap.Rows[0].Proxies[proxy]
+	expected := 1.0/float64(rec.Attributes.Latency) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0)
+	if math.Abs(got-expected) > 0.000001 {
+		t.Fatalf("expected snapshot score %.6f, got %.6f", expected, got)
 	}
 }
 

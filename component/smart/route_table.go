@@ -2,6 +2,7 @@ package smart
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"sort"
 	"strings"
@@ -41,7 +42,7 @@ type proxyCell struct {
 	latency   int64   // EMA, 0 means no sample yet
 	pkgLoss   float64 // EMA
 	speed     float64 // EMA
-	score     float64 // non-EMA score derived from latency
+	score     float64 // non-EMA score derived from latency and speed
 	hasSample bool
 }
 
@@ -199,18 +200,22 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 	return int64(float64(old)*3.0/4.0 + float64(new)/4.0)
 }
 
-func calculateScoreFromLatency(latency int64) float64 {
-	if latency <= 0 {
-		return 0
+func calculateScore(latency int64, speed float64) float64 {
+	score := 0.0
+	if latency > 0 {
+		score = 1.0 / float64(latency)
 	}
-	return 1.0 / float64(latency)
+	if speed > 0 {
+		score += math.Log1p(speed / 1024.0 / 1024.0)
+	}
+	return score
 }
 
 func scoreFromHealthCheckLatency(latency uint16) float64 {
 	if latency == 0 || latency == 0xffff {
 		return 0
 	}
-	return calculateScoreFromLatency(int64(latency))
+	return calculateScore(int64(latency), 0)
 }
 
 // RefreshScores updates non-EMA scores for existing proxy samples in a route row.
@@ -226,7 +231,7 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 		if !ok || !cell.hasSample {
 			continue
 		}
-		cell.score = calculateScoreFromLatency(cell.latency)
+		cell.score = calculateScore(cell.latency, cell.speed)
 	}
 }
 
@@ -380,7 +385,7 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 				if cell.score > 0 {
 					scores[proxy] = cell.score
 				} else {
-					scores[proxy] = calculateScoreFromLatency(cell.latency)
+					scores[proxy] = calculateScore(cell.latency, cell.speed)
 				}
 				continue
 			}
