@@ -249,9 +249,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Conn {
 	c.AppendToChains(s)
 
-	start := time.Now()
 	var firstReadErr atomic.TypedValue[error]
-	var firstReadLatency atomic.Int64
 
 	if N.NeedHandshake(c) {
 		c = callback.NewFirstWriteCallBackConn(c, func(err error) {
@@ -262,7 +260,6 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 	}
 
 	c = callback.NewFirstReadCallBackConn(c, func(err error) {
-		firstReadLatency.Store(time.Since(start).Milliseconds())
 		if err != nil {
 			firstReadErr.Store(err)
 		}
@@ -270,10 +267,6 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 
 	return callback.NewCloseCallbackConn(c, func() {
 		key := routeKey(metadata)
-		latency := firstReadLatency.Load()
-		if latency > 0 {
-			s.routeTable.UpdateLatency(key, proxy.Name(), latency)
-		}
 
 		// Collect speed and pkg_loss from tracker
 		tracker := statistic.DefaultManager.Get(metadata.UUID)
