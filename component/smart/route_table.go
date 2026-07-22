@@ -200,14 +200,17 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 	return int64(float64(old)*3.0/4.0 + float64(new)/4.0)
 }
 
-func calculateScore(latency int64, speed float64) float64 {
+func calculateScore(latency int64, speed float64, pkgLoss float64) float64 {
 	score := 0.0
 	if latency > 0 {
 		score = 100.0 / float64(latency)
 	}
 	if speed > 0 {
-		score += math.Log1p(speed / 1024.0 / 1024.0)
+		// 500kb/s is a sensitive threshold to define what is good download speed or not.
+		// so divided by 0.5
+		score += math.Log1p(speed / 1024.0 / 1024.0 / 0.5)
 	}
+	score = score * (1 - pkgLoss)
 	return score
 }
 
@@ -215,7 +218,7 @@ func scoreFromHealthCheckLatency(latency uint16) float64 {
 	if latency == 0 || latency == 0xffff {
 		return 0
 	}
-	return calculateScore(int64(latency), 0)
+	return calculateScore(int64(latency), 0, 0)
 }
 
 // RefreshScores updates non-EMA scores for existing proxy samples in a route row.
@@ -231,7 +234,7 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 		if !ok || !cell.hasSample {
 			continue
 		}
-		cell.score = calculateScore(cell.latency, cell.speed)
+		cell.score = calculateScore(cell.latency, cell.speed, cell.pkgLoss)
 	}
 }
 
@@ -385,7 +388,7 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 				if cell.score > 0 {
 					scores[proxy] = cell.score
 				} else {
-					scores[proxy] = calculateScore(cell.latency, cell.speed)
+					scores[proxy] = calculateScore(cell.latency, cell.speed, cell.pkgLoss)
 				}
 				continue
 			}
@@ -512,8 +515,8 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 			use:          cell.useCount,
 			loss:         cell.pkgLoss,
 			speed:        cell.speed,
-			latencyScore: calculateScore(cell.latency, 0),
-			speedScore:   calculateScore(0, cell.speed),
+			latencyScore: calculateScore(cell.latency, 0, 0),
+			speedScore:   calculateScore(0, cell.speed, 0),
 			score:        cell.score,
 		})
 	}

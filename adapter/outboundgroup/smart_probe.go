@@ -11,7 +11,7 @@ import (
 	"github.com/metacubex/mihomo/tunnel"
 )
 
-const topK = 5
+const topK = 10
 
 // discoveryState tracks an in-progress discovery for a route key.
 type discoveryState struct {

@@ -20,7 +20,7 @@ import (
 	"github.com/metacubex/mihomo/tunnel/statistic"
 )
 
-const smartBestProxyFreshness = 20 * time.Second
+const smartBestProxyFreshness = 10 * time.Second
 
 // routeKey returns the route table key for a connection's metadata.
 // Format: "ASN:<number>" when ASN is available and valid,
