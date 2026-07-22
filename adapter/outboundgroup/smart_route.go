@@ -149,6 +149,11 @@ func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Meta
 	s.routeTable.SetBestProxy(key, proxy.Name())
 	s.routeTable.SetTCPProbed(key)
 
+	// Log the connection decision with full route-table context
+	log.Debugln("[Smart] Connected [%s] %s → %s (%dms) | %s",
+		s.Name(), key, proxy.Name(), connectTime,
+		s.routeTable.DebugDumpDecision(key, metadata.Host, proxy.Name()))
+
 	return s.wrapTCPConn(conn, proxy, metadata), nil
 }
 
@@ -179,9 +184,6 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 		}
 		return 0xffff
 	}, key)
-
-	// Debug: dump the route table row before rerank probe
-	log.Debugln("[Smart] Rerank for group [%s]: %s", s.Name(), s.routeTable.DebugDumpRow(key))
 
 	// Secondary rank: re-sort top-K by predicted completion time
 	topKCount := topK
@@ -226,6 +228,11 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	s.routeTable.IncrementUseCount(key, proxy.Name())
 	s.routeTable.SetBestProxy(key, proxy.Name())
 	s.routeTable.SetTCPProbed(key)
+
+	// Log the connection decision with full route-table context
+	log.Debugln("[Smart] Connected [%s] %s → %s (%dms) | %s",
+		s.Name(), key, proxy.Name(), connectTime,
+		s.routeTable.DebugDumpDecision(key, metadata.Host, proxy.Name()))
 
 	return s.wrapTCPConn(conn, proxy, metadata), nil
 }

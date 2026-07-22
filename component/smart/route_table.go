@@ -566,3 +566,68 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 	sb.WriteString("]")
 	return sb.String()
 }
+
+// DebugDumpDecision returns a detailed debug string for connection-decision logging.
+// It includes the full route-table row state with the selected proxy highlighted (★),
+// plus ASN sub-table average connection size for the given target when available.
+func (rt *RouteTable) DebugDumpDecision(key, target, selectedProxy string) string {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+
+	var sb strings.Builder
+
+	row, ok := rt.rows[key]
+	if !ok || len(row.proxies) == 0 {
+		sb.WriteString(fmt.Sprintf("key=%s proxies=<empty>", key))
+		return sb.String()
+	}
+
+	// Collect and sort by latency for readable output
+	type entry struct {
+		name    string
+		latency int64
+		use     int64
+		loss    float64
+		speed   float64
+	}
+	entries := make([]entry, 0, len(row.proxies))
+	for _, cell := range row.proxies {
+		entries = append(entries, entry{
+			name:    cell.name,
+			latency: cell.latency,
+			use:     cell.useCount,
+			loss:    cell.pkgLoss,
+			speed:   cell.speed,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].latency != entries[j].latency {
+			return entries[i].latency < entries[j].latency
+		}
+		return entries[i].name < entries[j].name
+	})
+
+	sb.WriteString(fmt.Sprintf("key=%s best=%s tcpProbed=%v proxies=[",
+		key, row.bestProxy, row.tcpProbed))
+	for i, e := range entries {
+		if i > 0 {
+			sb.WriteString(" ")
+		}
+		marker := ""
+		if e.name == selectedProxy {
+			marker = "★"
+		}
+		sb.WriteString(fmt.Sprintf("%s%s(lat=%d,use=%d,loss=%.3f,spd=%.0f)",
+			marker, e.name, e.latency, e.use, e.loss, e.speed))
+	}
+	sb.WriteString("]")
+
+	// ASN sub-table: show average connection size for this target
+	if row.asnSub != nil && target != "" {
+		if avgSize, hasSize := row.asnSub.GetAvgConnSize(target); hasSize {
+			sb.WriteString(fmt.Sprintf(" target=%s avgConnSize=%.0f", target, avgSize))
+		}
+	}
+
+	return sb.String()
+}
