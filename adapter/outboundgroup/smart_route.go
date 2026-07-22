@@ -54,10 +54,10 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 	}
 
 	// Fast path: known route with TCP-probed best proxy.
-	// 8% of requests intentionally skip the fast path to trigger re-discovery,
+	// 10% of requests intentionally skip the fast path to trigger re-discovery,
 	// giving the pre-ranker a chance to use accumulated per-key latency data
 	// from earlier loser measurements and potentially find a better proxy.
-	if s.routeTable.IsTCPProbed(key) && rand.Intn(100)%12 != 0 {
+	if s.routeTable.IsTCPProbed(key) && rand.Intn(100)%10 != 0 {
 		if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
 			for _, p := range proxies {
 				if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
@@ -108,7 +108,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 		}
 	}
 
-	// Cold start, 8% re-discover, or all serial fallbacks exhausted:
+	// Cold start, 10% re-discover, or all serial fallbacks exhausted:
 	// full parallel discovery.
 	return s.discoverAndRoute(ctx, metadata, key, proxies)
 }
@@ -184,7 +184,9 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	// Update route table with the winner
 	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
 	s.routeTable.IncrementUseCount(key, proxy.Name())
-	s.routeTable.SetBestProxy(key, proxy.Name())
+	// set bestProxy to empty string to force re-rank on next request
+	// this avoids reuse a 'latency only' proxy in the next several requests.
+	s.routeTable.SetBestProxy(key, "")
 	s.routeTable.SetTCPProbed(key)
 
 	return s.wrapTCPConn(conn, proxy, metadata), nil

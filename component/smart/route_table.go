@@ -203,7 +203,7 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 func calculateScore(latency int64, speed float64, pkgLoss float64) float64 {
 	score := 0.0
 	if latency > 0 {
-		score = 100.0 / float64(latency)
+		score = 100.0 / math.Max(float64(latency), 100.0)
 	}
 	if speed > 0 {
 		// 500kb/s is a sensitive threshold to define what is good download speed or not.
