@@ -139,6 +139,17 @@ func (rt *RouteTable) IsTCPProbed(key string) bool {
 	return ok && row.tcpProbed
 }
 
+// LastUsed returns the lastUsed timestamp for a route key.
+func (rt *RouteTable) LastUsed(key string) (int64, bool) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return 0, false
+	}
+	return row.lastUsed, true
+}
+
 // SetBestProxy sets the best proxy for a route key.
 func (rt *RouteTable) SetBestProxy(key, proxy string) {
 	rt.mu.Lock()

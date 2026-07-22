@@ -55,19 +55,27 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 	// 8% of requests intentionally skip the fast path to trigger re-discovery,
 	// giving the pre-ranker a chance to use accumulated per-key latency data
 	// from earlier loser measurements and potentially find a better proxy.
+	//
+	// Within the fast path, only trust bestProxy if the row was touched
+	// within the last 5 seconds — a recent success suggests conditions
+	// haven't changed.  Otherwise fall through to SecondaryRank to
+	// re-evaluate in light of accumulated EMA data.
 	if s.routeTable.IsTCPProbed(key) && rand.Intn(100)%12 != 0 {
-		if bestName, ok := s.routeTable.GetBestProxy(key); ok {
-			for _, p := range proxies {
-				if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
-					conn, err := s.dialAndWrap(ctx, p, metadata, key)
-					if err == nil {
-						return conn, nil
+		now := time.Now().Unix()
+		if lu, ok := s.routeTable.LastUsed(key); ok && now-lu < 5 {
+			if bestName, ok := s.routeTable.GetBestProxy(key); ok {
+				for _, p := range proxies {
+					if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
+						conn, err := s.dialAndWrap(ctx, p, metadata, key)
+						if err == nil {
+							return conn, nil
+						}
+						s.routeTable.MarkFailed(key, bestName)
+						if tunnel.ShouldStopRetry(err) {
+							return nil, err
+						}
+						break
 					}
-					s.routeTable.MarkFailed(key, bestName)
-					if tunnel.ShouldStopRetry(err) {
-						return nil, err
-					}
-					break
 				}
 			}
 		}
