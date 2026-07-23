@@ -173,7 +173,7 @@ func (pc *ProbeCoordinator) probeBatch(
 		}
 
 		log.Infoln("[Smart] probeBatch key=%s batch=%v", key, batchNames)
-		result, metrics := pc.parallelDial(ctx, key, batch, metadata, singleDial)
+		result, metrics := pc.parallelDial(ctx, key, batch, metadata, singleDial, rt)
 		// Record all successful connectTimes to the route table so losers'
 		// measurements are not wasted — they improve prerank accuracy for
 		// subsequent discoveries on this route key.
@@ -210,13 +210,14 @@ func (pc *ProbeCoordinator) probeBatch(
 // parallelDial concurrently dials all proxies in the batch.
 // Returns the FIRST successful connection immediately without waiting for
 // slower goroutines.  Remaining goroutines complete in the background and
-// their connectTimes are recorded in the route table by the caller.
+// write their connectTimes directly to the route table.
 func (pc *ProbeCoordinator) parallelDial(
 	ctx context.Context,
 	key string,
 	batch []C.Proxy,
 	metadata *C.Metadata,
 	singleDial func(context.Context, C.Proxy, *C.Metadata, time.Time) (C.Conn, int64, error),
+	rt *smart.RouteTable,
 ) (probeResult, []probeMetric) {
 	n := len(batch)
 	if n == 0 {
@@ -261,7 +262,7 @@ func (pc *ProbeCoordinator) parallelDial(
 						for i := 0; i < remaining; i++ {
 							r := <-results
 							if r.err == nil {
-								allMetrics = append(allMetrics, probeMetric{proxyName: r.proxy.Name(), connectTime: r.connectTime})
+								rt.UpdateLatency(key, r.proxy.Name(), r.connectTime)
 								log.Debugln("[Smart] parallelDial key=%s proxy=%s connectTime=%dms (loser)",
 									key, r.proxy.Name(), r.connectTime)
 								if r.conn != nil {

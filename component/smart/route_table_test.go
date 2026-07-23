@@ -143,7 +143,7 @@ func TestCalculateScore(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		got := calculateScore(tc.latency, tc.speed)
+		got := calculateScore(tc.latency, tc.speed, 0)
 		if math.Abs(got-tc.expect) > 0.000001 {
 			t.Fatalf("latency=%d speed=%.0f: expected score %.6f, got %.6f", tc.latency, tc.speed, tc.expect, got)
 		}
