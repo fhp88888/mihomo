@@ -82,8 +82,8 @@ func TestEMAPkgLoss(t *testing.T) {
 
 	rt.UpdatePkgLoss(key, proxy, 0.01)
 	snap := rt.Snapshot("test")
-	if snap.Rows[0].Proxies[proxy].Attributes.PkgLoss != 0.01 {
-		t.Fatal("first pkg_loss should be 0.01")
+	first := snap.Rows[0].Proxies[proxy].Attributes.PkgLoss; if first < 0.009 || first > 0.011 {
+		t.Fatalf("first pkg_loss should be ~0.01, got %.6f", first)
 	}
 
 	rt.UpdatePkgLoss(key, proxy, 0.04)

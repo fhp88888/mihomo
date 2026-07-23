@@ -37,11 +37,12 @@ type rowEntry struct {
 
 type proxyCell struct {
 	name      string
-	useCount  int64
-	latency   int64   // EMA, 0 means no sample yet
-	pkgLoss   float64 // EMA
-	speed     float64 // EMA
+	pkgLoss   float32 // EMA
+	speed     float32 // EMA
+	useCount  uint16
+	latency   uint16 // EMA, 0 means no sample yet
 	hasSample bool
+	_pad      [3]byte
 }
 
 // RowSnapshot is a read-only copy of a row for the REST API.
@@ -180,19 +181,19 @@ func (rt *RouteTable) getOrCreateCell(row *rowEntry, proxy string) *proxyCell {
 	return cell
 }
 
-// applyEMA applies exponential moving average with 1/3 weight for the new sample.
-func applyEMA(old, new float64, hasSample bool) float64 {
+// applyEMA32 applies exponential moving average with 1/3 weight for the new sample.
+func applyEMA32(old, new float32, hasSample bool) float32 {
 	if !hasSample {
 		return new
 	}
 	return old*2.0/3.0 + new/3.0
 }
 
-func applyEMAInt64(old, new int64, hasSample bool) int64 {
+func applyEMAUint16(old, new uint16, hasSample bool) uint16 {
 	if !hasSample {
 		return new
 	}
-	return int64(float64(old)*2.0/3.0 + float64(new)/3.0)
+	return uint16(float32(old)*2.0/3.0 + float32(new)/3.0)
 }
 
 // UpdateLatency updates the EMA latency for a (key, proxy) pair.
@@ -201,7 +202,11 @@ func (rt *RouteTable) UpdateLatency(key, proxy string, latency int64) {
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.latency = applyEMAInt64(cell.latency, latency, cell.hasSample)
+	v := uint16(latency)
+	if latency > 65535 {
+		v = 65535
+	}
+	cell.latency = applyEMAUint16(cell.latency, v, cell.hasSample)
 	cell.hasSample = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
@@ -213,7 +218,7 @@ func (rt *RouteTable) UpdatePkgLoss(key, proxy string, loss float64) {
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.pkgLoss = applyEMA(float64(cell.pkgLoss), loss, cell.hasSample)
+	cell.pkgLoss = applyEMA32(cell.pkgLoss, float32(loss), cell.hasSample)
 	cell.hasSample = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
@@ -225,7 +230,7 @@ func (rt *RouteTable) UpdateSpeed(key, proxy string, speed float64) {
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.speed = applyEMA(float64(cell.speed), speed, cell.hasSample)
+	cell.speed = applyEMA32(cell.speed, float32(speed), cell.hasSample)
 	cell.hasSample = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
@@ -320,7 +325,7 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 			for _, proxy := range proxies {
 				if cell, cOk := row.proxies[proxy]; cOk && cell.hasSample {
 					s := stats[proxy]
-					s.sum += cell.latency
+					s.sum += int64(cell.latency)
 					s.count++
 				}
 			}
@@ -391,8 +396,8 @@ func (rt *RouteTable) SecondaryRank(
 		if ok {
 			if cell, cOk := row.proxies[proxyName]; cOk && cell.hasSample {
 				establishTimeMs = float64(cell.latency)
-				avgSpeed = cell.speed
-				pLoss = cell.pkgLoss
+				avgSpeed = float64(cell.speed)
+				pLoss = float64(cell.pkgLoss)
 				hasCell = true
 			}
 		}
@@ -407,9 +412,10 @@ func (rt *RouteTable) SecondaryRank(
 
 		// Compute transmit_time_ms
 		var transmitTimeMs float64
-		avgConnSize, hasSize := float64(0), false
+		var avgConnSize float64
+			var hasSize bool
 		if asnSub != nil {
-			avgConnSize, hasSize = asnSub.GetAvgConnSize(target)
+			c32, ok := asnSub.GetAvgConnSize(target); avgConnSize, hasSize = float64(c32), ok
 		}
 
 		if hasSize && avgConnSize > 0 && avgSpeed > epsilon {
@@ -500,11 +506,11 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 		for _, cell := range row.proxies {
 			proxies[cell.name] = ProxyRecord{
 				Name:     cell.name,
-				UseCount: cell.useCount,
+				UseCount: int64(cell.useCount),
 				Attributes: ProxyAttributes{
-					PkgLoss: cell.pkgLoss,
-					Latency: cell.latency,
-					Speed:   cell.speed,
+					PkgLoss: float64(cell.pkgLoss),
+					Latency: int64(cell.latency),
+					Speed:   float64(cell.speed),
 				},
 			}
 		}
@@ -551,10 +557,10 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 	for _, cell := range row.proxies {
 		entries = append(entries, entry{
 			name:    cell.name,
-			latency: cell.latency,
-			use:     cell.useCount,
-			loss:    cell.pkgLoss,
-			speed:   cell.speed,
+			latency: int64(cell.latency),
+			use:     int64(cell.useCount),
+			loss:    float64(cell.pkgLoss),
+			speed:   float64(cell.speed),
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool {
@@ -605,10 +611,10 @@ func (rt *RouteTable) DebugDumpDecision(key, target, selectedProxy string) strin
 	for _, cell := range row.proxies {
 		entries = append(entries, entry{
 			name:    cell.name,
-			latency: cell.latency,
-			use:     cell.useCount,
-			loss:    cell.pkgLoss,
-			speed:   cell.speed,
+			latency: int64(cell.latency),
+			use:     int64(cell.useCount),
+			loss:    float64(cell.pkgLoss),
+			speed:   float64(cell.speed),
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool {

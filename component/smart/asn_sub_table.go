@@ -7,7 +7,7 @@ const defaultMaxASNEntries = 20
 // connSizeEntry is one per-target record in the ASN sub-table.
 type connSizeEntry struct {
 	target      string
-	avgConnSize float64 // EMA, bidirectional bytes per connection lifecycle
+	avgConnSize float32 // EMA, bidirectional bytes per connection lifecycle
 }
 
 // ASNSubTable tracks per-target average connection size (upload+download)
@@ -40,7 +40,7 @@ func (t *ASNSubTable) Update(target string, totalBytes float64) {
 
 	for i := range t.entries {
 		if t.entries[i].target == target {
-			t.entries[i].avgConnSize = t.entries[i].avgConnSize*2.0/3.0 + totalBytes/3.0
+			t.entries[i].avgConnSize = t.entries[i].avgConnSize*2.0/3.0 + float32(totalBytes)/3.0
 			// Move to end (most recently used)
 			entry := t.entries[i]
 			t.entries = append(t.entries[:i], t.entries[i+1:]...)
@@ -55,13 +55,13 @@ func (t *ASNSubTable) Update(target string, totalBytes float64) {
 	}
 	t.entries = append(t.entries, connSizeEntry{
 		target:      target,
-		avgConnSize: totalBytes,
+		avgConnSize: float32(totalBytes),
 	})
 }
 
 // GetAvgConnSize returns the EMA average connection size for the given target.
 // Returns (0, false) if no record exists.
-func (t *ASNSubTable) GetAvgConnSize(target string) (float64, bool) {
+func (t *ASNSubTable) GetAvgConnSize(target string) (float32, bool) {
 	if target == "" {
 		return 0, false
 	}

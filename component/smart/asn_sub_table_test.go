@@ -24,7 +24,7 @@ func TestASNSubTableUpdateAndGet(t *testing.T) {
 		t.Fatal("expected entry after EMA update")
 	}
 	expected := 10240.0*2.0/3.0 + 51200.0/3.0
-	if size < expected-0.01 || size > expected+0.01 {
+	if float64(size) < expected-0.01 || float64(size) > expected+0.01 {
 		t.Fatalf("expected EMA size=%.2f, got %.2f", expected, size)
 	}
 }
