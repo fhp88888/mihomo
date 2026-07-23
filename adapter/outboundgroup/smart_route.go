@@ -65,6 +65,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 					if err == nil {
 						return conn, nil
 					}
+					log.Infoln("[Smart] tcpRoute key=%s fast-best FAILED proxy=%s err=%v", key, bestName, err)
 					s.routeTable.MarkFailed(key, bestName)
 					if tunnel.ShouldStopRetry(err) {
 						return nil, err
@@ -76,6 +77,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 
 		// Best proxy is stale, unavailable, or failed. Try the remaining
 		// per-key proxies serially by score, recalculated from current latency.
+		log.Infoln("[Smart] tcpRoute key=%s fast-best-miss, trying serial fallback", key)
 		names := make([]string, 0, len(proxies))
 		proxyMap := make(map[string]C.Proxy, len(proxies))
 		for _, p := range proxies {
@@ -106,6 +108,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 				return nil, err
 			}
 		}
+		log.Infoln("[Smart] tcpRoute key=%s serial-fallback-exhausted, falling to discovery", key)
 	}
 
 	// Cold start, 8% re-discover, or all serial fallbacks exhausted:
@@ -146,6 +149,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	}
 
 	if len(available) == 0 {
+		log.Infoln("[Smart] discoverAndRoute key=%s NO-ALIVE-PROXIES (total=%d)", key, len(proxies))
 		return nil, errors.New("no alive proxies available")
 	}
 
@@ -178,8 +182,12 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	)
 
 	if err != nil {
+		log.Infoln("[Smart] discoverAndRoute key=%s DISCOVERY-FAILED err=%v", key, err)
 		return nil, err
 	}
+
+	log.Infoln("[Smart] discoverAndRoute key=%s winner=%s connectTime=%dms",
+		key, proxy.Name(), connectTime)
 
 	// Update route table with the winner
 	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
