@@ -17,6 +17,7 @@ import (
 	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/mmdb"
+	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/smart"
 	C "github.com/metacubex/mihomo/constant"
@@ -88,6 +89,8 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 
 	configName := getConfigFilename()
 
+	routeTable := smart.NewRouteTable(smart.DefaultMaxRows)
+
 	s := &Smart{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:           option.Name,
@@ -111,7 +114,7 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		useLightGBM:      smartOption.UseLightGBM,
 		collectData:      smartOption.CollectData,
 		preferASN:        smartOption.PreferASN,
-		routeTable:       smart.NewRouteTable(smart.DefaultMaxRows),
+		routeTable:       routeTable,
 		probeCoordinator: NewProbeCoordinator(),
 	}
 
@@ -123,9 +126,48 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		applyPolicyPriority(s, smartOption.PolicyPriority)
 	}
 
+	// Restore persisted route table cells from the database.
+	s.restoreRouteTable(routeTable, configName)
+
 	s.InitSmart()
 
 	return s, nil
+}
+
+// restoreRouteTable loads persisted route cells from the bbolt store into the
+// in-memory route table.  Cells that were loaded are marked clean so the
+// periodic flush won't re-persist them until they actually change.
+func (s *Smart) restoreRouteTable(rt *smart.RouteTable, configName string) {
+	store := cachefile.GetSmartStore()
+	if store == nil {
+		return
+	}
+
+	rawCells, err := store.LoadRouteCells(configName, s.Name())
+	if err != nil {
+		log.Debugln("[Smart] No persisted route data for group [%s]: %v", s.Name(), err)
+		return
+	}
+
+	loaded := 0
+	for keyProxy, data := range rawCells {
+		var pc smart.PersistedCell
+		if json.Unmarshal(data, &pc) != nil {
+			continue
+		}
+		// keyProxy format: {routeKey}/{proxyName}
+		slash := strings.LastIndex(keyProxy, "/")
+		if slash < 0 {
+			continue
+		}
+		key := keyProxy[:slash]
+		proxy := keyProxy[slash+1:]
+		rt.RestoreRow(key, proxy, pc)
+		loaded++
+	}
+	if loaded > 0 {
+		log.Infoln("[Smart] Restored %d persisted route cells for group [%s]", loaded, s.Name())
+	}
 }
 
 func (s *Smart) GetConfigFilename() string {
@@ -145,6 +187,9 @@ func (s *Smart) InitSmart() {
 		}
 	})
 
+	// Periodic route table persistence: every 10 minutes, iterate the route
+	// table and enqueue dirty cells to the bbolt batch queue.
+	s.startTimedTask(10*time.Minute, 10*time.Minute, "Route table persistence", s.persistRouteTable, false)
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, true)
 }
 
@@ -430,6 +475,54 @@ func (s *Smart) cleanupOrphanedNodeCache() {
 			}
 		}
 	}
+}
+
+// persistRouteTable atomically snapshots dirty cells and enqueues them
+// to the global bbolt batch queue.  The snapshot-and-clear is a single
+// lock window, so no dirty flag is lost to concurrent mutations.
+func (s *Smart) persistRouteTable() {
+	dirty := s.routeTable.SnapshotAndClearDirty()
+	if len(dirty) == 0 {
+		return
+	}
+
+	store := cachefile.GetSmartStore()
+
+	// Check whether the underlying DB is available.  If not, re-mark the
+	// cells dirty so the next cycle retries — otherwise we'd silently
+	// discard data when the bbolt file can't be opened.
+	if !store.IsDBAvailable() {
+		for cellKey := range dirty {
+			if idx := strings.IndexByte(cellKey, 0); idx >= 0 {
+				s.routeTable.MarkDirty(cellKey[:idx], cellKey[idx+1:])
+			}
+		}
+		log.Debugln("[Smart] DB unavailable, re-marked %d dirty route cells for group [%s]", len(dirty), s.Name())
+		return
+	}
+
+	for cellKey, pc := range dirty {
+		// cellKey format: {routeKey}\x00{proxyName}
+		if idx := strings.IndexByte(cellKey, 0); idx >= 0 {
+			key := cellKey[:idx]
+			proxy := cellKey[idx+1:]
+
+			data, err := json.Marshal(pc)
+			if err != nil {
+				continue
+			}
+
+			store.AppendToGlobalQueue(smart.StoreOperation{
+				Type:   smart.OpSaveRoute,
+				Group:  s.Name(),
+				Config: s.configName,
+				Target: key + "/" + proxy,
+				Data:   data,
+			})
+		}
+	}
+
+	log.Debugln("[Smart] Persisted %d dirty route cells for group [%s]", len(dirty), s.Name())
 }
 
 // ── Status test ─────────────────────────────────────────────

@@ -38,14 +38,15 @@ type rowEntry struct {
 }
 
 type proxyCell struct {
-	name        string
-	useCount    int64
-	failedCount int64
-	latency     int64   // EMA, 0 means no sample yet
-	pkgLoss     float64 // EMA
-	speed       float64 // EMA
-	score       float64 // non-EMA score derived from latency, speed, pkgLoss and failedCount
-	hasSample   bool
+	Name        string
+	UseCount    int64
+	FailedCount int64
+	Latency     int64   // EMA, 0 means no sample yet
+	PkgLoss     float64 // EMA
+	Speed       float64 // EMA
+	Score       float64 // non-EMA score derived from latency, speed, pkgLoss and failedCount
+	HasSample   bool
+	Dirty       bool // true when cell has unsaved changes
 }
 
 // RowSnapshot is a read-only copy of a row for the REST API.
@@ -181,7 +182,7 @@ func (rt *RouteTable) SetTCPProbed(key string) {
 func (rt *RouteTable) getOrCreateCell(row *rowEntry, proxy string) *proxyCell {
 	cell, ok := row.proxies[proxy]
 	if !ok {
-		cell = &proxyCell{name: proxy}
+		cell = &proxyCell{Name: proxy}
 		row.proxies[proxy] = cell
 	}
 	return cell
@@ -240,10 +241,10 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 	}
 	for _, proxy := range proxies {
 		cell, ok := row.proxies[proxy]
-		if !ok || !cell.hasSample {
+		if !ok || !cell.HasSample {
 			continue
 		}
-		cell.score = calculateScore(cell.latency, cell.speed, cell.pkgLoss, cell.failedCount)
+		cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount)
 	}
 }
 
@@ -268,12 +269,12 @@ func (rt *RouteTable) DebugDumpScores(key string) string {
 	entries := make([]entry, 0, len(row.proxies))
 	for _, cell := range row.proxies {
 		entries = append(entries, entry{
-			name:  cell.name,
-			lat:   cell.latency,
-			spd:   cell.speed,
-			loss:  cell.pkgLoss,
-			fail:  cell.failedCount,
-			score: cell.score,
+			name:  cell.Name,
+			lat:   cell.Latency,
+			spd:   cell.Speed,
+			loss:  cell.PkgLoss,
+			fail:  cell.FailedCount,
+			score: cell.Score,
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].score > entries[j].score })
@@ -297,8 +298,9 @@ func (rt *RouteTable) UpdateLatency(key, proxy string, latency int64) {
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.latency = applyEMAInt64(cell.latency, latency, cell.hasSample)
-	cell.hasSample = true
+	cell.Latency = applyEMAInt64(cell.Latency, latency, cell.HasSample)
+	cell.HasSample = true
+	cell.Dirty = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
 }
@@ -309,8 +311,9 @@ func (rt *RouteTable) UpdatePkgLoss(key, proxy string, loss float64) {
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.pkgLoss = applyEMA(float64(cell.pkgLoss), loss, cell.hasSample)
-	cell.hasSample = true
+	cell.PkgLoss = applyEMA(float64(cell.PkgLoss), loss, cell.HasSample)
+	cell.HasSample = true
+	cell.Dirty = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
 }
@@ -321,8 +324,9 @@ func (rt *RouteTable) UpdateSpeed(key, proxy string, speed float64) {
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.speed = applyEMA(float64(cell.speed), speed, cell.hasSample)
-	cell.hasSample = true
+	cell.Speed = applyEMA(float64(cell.Speed), speed, cell.HasSample)
+	cell.HasSample = true
+	cell.Dirty = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
 }
@@ -334,8 +338,9 @@ func (rt *RouteTable) IncrementUseCount(key, proxy string) {
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.useCount++
-	cell.failedCount = 0
+	cell.UseCount++
+	cell.FailedCount = 0
+	cell.Dirty = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
 }
@@ -362,8 +367,8 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 		hasKeyData := false
 		for _, proxy := range proxies {
 			if ok {
-				if cell, cOk := row.proxies[proxy]; cOk && cell.hasSample {
-					meanLatency[proxy] = float64(cell.latency)
+				if cell, cOk := row.proxies[proxy]; cOk && cell.HasSample {
+					meanLatency[proxy] = float64(cell.Latency)
 					hasKeyData = true
 					continue
 				}
@@ -401,9 +406,9 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 
 		for _, row := range rt.rows {
 			for _, proxy := range proxies {
-				if cell, cOk := row.proxies[proxy]; cOk && cell.hasSample {
+				if cell, cOk := row.proxies[proxy]; cOk && cell.HasSample {
 					s := stats[proxy]
-					s.sum += cell.latency
+					s.sum += cell.Latency
 					s.count++
 				}
 			}
@@ -439,11 +444,11 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 	row, rowOK := rt.rows[key]
 	for _, proxy := range proxies {
 		if rowOK {
-			if cell, ok := row.proxies[proxy]; ok && cell.hasSample {
-				if cell.score > 0 {
-					scores[proxy] = cell.score
+			if cell, ok := row.proxies[proxy]; ok && cell.HasSample {
+				if cell.Score > 0 {
+					scores[proxy] = cell.Score
 				} else {
-					scores[proxy] = calculateScore(cell.latency, cell.speed, cell.pkgLoss, cell.failedCount)
+					scores[proxy] = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount)
 				}
 				continue
 			}
@@ -491,11 +496,87 @@ func (rt *RouteTable) MarkFailed(key, proxy string) {
 		return
 	}
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.failedCount++
+	cell.FailedCount++
+	cell.Dirty = true
 	if row.bestProxy == proxy {
 		row.bestProxy = ""
 	}
 	row.tcpProbed = false
+}
+
+// SnapshotAndClearDirty atomically snapshots all dirty cells and clears them
+// in a single lock window. Returns a deep copy of each cell's persisted fields
+// so the caller can serialize without holding the lock and without risk of
+// data races with concurrent writers.
+//
+// The map key is "{routeKey}\x00{proxyName}".
+func (rt *RouteTable) SnapshotAndClearDirty() map[string]PersistedCell {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	snapshot := make(map[string]PersistedCell)
+	for key, row := range rt.rows {
+		for _, cell := range row.proxies {
+			if cell.Dirty {
+				cellKey := key + "\x00" + cell.Name
+				snapshot[cellKey] = PersistedCell{
+					Latency:     cell.Latency,
+					PkgLoss:     cell.PkgLoss,
+					Speed:       cell.Speed,
+					UseCount:    cell.UseCount,
+					FailedCount: cell.FailedCount,
+					HasSample:   cell.HasSample,
+				}
+				cell.Dirty = false
+			}
+		}
+	}
+	return snapshot
+}
+
+// MarkDirty sets the dirty flag on a cell so it will be included in the next
+// periodic persist cycle.  Unlike RestoreRow, it does not touch cell data,
+// LRU order, or the Score field.
+func (rt *RouteTable) MarkDirty(key, proxy string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return
+	}
+	cell, ok := row.proxies[proxy]
+	if !ok {
+		return
+	}
+	cell.Dirty = true
+}
+
+// PersistedCell is the JSON-serializable form of a proxyCell meant for DB storage.
+type PersistedCell struct {
+	Latency     int64   `json:"latency"`
+	PkgLoss     float64 `json:"pkg_loss"`
+	Speed       float64 `json:"speed"`
+	UseCount    int64   `json:"use_count"`
+	FailedCount int64   `json:"failed_count"`
+	HasSample   bool    `json:"has_sample"`
+}
+
+// RestoreRow restores a per-(key,proxy) cell from previously persisted data.
+// The restored cell has dirty=false so it won't be flushed until modified.
+func (rt *RouteTable) RestoreRow(key, proxy string, pc PersistedCell) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row := rt.getOrCreateRow(key)
+	cell := rt.getOrCreateCell(row, proxy)
+	cell.Latency = pc.Latency
+	cell.PkgLoss = pc.PkgLoss
+	cell.Speed = pc.Speed
+	cell.UseCount = pc.UseCount
+	cell.FailedCount = pc.FailedCount
+	cell.HasSample = pc.HasSample
+	cell.Score = calculateScore(pc.Latency, pc.Speed, pc.PkgLoss, pc.FailedCount)
+	cell.Dirty = false
+	row.lastUsed = time.Now().Unix()
+	rt.touchLRU(key)
 }
 
 // RemoveProxy removes a proxy from all rows (e.g., when it leaves the provider).
@@ -510,6 +591,13 @@ func (rt *RouteTable) RemoveProxy(name string) {
 	}
 }
 
+// Len returns the current number of rows in the table.
+func (rt *RouteTable) Len() int {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return len(rt.rows)
+}
+
 // Snapshot returns a read-only deep copy of the full table sorted by LastUsed descending.
 func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 	rt.mu.RLock()
@@ -519,15 +607,15 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 	for _, row := range rt.rows {
 		proxies := make(map[string]ProxyRecord, len(row.proxies))
 		for _, cell := range row.proxies {
-			proxies[cell.name] = ProxyRecord{
-				Name:     cell.name,
-				UseCount: cell.useCount,
+			proxies[cell.Name] = ProxyRecord{
+				Name:     cell.Name,
+				UseCount: cell.UseCount,
 				Attributes: ProxyAttributes{
-					PkgLoss:     cell.pkgLoss,
-					Latency:     cell.latency,
-					Speed:       cell.speed,
-					Score:       cell.score,
-					FailedCount: cell.failedCount,
+					PkgLoss:     cell.PkgLoss,
+					Latency:     cell.Latency,
+					Speed:       cell.Speed,
+					Score:       cell.Score,
+					FailedCount: cell.FailedCount,
 				},
 			}
 		}
@@ -577,15 +665,15 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 	entries := make([]entry, 0, len(row.proxies))
 	for _, cell := range row.proxies {
 		entries = append(entries, entry{
-			name:         cell.name,
-			latency:      cell.latency,
-			use:          cell.useCount,
-			fail:         cell.failedCount,
-			loss:         cell.pkgLoss,
-			speed:        cell.speed,
-			latencyScore: calculateScore(cell.latency, 0, 0, cell.failedCount),
-			speedScore:   calculateScore(0, cell.speed, 0, cell.failedCount),
-			score:        cell.score,
+			name:         cell.Name,
+			latency:      cell.Latency,
+			use:          cell.UseCount,
+			fail:         cell.FailedCount,
+			loss:         cell.PkgLoss,
+			speed:        cell.Speed,
+			latencyScore: calculateScore(cell.Latency, 0, 0, cell.FailedCount),
+			speedScore:   calculateScore(0, cell.Speed, 0, cell.FailedCount),
+			score:        cell.Score,
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool {

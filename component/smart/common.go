@@ -23,6 +23,7 @@ const (
 	OpSavePrefetch
 	OpSaveRanking
 	OpSaveHostFailures
+	OpSaveRoute
 )
 
 const (
@@ -31,6 +32,7 @@ const (
 	KeyTypeStats            = "stats"
 	KeyTypeRanking          = "ranking"
 	KeyTypeHostFailures     = "failures"
+	KeyTypeRoute            = "route"
 
 	WeightTypeTCP           = "tcp"
 	WeightTypeUDP           = "udp"
@@ -159,6 +161,8 @@ func formatOperationKey(op *StoreOperation) string {
 		return FormatDBKey(KeyTypeRanking, op.Config, op.Group)
 	case OpSaveHostFailures:
 		return FormatDBKey(KeyTypeHostFailures, op.Config, op.Group, op.Target)
+	case OpSaveRoute:
+		return FormatDBKey(KeyTypeRoute, op.Config, op.Group, op.Target)
 	default:
 		return ""
 	}
@@ -573,6 +577,7 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 			FormatDBKey(KeyTypeRanking, config),
 			FormatDBKey(KeyTypePrefetch, config),
 			FormatDBKey(KeyTypeHostFailures, config),
+			FormatDBKey(KeyTypeRoute, config),
 		}, false)
 	} else if level == "group" {
 		s.DBBatchDeletePrefix([]string{
@@ -581,6 +586,7 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 			FormatDBKey(KeyTypeRanking, config, group),
 			FormatDBKey(KeyTypePrefetch, config, group),
 			FormatDBKey(KeyTypeHostFailures, config, group),
+			FormatDBKey(KeyTypeRoute, config, group),
 		}, false)
 	}
 
@@ -612,4 +618,9 @@ func (s *Store) FlushByGroup(group, config string) error {
 		log.Debugln("[SmartStore] All data for group [%s] config [%s] cleared", group, config)
 	}
 	return err
+}
+
+// IsDBAvailable reports whether the underlying bbolt database is open.
+func (s *Store) IsDBAvailable() bool {
+	return db != nil
 }

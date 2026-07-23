@@ -192,6 +192,13 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 				}
 				result[FormatDBKey(KeyTypeHostFailures, op.Config, op.Group, op.Target)] = op.Data
 			}
+		case KeyTypeRoute:
+			if op.Type == OpSaveRoute && op.Target != "" {
+				if depth >= 5 && seg4 != op.Target {
+					continue
+				}
+				result[FormatDBKey(KeyTypeRoute, op.Config, op.Group, op.Target)] = op.Data
+			}
 		}
 	}
 
@@ -208,7 +215,7 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 	var groupPrefix string
 
 	switch keyType {
-	case KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures, KeyTypeRanking:
+	case KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures, KeyTypeRanking, KeyTypeRoute:
 		if depth >= 4 {
 			hasGroupLevel = true
 			groupPrefix = FormatDBKey(keyType, config, group)
@@ -424,4 +431,27 @@ func (s *Store) DBBatchDeletePrefix(prefixes []string, strict bool) error {
 		}
 		return nil
 	})
+}
+
+// LoadRouteCells loads persisted route table cells for all target keys in a group.
+// Returns a map of "key/proxy" -> raw JSON PersistedCell.
+func (s *Store) LoadRouteCells(config, group string) (map[string][]byte, error) {
+	pathPrefix := FormatDBKey(KeyTypeRoute, config, group)
+	rawResult, err := s.GetSubBytesByPath(pathPrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string][]byte, len(rawResult))
+	prefix := pathPrefix + "/"
+	for fullPath, data := range rawResult {
+		if !strings.HasPrefix(fullPath, prefix) {
+			continue
+		}
+		// fullPath = smart/route/{config}/{group}/{key}/{proxy}
+		// keyProxy  = {routeKey}/{proxyName}
+		keyProxy := fullPath[len(prefix):]
+		result[keyProxy] = data
+	}
+	return result, nil
 }
