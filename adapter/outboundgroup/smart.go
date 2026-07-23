@@ -196,6 +196,7 @@ func (s *Smart) InitSmart() {
 	// Periodic route table persistence: every 10 minutes, iterate the route
 	// table and enqueue dirty cells to the bbolt batch queue.
 	s.startTimedTask(10*time.Minute, 10*time.Minute, "Route table persistence", s.persistRouteTable, false)
+	s.startTimedTask(10*time.Minute, 10*time.Minute, "FailedCount decay", s.decayFailedCounts, false)
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, true)
 }
 
@@ -529,6 +530,14 @@ func (s *Smart) persistRouteTable() {
 	}
 
 	log.Infoln("[Smart] Persisted %d dirty route cells for group [%s]", len(dirty), s.Name())
+}
+
+// decayFailedCounts reduces every route cell's FailedCount by 0.1 (floor 0).
+func (s *Smart) decayFailedCounts() {
+	count := s.routeTable.DecayFailedCounts()
+	if count > 0 {
+		log.Debugln("[Smart] Decayed FailedCount for %d cells in group [%s]", count, s.Name())
+	}
 }
 
 // ── Status test ─────────────────────────────────────────────

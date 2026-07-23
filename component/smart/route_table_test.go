@@ -133,7 +133,7 @@ func TestCalculateScore(t *testing.T) {
 	cases := []struct {
 		latency     int64
 		speed       float64
-		failedCount int64
+		failedCount float64
 		expect      float64
 	}{
 		// score = 100 / max(latency, 100)  when speed=0, pkgLoss=0, failedCount=0
@@ -153,7 +153,7 @@ func TestCalculateScore(t *testing.T) {
 	for _, tc := range cases {
 		got := calculateScore(tc.latency, tc.speed, 0, tc.failedCount)
 		if math.Abs(got-tc.expect) > 0.000001 {
-			t.Fatalf("latency=%d speed=%.0f fail=%d: expected score %.6f, got %.6f", tc.latency, tc.speed, tc.failedCount, tc.expect, got)
+			t.Fatalf("latency=%d speed=%.0f fail=%.1f: expected score %.6f, got %.6f", tc.latency, tc.speed, tc.failedCount, tc.expect, got)
 		}
 	}
 }

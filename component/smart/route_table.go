@@ -18,7 +18,7 @@ type ProxyAttributes struct {
 	Latency     int64   `json:"latency"`
 	Speed       float64 `json:"speed"`
 	Score       float64 `json:"score"`
-	FailedCount int64   `json:"failed_count"`
+	FailedCount float64 `json:"failed_count"`
 }
 
 // ProxyRecord is the per-proxy entry in a route table row.
@@ -40,7 +40,7 @@ type rowEntry struct {
 type proxyCell struct {
 	Name        string
 	UseCount    int64
-	FailedCount int64
+	FailedCount float64
 	Latency     int64   // EMA, 0 means no sample yet
 	PkgLoss     float64 // EMA
 	Speed       float64 // EMA
@@ -203,7 +203,7 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 	return int64(float64(old)*3.0/4.0 + float64(new)/4.0)
 }
 
-func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount int64) float64 {
+func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount float64) float64 {
 	score := 0.0
 	if latency > 0 {
 		score = 100.0 / math.Max(float64(latency), 100.0)
@@ -219,7 +219,7 @@ func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount i
 	// scores naturally degrade under persistent failure without needing
 	// a binary block/ban mechanism.
 	if failedCount > 0 {
-		score *= math.Pow(0.8, float64(failedCount))
+		score *= math.Pow(0.8, failedCount)
 	}
 	return score
 }
@@ -263,7 +263,7 @@ func (rt *RouteTable) DebugDumpScores(key string) string {
 		lat   int64
 		spd   float64
 		loss  float64
-		fail  int64
+		fail  float64
 		score float64
 	}
 	entries := make([]entry, 0, len(row.proxies))
@@ -285,7 +285,7 @@ func (rt *RouteTable) DebugDumpScores(key string) string {
 		if i > 0 {
 			sb.WriteString(" ")
 		}
-		sb.WriteString(fmt.Sprintf("%s(lat=%d,spd=%.0f,loss=%.3f,fail=%d→score=%.3f)",
+		sb.WriteString(fmt.Sprintf("%s(lat=%d,spd=%.0f,loss=%.3f,fail=%.1f→score=%.3f)",
 			e.name, e.lat, e.spd, e.loss, e.fail, e.score))
 	}
 	sb.WriteString("]")
@@ -496,12 +496,30 @@ func (rt *RouteTable) MarkFailed(key, proxy string) {
 		return
 	}
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.FailedCount++
+	cell.FailedCount += 1.0
 	cell.Dirty = true
 	if row.bestProxy == proxy {
 		row.bestProxy = ""
 	}
 	row.tcpProbed = false
+}
+
+// DecayFailedCounts reduces every cell's FailedCount by 0.1 (floor 0) across all
+// rows. Cells that change are marked dirty so they are persisted on the next cycle.
+func (rt *RouteTable) DecayFailedCounts() int {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	dirtyCount := 0
+	for _, row := range rt.rows {
+		for _, cell := range row.proxies {
+			if cell.FailedCount > 0 {
+				cell.FailedCount = math.Max(0, cell.FailedCount-0.1)
+				cell.Dirty = true
+				dirtyCount++
+			}
+		}
+	}
+	return dirtyCount
 }
 
 // SnapshotAndClearDirty atomically snapshots all dirty cells and clears them
@@ -556,7 +574,7 @@ type PersistedCell struct {
 	PkgLoss     float64 `json:"pkg_loss"`
 	Speed       float64 `json:"speed"`
 	UseCount    int64   `json:"use_count"`
-	FailedCount int64   `json:"failed_count"`
+	FailedCount float64   `json:"failed_count"`
 	HasSample   bool    `json:"has_sample"`
 }
 
@@ -655,7 +673,7 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 		name         string
 		latency      int64
 		use          int64
-		fail         int64
+		fail         float64
 		loss         float64
 		speed        float64
 		latencyScore float64
@@ -690,7 +708,7 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 		if i > 0 {
 			sb.WriteString(" ")
 		}
-		sb.WriteString(fmt.Sprintf("%s(lat=%d,use=%d,fail=%d,loss=%.3f,spd=%.0f,[latScore=%.4f,speedScore=%.4f,score=%.4f])",
+		sb.WriteString(fmt.Sprintf("%s(lat=%d,use=%d,fail=%.1f,loss=%.3f,spd=%.0f,[latScore=%.4f,speedScore=%.4f,score=%.4f])",
 			e.name, e.latency, e.use, e.fail, e.loss, e.speed, e.latencyScore, e.speedScore, e.score))
 	}
 	sb.WriteString("]")
