@@ -149,6 +149,12 @@ func (s *Smart) restoreRouteTable(rt *smart.RouteTable, configName string) {
 		return
 	}
 
+	if len(rawCells) == 0 {
+		return
+	}
+
+	log.Infoln("[Smart] Loaded %d persisted route cells from cache.db for group [%s], restoring...", len(rawCells), s.Name())
+
 	loaded := 0
 	for keyProxy, data := range rawCells {
 		var pc smart.PersistedCell
@@ -497,7 +503,7 @@ func (s *Smart) persistRouteTable() {
 				s.routeTable.MarkDirty(cellKey[:idx], cellKey[idx+1:])
 			}
 		}
-		log.Debugln("[Smart] DB unavailable, re-marked %d dirty route cells for group [%s]", len(dirty), s.Name())
+		log.Infoln("[Smart] DB unavailable, re-marked %d dirty route cells for group [%s]", len(dirty), s.Name())
 		return
 	}
 
@@ -522,7 +528,7 @@ func (s *Smart) persistRouteTable() {
 		}
 	}
 
-	log.Debugln("[Smart] Persisted %d dirty route cells for group [%s]", len(dirty), s.Name())
+	log.Infoln("[Smart] Persisted %d dirty route cells for group [%s]", len(dirty), s.Name())
 }
 
 // ── Status test ─────────────────────────────────────────────
