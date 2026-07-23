@@ -152,14 +152,6 @@ func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Meta
 		return nil, err
 	}
 
-	// Ensure tracker exists for speed/pkg_loss collection (same fix as master).
-	if statistic.DefaultManager.Get(metadata.UUID) == nil {
-		conn = statistic.NewTCPTracker(conn, statistic.DefaultManager, metadata, nil, 0, 0, false)
-	}
-
-	log.Debugln("[Smart] dialAndWrap key=%s proxy=%s OK connectTime=%dms uuid=%s",
-		key, proxy.Name(), connectTime, metadata.UUID)
-
 	// Update latency in route table
 	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
 	s.routeTable.IncrementUseCount(key, proxy.Name())
@@ -224,13 +216,8 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 		return nil, err
 	}
 
-	// Ensure tracker exists for speed/pkg_loss collection (same fix as master).
-	if statistic.DefaultManager.Get(metadata.UUID) == nil {
-		conn = statistic.NewTCPTracker(conn, statistic.DefaultManager, metadata, nil, 0, 0, false)
-	}
-
-	log.Infoln("[Smart] discoverAndRoute key=%s DISCOVERY-WINNER proxy=%s connectTime=%dms uuid=%s",
-		key, proxy.Name(), connectTime, metadata.UUID)
+	log.Infoln("[Smart] discoverAndRoute key=%s DISCOVERY-WINNER proxy=%s connectTime=%dms",
+		key, proxy.Name(), connectTime)
 
 	// Refresh scores again with winner latency, then dump final score state
 	s.routeTable.RefreshScores(key, names)
