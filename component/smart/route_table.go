@@ -14,10 +14,11 @@ const DefaultMaxRows = 5000
 
 // ProxyAttributes holds tracked connection quality metrics.
 type ProxyAttributes struct {
-	PkgLoss float64 `json:"pkg_loss"`
-	Latency int64   `json:"latency"`
-	Speed   float64 `json:"speed"`
-	Score   float64 `json:"score"`
+	PkgLoss     float64 `json:"pkg_loss"`
+	Latency     int64   `json:"latency"`
+	Speed       float64 `json:"speed"`
+	Score       float64 `json:"score"`
+	FailedCount int64   `json:"failed_count"`
 }
 
 // ProxyRecord is the per-proxy entry in a route table row.
@@ -37,13 +38,14 @@ type rowEntry struct {
 }
 
 type proxyCell struct {
-	name      string
-	useCount  int64
-	latency   int64   // EMA, 0 means no sample yet
-	pkgLoss   float64 // EMA
-	speed     float64 // EMA
-	score     float64 // non-EMA score derived from latency and speed
-	hasSample bool
+	name        string
+	useCount    int64
+	failedCount int64
+	latency     int64   // EMA, 0 means no sample yet
+	pkgLoss     float64 // EMA
+	speed       float64 // EMA
+	score       float64 // non-EMA score derived from latency, speed, pkgLoss and failedCount
+	hasSample   bool
 }
 
 // RowSnapshot is a read-only copy of a row for the REST API.
@@ -200,7 +202,7 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 	return int64(float64(old)*3.0/4.0 + float64(new)/4.0)
 }
 
-func calculateScore(latency int64, speed float64, pkgLoss float64) float64 {
+func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount int64) float64 {
 	score := 0.0
 	if latency > 0 {
 		score = 100.0 / math.Max(float64(latency), 100.0)
@@ -211,6 +213,13 @@ func calculateScore(latency int64, speed float64, pkgLoss float64) float64 {
 		score += math.Log1p(speed / 1024.0 / 1024.0 / 0.5)
 	}
 	score = score * (1 - pkgLoss)
+	// Penalty for consecutive failures: each failure reduces score by
+	// an additional 20% multiplicatively. This ensures per-key per-proxy
+	// scores naturally degrade under persistent failure without needing
+	// a binary block/ban mechanism.
+	if failedCount > 0 {
+		score *= math.Pow(0.8, float64(failedCount))
+	}
 	return score
 }
 
@@ -218,7 +227,7 @@ func scoreFromHealthCheckLatency(latency uint16) float64 {
 	if latency == 0 || latency == 0xffff {
 		return 0
 	}
-	return calculateScore(int64(latency), 0, 0)
+	return calculateScore(int64(latency), 0, 0, 0)
 }
 
 // RefreshScores updates non-EMA scores for existing proxy samples in a route row.
@@ -234,12 +243,12 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 		if !ok || !cell.hasSample {
 			continue
 		}
-		cell.score = calculateScore(cell.latency, cell.speed, cell.pkgLoss)
+		cell.score = calculateScore(cell.latency, cell.speed, cell.pkgLoss, cell.failedCount)
 	}
 }
 
 // DebugDumpScores returns a formatted string showing score breakdown for each proxy in a row.
-// Format: "proxy1(lat=30,spd=1024000,loss=0.010→score=3.45) proxy2(lat=80,spd=0,loss=0→score=1.25) ..."
+// Format: "proxy1(lat=30,spd=1024000,loss=0.010,fail=0→score=3.45) proxy2(lat=80,spd=0,loss=0,fail=3→score=0.64) ..."
 func (rt *RouteTable) DebugDumpScores(key string) string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
@@ -253,6 +262,7 @@ func (rt *RouteTable) DebugDumpScores(key string) string {
 		lat   int64
 		spd   float64
 		loss  float64
+		fail  int64
 		score float64
 	}
 	entries := make([]entry, 0, len(row.proxies))
@@ -262,6 +272,7 @@ func (rt *RouteTable) DebugDumpScores(key string) string {
 			lat:   cell.latency,
 			spd:   cell.speed,
 			loss:  cell.pkgLoss,
+			fail:  cell.failedCount,
 			score: cell.score,
 		})
 	}
@@ -273,8 +284,8 @@ func (rt *RouteTable) DebugDumpScores(key string) string {
 		if i > 0 {
 			sb.WriteString(" ")
 		}
-		sb.WriteString(fmt.Sprintf("%s(lat=%d,spd=%.0f,loss=%.3f→score=%.3f)",
-			e.name, e.lat, e.spd, e.loss, e.score))
+		sb.WriteString(fmt.Sprintf("%s(lat=%d,spd=%.0f,loss=%.3f,fail=%d→score=%.3f)",
+			e.name, e.lat, e.spd, e.loss, e.fail, e.score))
 	}
 	sb.WriteString("]")
 	return sb.String()
@@ -317,12 +328,14 @@ func (rt *RouteTable) UpdateSpeed(key, proxy string, speed float64) {
 }
 
 // IncrementUseCount increments the use counter for a proxy within a row.
+// Also resets failedCount since a successful use means the proxy is working.
 func (rt *RouteTable) IncrementUseCount(key, proxy string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
 	cell.useCount++
+	cell.failedCount = 0
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
 }
@@ -430,7 +443,7 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 				if cell.score > 0 {
 					scores[proxy] = cell.score
 				} else {
-					scores[proxy] = calculateScore(cell.latency, cell.speed, cell.pkgLoss)
+					scores[proxy] = calculateScore(cell.latency, cell.speed, cell.pkgLoss, cell.failedCount)
 				}
 				continue
 			}
@@ -461,7 +474,15 @@ func (rt *RouteTable) TouchRow(key string) {
 	rt.touchLRU(key)
 }
 
-// MarkFailed removes the given proxy from the row's consideration and clears best_proxy.
+// MarkFailed increments the failedCount for the given (key, proxy) pair,
+// clearing bestProxy and tcpProbed.  Consecutive failures degrade the score
+// via calculateScore's 0.8^n penalty.
+//
+// TODO: When failedCount exceeds a threshold (e.g. consecutive failures ≥
+// maxFailedTimes), consider also calling store.UpdateHostStatus(...) to
+// persist a TTL-based block via the HostStatus failure tracking system
+// (see stats.go).  That gives cross-restart memory and binary exclusion
+// while the score penalty handles in-memory gradual degradation.
 func (rt *RouteTable) MarkFailed(key, proxy string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -469,6 +490,8 @@ func (rt *RouteTable) MarkFailed(key, proxy string) {
 	if !ok {
 		return
 	}
+	cell := rt.getOrCreateCell(row, proxy)
+	cell.failedCount++
 	if row.bestProxy == proxy {
 		row.bestProxy = ""
 	}
@@ -500,10 +523,11 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 				Name:     cell.name,
 				UseCount: cell.useCount,
 				Attributes: ProxyAttributes{
-					PkgLoss: cell.pkgLoss,
-					Latency: cell.latency,
-					Speed:   cell.speed,
-					Score:   cell.score,
+					PkgLoss:     cell.pkgLoss,
+					Latency:     cell.latency,
+					Speed:       cell.speed,
+					Score:       cell.score,
+					FailedCount: cell.failedCount,
 				},
 			}
 		}
@@ -528,7 +552,7 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 }
 
 // DebugDumpRow returns a debug string of a single row's proxies map.
-// Format: "proxy1(lat=30,use=5,loss=0.01,spd=1024,latScore=0.033333,speedScore=0.000976,score=0.034309) ..."
+// Format: "proxy1(lat=30,use=5,fail=0,loss=0.01,spd=1024,latScore=...,speedScore=...,score=...) ..."
 func (rt *RouteTable) DebugDumpRow(key string) string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
@@ -543,6 +567,7 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 		name         string
 		latency      int64
 		use          int64
+		fail         int64
 		loss         float64
 		speed        float64
 		latencyScore float64
@@ -555,10 +580,11 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 			name:         cell.name,
 			latency:      cell.latency,
 			use:          cell.useCount,
+			fail:         cell.failedCount,
 			loss:         cell.pkgLoss,
 			speed:        cell.speed,
-			latencyScore: calculateScore(cell.latency, 0, 0),
-			speedScore:   calculateScore(0, cell.speed, 0),
+			latencyScore: calculateScore(cell.latency, 0, 0, cell.failedCount),
+			speedScore:   calculateScore(0, cell.speed, 0, cell.failedCount),
 			score:        cell.score,
 		})
 	}
@@ -576,8 +602,8 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 		if i > 0 {
 			sb.WriteString(" ")
 		}
-		sb.WriteString(fmt.Sprintf("%s(lat=%d,use=%d,loss=%.3f,spd=%.0f,[latScore=%.4f,speedScore=%.4f,score=%.4f])",
-			e.name, e.latency, e.use, e.loss, e.speed, e.latencyScore, e.speedScore, e.score))
+		sb.WriteString(fmt.Sprintf("%s(lat=%d,use=%d,fail=%d,loss=%.3f,spd=%.0f,[latScore=%.4f,speedScore=%.4f,score=%.4f])",
+			e.name, e.latency, e.use, e.fail, e.loss, e.speed, e.latencyScore, e.speedScore, e.score))
 	}
 	sb.WriteString("]")
 	return sb.String()
