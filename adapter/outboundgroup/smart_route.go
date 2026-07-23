@@ -231,6 +231,15 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 		return nil, err
 	}
 
+	// Wrap connection with tracker so close callback can collect speed/pkg_loss.
+	// Proxies that dial through proxydialer already get a tracker, but proxies
+	// that use a raw dialer (e.g. plain HTTP outbounds to localhost) do not.
+	// This ensures every smart-routed connection has a tracker regardless of
+	// how the underlying proxy dials.
+	if statistic.DefaultManager.Get(metadata.UUID) == nil {
+		conn = statistic.NewTCPTracker(conn, statistic.DefaultManager, metadata, nil, 0, 0, false)
+	}
+
 	// Update route table with the winner
 	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
 	s.routeTable.IncrementUseCount(key, proxy.Name())
