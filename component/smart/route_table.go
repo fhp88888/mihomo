@@ -238,6 +238,48 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 	}
 }
 
+// DebugDumpScores returns a formatted string showing score breakdown for each proxy in a row.
+// Format: "proxy1(lat=30,spd=1024000,loss=0.010→score=3.45) proxy2(lat=80,spd=0,loss=0→score=1.25) ..."
+func (rt *RouteTable) DebugDumpScores(key string) string {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	row, ok := rt.rows[key]
+	if !ok || len(row.proxies) == 0 {
+		return fmt.Sprintf("key=%s proxies=<empty>", key)
+	}
+	// Collect and sort by score descending for readable output
+	type entry struct {
+		name  string
+		lat   int64
+		spd   float64
+		loss  float64
+		score float64
+	}
+	entries := make([]entry, 0, len(row.proxies))
+	for _, cell := range row.proxies {
+		entries = append(entries, entry{
+			name:  cell.name,
+			lat:   cell.latency,
+			spd:   cell.speed,
+			loss:  cell.pkgLoss,
+			score: cell.score,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].score > entries[j].score })
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("key=%s scores=[", key))
+	for i, e := range entries {
+		if i > 0 {
+			sb.WriteString(" ")
+		}
+		sb.WriteString(fmt.Sprintf("%s(lat=%d,spd=%.0f,loss=%.3f→score=%.3f)",
+			e.name, e.lat, e.spd, e.loss, e.score))
+	}
+	sb.WriteString("]")
+	return sb.String()
+}
+
 // UpdateLatency updates the EMA latency for a (key, proxy) pair.
 func (rt *RouteTable) UpdateLatency(key, proxy string, latency int64) {
 	rt.mu.Lock()

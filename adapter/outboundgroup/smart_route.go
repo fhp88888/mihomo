@@ -44,10 +44,13 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 	key := routeKey(metadata)
 	proxies := s.GetProxies(true)
 
+	log.Debugln("[Smart] tcpRoute ENTER key=%s host=%s proxies=%d", key, metadata.Host, len(proxies))
+
 	// If manually selected, use that proxy directly
 	if s.selected != "" {
 		for _, p := range proxies {
 			if p.Name() == s.selected {
+				log.Debugln("[Smart] tcpRoute key=%s MANUAL-SELECT proxy=%s", key, s.selected)
 				return s.dialAndWrap(ctx, p, metadata, key)
 			}
 		}
@@ -61,10 +64,13 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 		if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
 			for _, p := range proxies {
 				if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
+					log.Debugln("[Smart] tcpRoute key=%s FAST-PATH best=%s", key, bestName)
 					conn, err := s.dialAndWrap(ctx, p, metadata, key)
 					if err == nil {
+						log.Debugln("[Smart] tcpRoute key=%s FAST-PATH-OK best=%s", key, bestName)
 						return conn, nil
 					}
+					log.Infoln("[Smart] tcpRoute key=%s fast-best FAILED proxy=%s err=%v", key, bestName, err)
 					s.routeTable.MarkFailed(key, bestName)
 					if tunnel.ShouldStopRetry(err) {
 						return nil, err
@@ -76,6 +82,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 
 		// Best proxy is stale, unavailable, or failed. Try the remaining
 		// per-key proxies serially by score, recalculated from current latency.
+		log.Infoln("[Smart] tcpRoute key=%s fast-best-miss, trying serial fallback", key)
 		names := make([]string, 0, len(proxies))
 		proxyMap := make(map[string]C.Proxy, len(proxies))
 		for _, p := range proxies {
@@ -92,20 +99,31 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 			return 0xffff
 		}, key)
 
+		log.Infoln("[Smart] tcpRoute key=%s SERIAL-FALLBACK %s",
+			key, s.routeTable.DebugDumpScores(key))
+		log.Infoln("[Smart] tcpRoute key=%s SERIAL-FALLBACK ranked: %v", key, ranked)
+
 		for _, name := range ranked {
 			p, ok := proxyMap[name]
 			if !ok {
 				continue
 			}
+			log.Debugln("[Smart] tcpRoute key=%s SERIAL-TRY proxy=%s", key, name)
 			conn, err := s.dialAndWrap(ctx, p, metadata, key)
 			if err == nil {
+				log.Infoln("[Smart] tcpRoute key=%s SERIAL-OK proxy=%s", key, name)
 				return conn, nil
 			}
+			log.Debugln("[Smart] tcpRoute key=%s SERIAL-FAIL proxy=%s err=%v", key, name, err)
 			s.routeTable.MarkFailed(key, name)
 			if tunnel.ShouldStopRetry(err) {
 				return nil, err
 			}
 		}
+		log.Infoln("[Smart] tcpRoute key=%s serial-fallback-exhausted, falling to discovery", key)
+	} else {
+		probed := s.routeTable.IsTCPProbed(key)
+		log.Debugln("[Smart] tcpRoute key=%s NO-FAST-PATH tcpProbed=%v (cold-start or 8%% re-discover)", key, probed)
 	}
 
 	// Cold start, 10% re-discover, or all serial fallbacks exhausted:
@@ -120,11 +138,21 @@ func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Meta
 	connectTime := time.Since(start).Milliseconds()
 
 	if err != nil {
+		log.Debugln("[Smart] dialAndWrap key=%s proxy=%s FAIL connectTime=%dms err=%v",
+			key, proxy.Name(), connectTime, err)
 		if !tunnel.ShouldStopRetry(err) && !errors.Is(err, context.Canceled) {
 			s.routeTable.MarkFailed(key, proxy.Name())
 		}
 		return nil, err
 	}
+
+	// Ensure tracker exists for speed/pkg_loss collection (same fix as master).
+	if statistic.DefaultManager.Get(metadata.UUID) == nil {
+		conn = statistic.NewTCPTracker(conn, statistic.DefaultManager, metadata, nil, 0, 0, false)
+	}
+
+	log.Debugln("[Smart] dialAndWrap key=%s proxy=%s OK connectTime=%dms uuid=%s",
+		key, proxy.Name(), connectTime, metadata.UUID)
 
 	// Update latency in route table
 	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
@@ -146,6 +174,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	}
 
 	if len(available) == 0 {
+		log.Infoln("[Smart] discoverAndRoute key=%s NO-ALIVE-PROXIES (total=%d)", key, len(proxies))
 		return nil, errors.New("no alive proxies available")
 	}
 
@@ -163,8 +192,13 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 		return 0xffff
 	}, key)
 
-	// Debug: dump the route table row before rerank probe
-	log.Debugln("[Smart] Rerank for group [%s]: %s", s.Name(), s.routeTable.DebugDumpRow(key))
+	log.Infoln("[Smart] discoverAndRoute key=%s PRE-RANK %s preRanked=%v",
+		key, s.routeTable.DebugDumpRow(key), preRanked)
+
+	// Refresh scores and dump them for decision traceability
+	s.routeTable.RefreshScores(key, names)
+	log.Infoln("[Smart] discoverAndRoute key=%s SCORES %s",
+		key, s.routeTable.DebugDumpScores(key))
 
 	// Concurrent discovery through probe coordinator
 	proxy, conn, connectTime, err := s.probeCoordinator.Discover(
@@ -178,8 +212,22 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	)
 
 	if err != nil {
+		log.Infoln("[Smart] discoverAndRoute key=%s DISCOVERY-FAILED err=%v", key, err)
 		return nil, err
 	}
+
+	// Ensure tracker exists for speed/pkg_loss collection (same fix as master).
+	if statistic.DefaultManager.Get(metadata.UUID) == nil {
+		conn = statistic.NewTCPTracker(conn, statistic.DefaultManager, metadata, nil, 0, 0, false)
+	}
+
+	log.Infoln("[Smart] discoverAndRoute key=%s DISCOVERY-WINNER proxy=%s connectTime=%dms uuid=%s",
+		key, proxy.Name(), connectTime, metadata.UUID)
+
+	// Refresh scores again with winner latency, then dump final score state
+	s.routeTable.RefreshScores(key, names)
+	log.Infoln("[Smart] discoverAndRoute key=%s POST-DISCOVERY %s",
+		key, s.routeTable.DebugDumpScores(key))
 
 	// Update route table with the winner
 	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
@@ -228,6 +276,8 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 			info := tracker.Info()
 			maxUpload := info.MaxUploadRate.Load()
 			maxDownload := info.MaxDownloadRate.Load()
+			upTotal := info.UploadTotal.Load()
+			downTotal := info.DownloadTotal.Load()
 			speed := float64(maxUpload)
 			if maxDownload > maxUpload {
 				speed = float64(maxDownload)
@@ -237,15 +287,22 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 			}
 
 			// Collect pkg_loss from TCP stats
+			var lossRate float64
 			if trackerConn, ok := tracker.(net.Conn); ok {
 				stats := tcpstats.GetTCPStats(trackerConn)
 				if stats != nil {
-					lossRate := stats.LossRate()
+					lossRate = stats.LossRate()
 					if lossRate > 0 {
 						s.routeTable.UpdatePkgLoss(key, proxy.Name(), lossRate)
 					}
 				}
 			}
+
+			log.Debugln("[Smart] Close key=%s proxy=%s firstReadLat=%dms maxUp=%d maxDown=%d spd=%.0f loss=%.3f upTotal=%d downTotal=%d",
+				key, proxy.Name(), latency, maxUpload, maxDownload, speed, lossRate, upTotal, downTotal)
+		} else {
+			log.Debugln("[Smart] Close key=%s proxy=%s NO-TRACKER firstReadLat=%dms",
+				key, proxy.Name(), latency)
 		}
 
 		// Log connection close error for debugging
