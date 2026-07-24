@@ -227,9 +227,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	// Update route table with the winner
 	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
 	s.routeTable.IncrementUseCount(key, proxy.Name())
-	// set bestProxy to empty string to force re-rank on next request
-	// this avoids reuse a 'latency only' proxy in the next several requests.
-	s.routeTable.SetBestProxy(key, "")
+	s.routeTable.SetBestProxy(key, proxy.Name())
 	s.routeTable.SetTCPProbed(key)
 
 	return s.wrapTCPConn(conn, proxy, metadata), nil
