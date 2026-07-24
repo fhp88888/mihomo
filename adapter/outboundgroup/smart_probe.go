@@ -181,7 +181,7 @@ func (pc *ProbeCoordinator) probeBatch(
 		}
 
 		log.Infoln("[Smart] probeBatch key=%s batch=%v", key, batchNames)
-		result, metrics := pc.parallelDial(ctx, key, batch, metadata, singleDial, rt)
+		result, metrics, dialResults := pc.parallelDial(ctx, key, batch, metadata, singleDial, rt)
 		// Record all successful connectTimes to the route table so losers'
 		// measurements are not wasted — they improve prerank accuracy for
 		// subsequent discoveries on this route key.
@@ -194,16 +194,30 @@ func (pc *ProbeCoordinator) probeBatch(
 		}
 
 		// All failed in this batch.
-		// Only mark the proxy that returned the fatal error, not all proxies.
-		// Concurrent dial issues or one slow proxy shouldn't blacklist the rest.
+		// Only mark proxies that had node-level errors (not fatal/target-level
+		// errors and not cancellations). Target-level errors like DNS failures
+		// or loopback rejects are not the proxy's fault and should not penalize
+		// the proxy's score.
 		log.Infoln("[Smart] probeBatch key=%s batch-ALL-FAILED err=%v", key, result.err)
-		for _, p := range batch {
-			rt.MarkFailed(key, p.Name())
+		hasFatal := false
+		var fatalErr error
+		for _, dr := range dialResults {
+			if dr.err == nil {
+				continue
+			}
+			if tunnel.ShouldStopRetry(dr.err) {
+				hasFatal = true
+				fatalErr = dr.err
+				continue // Don't penalize proxy for target-level error
+			}
+			if errors.Is(dr.err, context.Canceled) {
+				continue // Don't penalize proxy for cancellation
+			}
+			rt.MarkFailed(key, dr.proxy.Name())
 		}
 
-		// Check for fatal error
-		if tunnel.ShouldStopRetry(result.err) {
-			return result
+		if hasFatal {
+			return probeResult{err: fatalErr}
 		}
 
 		// If ctx is done, stop
@@ -226,10 +240,10 @@ func (pc *ProbeCoordinator) parallelDial(
 	metadata *C.Metadata,
 	singleDial func(context.Context, C.Proxy, *C.Metadata, time.Time) (C.Conn, int64, error),
 	rt *smart.RouteTable,
-) (probeResult, []probeMetric) {
+) (probeResult, []probeMetric, []dialResult) {
 	n := len(batch)
 	if n == 0 {
-		return probeResult{err: errors.New("empty batch")}, nil
+		return probeResult{err: errors.New("empty batch")}, nil, nil
 	}
 
 	results := make(chan dialResult, n)
@@ -245,12 +259,14 @@ func (pc *ProbeCoordinator) parallelDial(
 	}
 
 	var allMetrics []probeMetric
+	var allResults []dialResult
 	received := 0
 
 	for received < n {
 		select {
 		case res := <-results:
 			received++
+			allResults = append(allResults, res)
 			if res.err == nil {
 				log.Infoln("[Smart] parallelDial key=%s proxy=%s connectTime=%dms (winner)",
 					key, res.proxy.Name(), res.connectTime)
@@ -261,7 +277,7 @@ func (pc *ProbeCoordinator) parallelDial(
 				if remaining > 0 {
 					go drainResults(results, remaining, rt, key, true)
 				}
-				return probeResult{proxy: res.proxy, conn: res.conn, connectTime: res.connectTime}, allMetrics
+				return probeResult{proxy: res.proxy, conn: res.conn, connectTime: res.connectTime}, allMetrics, allResults
 			}
 			log.Infoln("[Smart] parallelDial key=%s proxy=%s FAILED err=%v",
 				key, res.proxy.Name(), res.err)
@@ -274,12 +290,18 @@ func (pc *ProbeCoordinator) parallelDial(
 			if remaining > 0 {
 				go drainResults(results, remaining, nil, "", false)
 			}
-			return probeResult{err: ctx.Err()}, allMetrics
+			return probeResult{err: ctx.Err()}, allMetrics, allResults
 		}
 	}
 
 	log.Infoln("[Smart] parallelDial key=%s ALL-FAILED (%d proxies)", key, n)
-	return probeResult{err: fmt.Errorf("all %d proxies failed for key=%s", n, key)}, allMetrics
+	errs := make([]error, 0, len(allResults))
+	for _, r := range allResults {
+		if r.err != nil {
+			errs = append(errs, r.err)
+		}
+	}
+	return probeResult{err: fmt.Errorf("all %d proxies failed for key=%s: %w", n, key, errors.Join(errs...))}, allMetrics, allResults
 }
 
 // drainResults drains n results from the channel, optionally updating the
