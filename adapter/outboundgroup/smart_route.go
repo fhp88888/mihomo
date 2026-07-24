@@ -75,7 +75,6 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 						return conn, nil
 					}
 					log.Infoln("[Smart] tcpRoute key=%s fast-best FAILED proxy=%s err=%v", key, bestName, err)
-					s.routeTable.MarkFailed(key, bestName)
 					if tunnel.ShouldStopRetry(err) {
 						return nil, err
 					}
@@ -121,7 +120,6 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 				return conn, nil
 			}
 			log.Debugln("[Smart] tcpRoute key=%s SERIAL-FAIL proxy=%s err=%v", key, name, err)
-			s.routeTable.MarkFailed(key, name)
 			if tunnel.ShouldStopRetry(err) {
 				return nil, err
 			}
