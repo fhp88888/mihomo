@@ -389,6 +389,14 @@ func (s *Smart) Close() error {
 
 	s.wg.Wait()
 
+	// Final persistence: snapshot remaining dirty cells and force-write
+	// the global queue so that small route tables (< batch threshold)
+	// are not lost on shutdown or config reload.
+	s.persistRouteTable()
+	if store := cachefile.GetSmartStore(); store != nil {
+		store.FlushQueue(true)
+	}
+
 	if s.probeCoordinator != nil {
 		s.probeCoordinator.Close()
 	}
@@ -529,7 +537,7 @@ func (s *Smart) persistRouteTable() {
 		}
 	}
 
-	log.Infoln("[Smart] Persisted %d dirty route cells for group [%s]", len(dirty), s.Name())
+	log.Infoln("[Smart] Enqueued %d dirty route cells for group [%s]", len(dirty), s.Name())
 }
 
 // decayFailedCounts reduces every route cell's FailedCount by 0.1 (floor 0).

@@ -460,7 +460,32 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 
 	if shouldFlush && len(snapshot) > 0 {
 		go func() {
-			if err := s.BatchSave(snapshot); err == nil {
+			if err := s.BatchSave(snapshot); err != nil {
+				log.Warnln("[SmartStore] Async batch save failed, re-enqueuing %d operations: %v", len(snapshot), err)
+				// Merge back into the queue without triggering the
+				// batch-save threshold again — the next periodic
+				// persist or final FlushQueue(true) on close will retry.
+				globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
+					opMap := make(map[string]StoreOperation, len(old)+len(snapshot))
+					for i := range old {
+						key := formatOperationKey(&old[i])
+						if key != "" {
+							opMap[key] = old[i]
+						}
+					}
+					for i := range snapshot {
+						key := formatOperationKey(&snapshot[i])
+						if key != "" {
+							opMap[key] = snapshot[i]
+						}
+					}
+					newQueue := make([]StoreOperation, 0, len(opMap))
+					for _, op := range opMap {
+						newQueue = append(newQueue, op)
+					}
+					return newQueue
+				})
+			} else {
 				log.Debugln("[SmartStore] Queue datas saved, operations: [%d]", len(snapshot))
 			}
 		}()
