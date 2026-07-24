@@ -150,13 +150,14 @@ func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Meta
 		return nil, err
 	}
 
-	// Update latency in route table
-	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
+	// Note: Latency is written as TTFB on connection close (see wrapTCPConn),
+	// not here as connectTime, so the route table's Latency EMA reflects the
+	// end-to-end time from dial start to first byte.
 	s.routeTable.IncrementUseCount(key, proxy.Name())
 	s.routeTable.SetBestProxy(key, proxy.Name())
 	s.routeTable.SetTCPProbed(key)
 
-	return s.wrapTCPConn(conn, proxy, metadata), nil
+	return s.wrapTCPConn(conn, proxy, metadata, connectTime), nil
 }
 
 // discoverAndRoute performs pre-rank + concurrent discovery for a new or failed route.
@@ -222,17 +223,20 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	log.Infoln("[Smart] discoverAndRoute key=%s POST-DISCOVERY %s",
 		key, s.routeTable.DebugDumpScores(key))
 
-	// Update route table with the winner
-	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
+	// Note: probeBatch already wrote the winner's connectTime to the route table
+	// (smart_probe.go:189). Do NOT write it again here — that would double-count
+	// the sample. TTFB is written on connection close via wrapTCPConn.
 	s.routeTable.IncrementUseCount(key, proxy.Name())
 	s.routeTable.SetBestProxy(key, proxy.Name())
 	s.routeTable.SetTCPProbed(key)
 
-	return s.wrapTCPConn(conn, proxy, metadata), nil
+	return s.wrapTCPConn(conn, proxy, metadata, connectTime), nil
 }
 
-// wrapTCPConn wraps a TCP connection with close-callback to collect pkg_loss and speed.
-func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Conn {
+// wrapTCPConn wraps a TCP connection with close-callback to collect latency (TTFB), pkg_loss and speed.
+// connectTime is the dial duration in milliseconds, passed in so the close callback can
+// compute TTFB = connectTime + firstReadLatency (time from dial start to first byte).
+func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64) C.Conn {
 	c.AppendToChains(s)
 
 	start := time.Now()
@@ -256,9 +260,15 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 
 	return callback.NewCloseCallbackConn(c, func() {
 		key := routeKey(metadata)
-		latency := firstReadLatency.Load()
-		if latency > 0 {
-			s.routeTable.UpdateLatency(key, proxy.Name(), latency)
+
+		// Compute TTFB = connectTime + firstReadLatency.
+		// Only write when the first read succeeded (no error) — errors like
+		// timeouts or connection resets must not be recorded as latency samples.
+		firstRead := firstReadLatency.Load()
+		readErr := firstReadErr.Load()
+		if firstRead > 0 && readErr == nil {
+			ttfb := connectTime + firstRead
+			s.routeTable.UpdateLatency(key, proxy.Name(), ttfb)
 		}
 
 		// Collect speed and pkg_loss from tracker
@@ -277,27 +287,27 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 				s.routeTable.UpdateSpeed(key, proxy.Name(), speed)
 			}
 
-			// Collect pkg_loss from TCP stats
+			// Collect pkg_loss from TCP stats.
+			// Always update when TCP stats are available — even 0% loss
+			// drives the EMA back toward 0, preventing stale loss from
+			// accumulating indefinitely.
 			var lossRate float64
 			if trackerConn, ok := tracker.(net.Conn); ok {
 				stats := tcpstats.GetTCPStats(trackerConn)
 				if stats != nil {
 					lossRate = stats.LossRate()
-					if lossRate > 0 {
-						s.routeTable.UpdatePkgLoss(key, proxy.Name(), lossRate)
-					}
+					s.routeTable.UpdatePkgLoss(key, proxy.Name(), lossRate)
 				}
 			}
 
 			log.Debugln("[Smart] Close key=%s proxy=%s firstReadLat=%dms maxUp=%d maxDown=%d spd=%.0f loss=%.3f upTotal=%d downTotal=%d",
-				key, proxy.Name(), latency, maxUpload, maxDownload, speed, lossRate, upTotal, downTotal)
+				key, proxy.Name(), firstRead, maxUpload, maxDownload, speed, lossRate, upTotal, downTotal)
 		} else {
 			log.Debugln("[Smart] Close key=%s proxy=%s NO-TRACKER firstReadLat=%dms",
-				key, proxy.Name(), latency)
+				key, proxy.Name(), firstRead)
 		}
 
 		// Log connection close error for debugging
-		readErr := firstReadErr.Load()
 		if readErr != nil && readErr != io.EOF {
 			log.Debugln("[Smart] Connection closed with error for [%s] via [%s]: %v",
 				key, proxy.Name(), readErr)

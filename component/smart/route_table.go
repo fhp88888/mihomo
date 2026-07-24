@@ -38,15 +38,22 @@ type rowEntry struct {
 }
 
 type proxyCell struct {
-	Name        string
-	UseCount    int64
-	FailedCount float64
-	Latency     int64   // EMA, 0 means no sample yet
-	PkgLoss     float64 // EMA
-	Speed       float64 // EMA
-	Score       float64 // non-EMA score derived from latency, speed, pkgLoss and failedCount
-	HasSample   bool
-	Dirty       bool // true when cell has unsaved changes
+	Name             string
+	UseCount         int64
+	FailedCount      float64
+	Latency          int64   // EMA, 0 means no sample yet
+	PkgLoss          float64 // EMA
+	Speed            float64 // EMA
+	Score            float64 // non-EMA score derived from latency, speed, pkgLoss and failedCount
+	HasLatencySample bool
+	HasPkgLossSample bool
+	HasSpeedSample   bool
+	Dirty            bool // true when cell has unsaved changes
+}
+
+// hasSample returns true when any metric has been sampled at least once.
+func (c *proxyCell) hasSample() bool {
+	return c.HasLatencySample || c.HasPkgLossSample || c.HasSpeedSample
 }
 
 // RowSnapshot is a read-only copy of a row for the REST API.
@@ -241,7 +248,7 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 	}
 	for _, proxy := range proxies {
 		cell, ok := row.proxies[proxy]
-		if !ok || !cell.HasSample {
+		if !ok || !cell.hasSample() {
 			continue
 		}
 		cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount)
@@ -298,8 +305,8 @@ func (rt *RouteTable) UpdateLatency(key, proxy string, latency int64) {
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.Latency = applyEMAInt64(cell.Latency, latency, cell.HasSample)
-	cell.HasSample = true
+	cell.Latency = applyEMAInt64(cell.Latency, latency, cell.HasLatencySample)
+	cell.HasLatencySample = true
 	cell.Dirty = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
@@ -311,8 +318,8 @@ func (rt *RouteTable) UpdatePkgLoss(key, proxy string, loss float64) {
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.PkgLoss = applyEMA(float64(cell.PkgLoss), loss, cell.HasSample)
-	cell.HasSample = true
+	cell.PkgLoss = applyEMA(float64(cell.PkgLoss), loss, cell.HasPkgLossSample)
+	cell.HasPkgLossSample = true
 	cell.Dirty = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
@@ -324,8 +331,8 @@ func (rt *RouteTable) UpdateSpeed(key, proxy string, speed float64) {
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.Speed = applyEMA(float64(cell.Speed), speed, cell.HasSample)
-	cell.HasSample = true
+	cell.Speed = applyEMA(float64(cell.Speed), speed, cell.HasSpeedSample)
+	cell.HasSpeedSample = true
 	cell.Dirty = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
@@ -367,7 +374,7 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 		hasKeyData := false
 		for _, proxy := range proxies {
 			if ok {
-				if cell, cOk := row.proxies[proxy]; cOk && cell.HasSample {
+				if cell, cOk := row.proxies[proxy]; cOk && cell.HasLatencySample {
 					meanLatency[proxy] = float64(cell.Latency)
 					hasKeyData = true
 					continue
@@ -406,7 +413,7 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 
 		for _, row := range rt.rows {
 			for _, proxy := range proxies {
-				if cell, cOk := row.proxies[proxy]; cOk && cell.HasSample {
+				if cell, cOk := row.proxies[proxy]; cOk && cell.HasLatencySample {
 					s := stats[proxy]
 					s.sum += cell.Latency
 					s.count++
@@ -444,7 +451,7 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 	row, rowOK := rt.rows[key]
 	for _, proxy := range proxies {
 		if rowOK {
-			if cell, ok := row.proxies[proxy]; ok && cell.HasSample {
+			if cell, ok := row.proxies[proxy]; ok && cell.hasSample() {
 				if cell.Score > 0 {
 					scores[proxy] = cell.Score
 				} else {
@@ -537,12 +544,14 @@ func (rt *RouteTable) SnapshotAndClearDirty() map[string]PersistedCell {
 			if cell.Dirty {
 				cellKey := key + "\x00" + cell.Name
 				snapshot[cellKey] = PersistedCell{
-					Latency:     cell.Latency,
-					PkgLoss:     cell.PkgLoss,
-					Speed:       cell.Speed,
-					UseCount:    cell.UseCount,
-					FailedCount: cell.FailedCount,
-					HasSample:   cell.HasSample,
+					Latency:          cell.Latency,
+					PkgLoss:          cell.PkgLoss,
+					Speed:            cell.Speed,
+					UseCount:         cell.UseCount,
+					FailedCount:      cell.FailedCount,
+					HasLatencySample: cell.HasLatencySample,
+					HasPkgLossSample: cell.HasPkgLossSample,
+					HasSpeedSample:   cell.HasSpeedSample,
 				}
 				cell.Dirty = false
 			}
@@ -570,12 +579,15 @@ func (rt *RouteTable) MarkDirty(key, proxy string) {
 
 // PersistedCell is the JSON-serializable form of a proxyCell meant for DB storage.
 type PersistedCell struct {
-	Latency     int64   `json:"latency"`
-	PkgLoss     float64 `json:"pkg_loss"`
-	Speed       float64 `json:"speed"`
-	UseCount    int64   `json:"use_count"`
-	FailedCount float64   `json:"failed_count"`
-	HasSample   bool    `json:"has_sample"`
+	Latency          int64   `json:"latency"`
+	PkgLoss          float64 `json:"pkg_loss"`
+	Speed            float64 `json:"speed"`
+	UseCount         int64   `json:"use_count"`
+	FailedCount      float64 `json:"failed_count"`
+	HasSample        bool    `json:"has_sample"`          // retained for backward compat with old persisted data
+	HasLatencySample bool    `json:"has_latency_sample"`
+	HasPkgLossSample bool    `json:"has_pkg_loss_sample"`
+	HasSpeedSample   bool    `json:"has_speed_sample"`
 }
 
 // RestoreRow restores a per-(key,proxy) cell from previously persisted data.
@@ -590,7 +602,16 @@ func (rt *RouteTable) RestoreRow(key, proxy string, pc PersistedCell) {
 	cell.Speed = pc.Speed
 	cell.UseCount = pc.UseCount
 	cell.FailedCount = pc.FailedCount
-	cell.HasSample = pc.HasSample
+	cell.HasLatencySample = pc.HasLatencySample
+	cell.HasPkgLossSample = pc.HasPkgLossSample
+	cell.HasSpeedSample = pc.HasSpeedSample
+	// Backward compat: old persisted data only had HasSample.
+	// If HasSample is true but no per-metric flag is set, enable all three.
+	if pc.HasSample && !cell.HasLatencySample && !cell.HasPkgLossSample && !cell.HasSpeedSample {
+		cell.HasLatencySample = true
+		cell.HasPkgLossSample = true
+		cell.HasSpeedSample = true
+	}
 	cell.Score = calculateScore(pc.Latency, pc.Speed, pc.PkgLoss, pc.FailedCount)
 	cell.Dirty = false
 	row.lastUsed = time.Now().Unix()

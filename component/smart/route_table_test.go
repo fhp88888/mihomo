@@ -487,3 +487,211 @@ func TestSnapshotRowOrder(t *testing.T) {
 		t.Fatalf("expected ASN:2 first (most recent), got %s", snap.Rows[0].Key)
 	}
 }
+
+func TestPerMetricHasSampleIndependent(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	proxy := "proxy-a"
+
+	// Update only latency — verify only latency flag is set
+	rt.UpdateLatency(key, proxy, 100)
+	rt.mu.RLock()
+	cell := rt.rows[key].proxies[proxy]
+	hasLat := cell.HasLatencySample
+	hasSpd := cell.HasSpeedSample
+	hasLoss := cell.HasPkgLossSample
+	rt.mu.RUnlock()
+	if !hasLat {
+		t.Fatal("HasLatencySample should be true after UpdateLatency")
+	}
+	if hasSpd {
+		t.Fatal("HasSpeedSample should be false after only latency update")
+	}
+	if hasLoss {
+		t.Fatal("HasPkgLossSample should be false after only latency update")
+	}
+
+	// Update speed — verify both latency and speed flags now set
+	rt.UpdateSpeed(key, proxy, 10485760)
+	rt.mu.RLock()
+	cell = rt.rows[key].proxies[proxy]
+	hasSpd = cell.HasSpeedSample
+	rt.mu.RUnlock()
+	if !hasSpd {
+		t.Fatal("HasSpeedSample should be true after UpdateSpeed")
+	}
+	if !rt.rows[key].proxies[proxy].HasLatencySample {
+		t.Fatal("HasLatencySample should still be true")
+	}
+
+	// Update pkg_loss — verify all three flags now set
+	rt.UpdatePkgLoss(key, proxy, 0.01)
+	rt.mu.RLock()
+	cell = rt.rows[key].proxies[proxy]
+	hasLoss = cell.HasPkgLossSample
+	rt.mu.RUnlock()
+	if !hasLoss {
+		t.Fatal("HasPkgLossSample should be true after UpdatePkgLoss")
+	}
+}
+
+func TestEMASpeedIsCorrectWithPriorLatencySample(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	proxy := "proxy-a"
+
+	// Latency sample first (sets HasLatencySample, not HasSpeedSample)
+	rt.UpdateLatency(key, proxy, 100)
+
+	// Speed sample second — must be 100% of real speed, NOT 25% (EMA with 0)
+	rt.UpdateSpeed(key, proxy, 10485760)
+	snap := rt.Snapshot("test")
+	got := snap.Rows[0].Proxies[proxy].Attributes.Speed
+	if got != 10485760 {
+		t.Fatalf("expected first speed=10485760 (100%% of value), got %.0f (%.1f%%)",
+			got, got/10485760*100)
+	}
+}
+
+func TestEMAPkgLossIsCorrectWithPriorLatencySample(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	proxy := "proxy-a"
+
+	// Latency sample first (sets HasLatencySample, not HasPkgLossSample)
+	rt.UpdateLatency(key, proxy, 100)
+
+	// PkgLoss sample second — must be 100% of real value, NOT 25%
+	rt.UpdatePkgLoss(key, proxy, 0.08)
+	snap := rt.Snapshot("test")
+	got := snap.Rows[0].Proxies[proxy].Attributes.PkgLoss
+	if got != 0.08 {
+		t.Fatalf("expected first pkg_loss=0.08 (100%% of value), got %.4f", got)
+	}
+}
+
+func TestPkgLossZeroUpdatesEMA(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	proxy := "proxy-a"
+
+	// Record initial loss
+	rt.UpdatePkgLoss(key, proxy, 0.1)
+	snap := rt.Snapshot("test")
+	if snap.Rows[0].Proxies[proxy].Attributes.PkgLoss != 0.1 {
+		t.Fatal("first pkg_loss should be 0.1")
+	}
+
+	// Update with 0% loss — EMA should decay toward 0
+	rt.UpdatePkgLoss(key, proxy, 0.0)
+	snap = rt.Snapshot("test")
+	expected := 0.1*3.0/4.0 + 0.0/4.0 // = 0.075
+	got := snap.Rows[0].Proxies[proxy].Attributes.PkgLoss
+	if got < expected-0.001 || got > expected+0.001 {
+		t.Fatalf("expected pkg_loss=%.4f after 0%% update, got %.4f", expected, got)
+	}
+
+	// Second 0% update — should decay further
+	rt.UpdatePkgLoss(key, proxy, 0.0)
+	snap = rt.Snapshot("test")
+	expected = expected*3.0/4.0 + 0.0/4.0 // = 0.05625
+	got = snap.Rows[0].Proxies[proxy].Attributes.PkgLoss
+	if got < expected-0.001 || got > expected+0.001 {
+		t.Fatalf("expected pkg_loss=%.4f after second 0%% update, got %.4f", expected, got)
+	}
+}
+
+func TestBackwardCompatPersistedCell(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	proxy := "proxy-a"
+
+	// Simulate old-format PersistedCell (HasSample=true, no per-metric flags)
+	pc := PersistedCell{
+		Latency:     100,
+		PkgLoss:     0.05,
+		Speed:       10485760,
+		UseCount:    5,
+		FailedCount: 0,
+		HasSample:   true,
+		// HasLatencySample, HasPkgLossSample, HasSpeedSample are all false
+		// (zero values from old-format JSON)
+	}
+
+	rt.RestoreRow(key, proxy, pc)
+
+	rt.mu.RLock()
+	cell := rt.rows[key].proxies[proxy]
+	hasLat := cell.HasLatencySample
+	hasLoss := cell.HasPkgLossSample
+	hasSpd := cell.HasSpeedSample
+	rt.mu.RUnlock()
+
+	if !hasLat {
+		t.Fatal("HasLatencySample should be inferred from old HasSample")
+	}
+	if !hasLoss {
+		t.Fatal("HasPkgLossSample should be inferred from old HasSample")
+	}
+	if !hasSpd {
+		t.Fatal("HasSpeedSample should be inferred from old HasSample")
+	}
+}
+
+func TestIntegrationLatencySpeedLossFromSingleConnection(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	proxy := "proxy-a"
+
+	// Simulate a full connection lifecycle:
+	// 1. Discovery phase: probeBatch writes connectTime for pre-ranking
+	connectTime := int64(120)
+	rt.UpdateLatency(key, proxy, connectTime)
+
+	// 2. Connection close: TTFB = connectTime + firstReadLatency
+	firstReadLat := int64(50)
+	ttfb := connectTime + firstReadLat // = 170ms
+	rt.UpdateLatency(key, proxy, ttfb)
+
+	// 3. Speed sample from tracker
+	speed := 10485760.0 // 10 MiB/s
+	rt.UpdateSpeed(key, proxy, speed)
+
+	// 4. Loss rate from TCP stats (0% loss — should still update)
+	rt.UpdatePkgLoss(key, proxy, 0.0)
+
+	// Verify all per-metric flags are set independently
+	rt.mu.RLock()
+	cell := rt.rows[key].proxies[proxy]
+	if !cell.HasLatencySample {
+		t.Fatal("HasLatencySample should be true after connection close")
+	}
+	if !cell.HasSpeedSample {
+		t.Fatal("HasSpeedSample should be true after speed update")
+	}
+	if !cell.HasPkgLossSample {
+		t.Fatal("HasPkgLossSample should be true after pkg_loss update")
+	}
+	rt.mu.RUnlock()
+
+	// Verify final values
+	snap := rt.Snapshot("test")
+	rec := snap.Rows[0].Proxies[proxy]
+
+	// Speed: first sample, no prior = raw value
+	if rec.Attributes.Speed != speed {
+		t.Fatalf("expected speed=%.0f, got %.0f", speed, rec.Attributes.Speed)
+	}
+
+	// PkgLoss: first sample, no prior = raw value (0.0)
+	if rec.Attributes.PkgLoss != 0.0 {
+		t.Fatalf("expected pkg_loss=0.0, got %.4f", rec.Attributes.PkgLoss)
+	}
+
+	// Latency: first=connectTime(raw), second=EMA(connectTime, ttfb)
+	// = 120*0.75 + 170*0.25 = 132.5
+	expectedLat := int64(float64(connectTime)*0.75 + float64(ttfb)*0.25)
+	if rec.Attributes.Latency != expectedLat {
+		t.Fatalf("expected latency=%d (TTFB EMA), got %d", expectedLat, rec.Attributes.Latency)
+	}
+}
