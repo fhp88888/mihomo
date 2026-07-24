@@ -51,7 +51,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 		for _, p := range proxies {
 			if p.Name() == s.selected {
 				log.Debugln("[Smart] tcpRoute key=%s MANUAL-SELECT proxy=%s", key, s.selected)
-				dialCtx, dialCancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
+				dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
 				defer dialCancel()
 				return s.dialAndWrap(dialCtx, p, metadata, key)
 			}
@@ -67,7 +67,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 			for _, p := range proxies {
 				if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
 					log.Debugln("[Smart] tcpRoute key=%s FAST-PATH best=%s", key, bestName)
-					dialCtx, dialCancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
+					dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
 					conn, err := s.dialAndWrap(dialCtx, p, metadata, key)
 					dialCancel()
 					if err == nil {
@@ -112,7 +112,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 				continue
 			}
 			log.Debugln("[Smart] tcpRoute key=%s SERIAL-TRY proxy=%s", key, name)
-			dialCtx, dialCancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
+			dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
 			conn, err := s.dialAndWrap(dialCtx, p, metadata, key)
 			dialCancel()
 			if err == nil {
@@ -200,7 +200,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	proxy, conn, connectTime, err := s.probeCoordinator.Discover(
 		ctx, key, available, metadata, preRanked,
 		func(ctx context.Context, p C.Proxy, m *C.Metadata, start time.Time) (C.Conn, int64, error) {
-			dialCtx, dialCancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
+			dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
 			conn, err := p.DialContext(dialCtx, m)
 			dialCancel()
 			elapsed := time.Since(start).Milliseconds()
@@ -319,7 +319,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	if s.selected != "" {
 		for _, p := range proxies {
 			if p.Name() == s.selected && p.SupportUDP() {
-				dialCtx, dialCancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
+				dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultUDPTimeout)
 				defer dialCancel()
 				return s.dialUDPAndWrap(dialCtx, p, metadata, key)
 			}
@@ -342,7 +342,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
 		for _, p := range udpProxies {
 			if p.Name() == bestName {
-				dialCtx, dialCancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
+				dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultUDPTimeout)
 				pc, err := s.dialUDPAndWrap(dialCtx, p, metadata, key)
 				dialCancel()
 				if err == nil {
@@ -387,7 +387,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	// Serial try
 	var lastErr error
 	for _, p := range ordered {
-		dialCtx, dialCancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
+		dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultUDPTimeout)
 		pc, err := s.dialUDPAndWrap(dialCtx, p, metadata, key)
 		dialCancel()
 		if err == nil {

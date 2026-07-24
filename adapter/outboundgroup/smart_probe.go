@@ -95,7 +95,7 @@ func (pc *ProbeCoordinator) Discover(
 	}
 
 	// Leader path: create discovery state
-	leaderCtx, leaderCancel := context.WithCancel(pc.ctx)
+	leaderCtx, leaderCancel := context.WithCancel(ctx)
 	ds = &discoveryState{
 		done:         make(chan struct{}),
 		leaderCtx:    leaderCtx,
@@ -137,6 +137,14 @@ type probeResult struct {
 type probeMetric struct {
 	proxyName   string
 	connectTime int64
+}
+
+// dialResult is the result of a single dial attempt in parallelDial.
+type dialResult struct {
+	proxy       C.Proxy
+	conn        C.Conn
+	connectTime int64
+	err         error
 }
 
 // probeBatch probes proxies in batches of topK. Returns the first successful result.
@@ -224,13 +232,6 @@ func (pc *ProbeCoordinator) parallelDial(
 		return probeResult{err: errors.New("empty batch")}, nil
 	}
 
-	type dialResult struct {
-		proxy       C.Proxy
-		conn        C.Conn
-		connectTime int64
-		err         error
-	}
-
 	results := make(chan dialResult, n)
 
 	for i := 0; i < n; i++ {
@@ -258,19 +259,7 @@ func (pc *ProbeCoordinator) parallelDial(
 				// connections but still collect their connectTimes.
 				remaining := n - received
 				if remaining > 0 {
-					go func() {
-						for i := 0; i < remaining; i++ {
-							r := <-results
-							if r.err == nil {
-								rt.UpdateLatency(key, r.proxy.Name(), r.connectTime)
-								log.Debugln("[Smart] parallelDial key=%s proxy=%s connectTime=%dms (loser)",
-									key, r.proxy.Name(), r.connectTime)
-								if r.conn != nil {
-									r.conn.Close()
-								}
-							}
-						}
-					}()
+					go drainResults(results, remaining, rt, key, true)
 				}
 				return probeResult{proxy: res.proxy, conn: res.conn, connectTime: res.connectTime}, allMetrics
 			}
@@ -279,12 +268,36 @@ func (pc *ProbeCoordinator) parallelDial(
 		case <-ctx.Done():
 			log.Infoln("[Smart] parallelDial key=%s ctx-done received=%d/%d",
 				key, received, n)
+			// Drain remaining results to close any successful connections
+			// from goroutines that completed concurrently with cancellation.
+			remaining := n - received
+			if remaining > 0 {
+				go drainResults(results, remaining, nil, "", false)
+			}
 			return probeResult{err: ctx.Err()}, allMetrics
 		}
 	}
 
 	log.Infoln("[Smart] parallelDial key=%s ALL-FAILED (%d proxies)", key, n)
 	return probeResult{err: fmt.Errorf("all %d proxies failed for key=%s", n, key)}, allMetrics
+}
+
+// drainResults drains n results from the channel, optionally updating the
+// route table with latency measurements, and closing any successful connections.
+func drainResults(results <-chan dialResult, n int, rt *smart.RouteTable, key string, updateRT bool) {
+	for i := 0; i < n; i++ {
+		r := <-results
+		if r.err == nil {
+			if updateRT && rt != nil {
+				rt.UpdateLatency(key, r.proxy.Name(), r.connectTime)
+				log.Debugln("[Smart] parallelDial key=%s proxy=%s connectTime=%dms (loser)",
+					key, r.proxy.Name(), r.connectTime)
+			}
+			if r.conn != nil {
+				r.conn.Close()
+			}
+		}
+	}
 }
 
 // Close cancels all active discoveries and waits for workers to finish.
