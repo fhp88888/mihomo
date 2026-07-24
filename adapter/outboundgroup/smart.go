@@ -31,7 +31,7 @@ const (
 )
 
 var (
-	smartInitOnce sync.Once
+	smartCleanupOnce sync.Once
 )
 
 type SmartOption struct {
@@ -183,15 +183,15 @@ func (s *Smart) GetConfigFilename() string {
 func (s *Smart) InitSmart() {
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
-	smartInitOnce.Do(func() {
+	smartCleanupOnce.Do(func() {
 		s.startTimedTask(5*time.Minute, cleanupInterval, "Global orphaned groups Clean up", s.cleanupOrphanedGroups, true)
-		// try load ASN database
-		if s.preferASN {
-			if err := geodata.InitASN(); err != nil {
-				log.Warnln("[Smart] Failed to load ASN database: %v", err)
-			}
-		}
 	})
+	// try load ASN database for any smart group that needs it
+	if s.preferASN {
+		if err := geodata.InitASN(); err != nil {
+			log.Warnln("[Smart] Failed to load ASN database: %v", err)
+		}
+	}
 
 	// Periodic route table persistence: every 10 minutes, iterate the route
 	// table and enqueue dirty cells to the bbolt batch queue.
@@ -355,6 +355,7 @@ func (s *Smart) MarshalJSON() ([]byte, error) {
 		"sampleRate":      s.sampleRate,
 		"preferASN":       s.preferASN,
 	})
+
 }
 
 func (s *Smart) Providers() []provider.ProxyProvider {
@@ -401,7 +402,6 @@ func (s *Smart) Close() error {
 		s.probeCoordinator.Close()
 	}
 
-	smartInitOnce = sync.Once{}
 
 	return nil
 }
@@ -689,6 +689,13 @@ func (s *Smart) getASNCode(metadata *C.Metadata) string {
 			ip = metadata.DstIP
 		}
 
+		if !geodata.ASNEnable() {
+			if err := geodata.InitASN(); err != nil {
+				log.Warnln("[Smart] ASN not initialized: %v", err)
+				metadata.DstIPASN = "unknown"
+				return ""
+			}
+		}
 		asn, aso := mmdb.ASNInstance().LookupASN(ip.AsSlice())
 		if asn == "" {
 			metadata.DstIPASN = "unknown"
