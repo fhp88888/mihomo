@@ -69,14 +69,48 @@ func (s *Store) BatchSave(operations []StoreOperation) error {
 	return err
 }
 
-// 刷新队列中的操作到数据库
-func (s *Store) FlushQueue(force bool) {
+// FlushQueue drains the global operation queue and writes all pending
+// operations to the database.  When force is false the queue is only
+// drained when it meets the batch threshold.  Returns an error when
+// the database write fails (the drained operations are re-enqueued).
+func (s *Store) FlushQueue(force bool) error {
 	ops := drainGlobalQueue(force)
 	if len(ops) == 0 {
-		return
+		return nil
 	}
-	s.BatchSave(ops)
+
+	// Serialize with threshold-triggered flushes from AppendToGlobalQueue
+	// so that a late-arriving old snapshot cannot overwrite newer data.
+	flushMutex.Lock()
+	defer flushMutex.Unlock()
+
+	if err := s.BatchSave(ops); err != nil {
+		log.Warnln("[SmartStore] FlushQueue failed, re-enqueuing %d operations: %v", len(ops), err)
+		// Re-enqueue: current queue values override the older snapshot.
+		globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
+			opMap := make(map[string]StoreOperation, len(ops)+len(old))
+			for i := range ops {
+				key := formatOperationKey(&ops[i])
+				if key != "" {
+					opMap[key] = ops[i]
+				}
+			}
+			for i := range old {
+				key := formatOperationKey(&old[i])
+				if key != "" {
+					opMap[key] = old[i]
+				}
+			}
+			newQueue := make([]StoreOperation, 0, len(opMap))
+			for _, op := range opMap {
+				newQueue = append(newQueue, op)
+			}
+			return newQueue
+		})
+		return err
+	}
 	log.Debugln("[SmartStore] Queue datas saved, operations: [%d]", len(ops))
+	return nil
 }
 
 func matchKeyPrefix(key, queryPrefix string, strict bool) bool {

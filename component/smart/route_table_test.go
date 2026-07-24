@@ -644,27 +644,22 @@ func TestIntegrationLatencySpeedLossFromSingleConnection(t *testing.T) {
 	proxy := "proxy-a"
 
 	// Simulate a full connection lifecycle:
-	// 1. Discovery phase: probeBatch writes connectTime for pre-ranking
+	// 1. dialAndWrap / probeBatch writes connectTime once
 	connectTime := int64(120)
 	rt.UpdateLatency(key, proxy, connectTime)
 
-	// 2. Connection close: TTFB = connectTime + firstReadLatency
-	firstReadLat := int64(50)
-	ttfb := connectTime + firstReadLat // = 170ms
-	rt.UpdateLatency(key, proxy, ttfb)
-
-	// 3. Speed sample from tracker
+	// 2. Speed sample from tracker (written on close)
 	speed := 10485760.0 // 10 MiB/s
 	rt.UpdateSpeed(key, proxy, speed)
 
-	// 4. Loss rate from TCP stats (0% loss — should still update)
+	// 3. Loss rate from TCP stats (written on close, 0% loss — should still update)
 	rt.UpdatePkgLoss(key, proxy, 0.0)
 
 	// Verify all per-metric flags are set independently
 	rt.mu.RLock()
 	cell := rt.rows[key].proxies[proxy]
 	if !cell.HasLatencySample {
-		t.Fatal("HasLatencySample should be true after connection close")
+		t.Fatal("HasLatencySample should be true after connectTime write")
 	}
 	if !cell.HasSpeedSample {
 		t.Fatal("HasSpeedSample should be true after speed update")
@@ -688,10 +683,8 @@ func TestIntegrationLatencySpeedLossFromSingleConnection(t *testing.T) {
 		t.Fatalf("expected pkg_loss=0.0, got %.4f", rec.Attributes.PkgLoss)
 	}
 
-	// Latency: first=connectTime(raw), second=EMA(connectTime, ttfb)
-	// = 120*0.75 + 170*0.25 = 132.5
-	expectedLat := int64(float64(connectTime)*0.75 + float64(ttfb)*0.25)
-	if rec.Attributes.Latency != expectedLat {
-		t.Fatalf("expected latency=%d (TTFB EMA), got %d", expectedLat, rec.Attributes.Latency)
+	// Latency: single connectTime write, first sample = raw value (no EMA blending)
+	if rec.Attributes.Latency != connectTime {
+		t.Fatalf("expected latency=%d (connectTime, single write), got %d", connectTime, rec.Attributes.Latency)
 	}
 }

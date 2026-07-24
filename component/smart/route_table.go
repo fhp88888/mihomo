@@ -606,11 +606,13 @@ func (rt *RouteTable) RestoreRow(key, proxy string, pc PersistedCell) {
 	cell.HasPkgLossSample = pc.HasPkgLossSample
 	cell.HasSpeedSample = pc.HasSpeedSample
 	// Backward compat: old persisted data only had HasSample.
-	// If HasSample is true but no per-metric flag is set, enable all three.
+	// Old code only wrote Speed/PkgLoss when > 0, so a zero value
+	// for those fields means "no sample".  Infer each per-metric
+	// flag from whether the stored value is non-zero.
 	if pc.HasSample && !cell.HasLatencySample && !cell.HasPkgLossSample && !cell.HasSpeedSample {
-		cell.HasLatencySample = true
-		cell.HasPkgLossSample = true
-		cell.HasSpeedSample = true
+		cell.HasLatencySample = pc.Latency > 0
+		cell.HasPkgLossSample = pc.PkgLoss > 0
+		cell.HasSpeedSample = pc.Speed > 0
 	}
 	cell.Score = calculateScore(pc.Latency, pc.Speed, pc.PkgLoss, pc.FailedCount)
 	cell.Dirty = false

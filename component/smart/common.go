@@ -64,6 +64,7 @@ var (
 	bucketSmartStats = []byte("smart_stats")
 
 	globalOperationQueue atomic.TypedValue[[]StoreOperation]
+	flushMutex           sync.Mutex
 
 	globalCacheParams struct {
 		BatchSaveThreshold int
@@ -459,36 +460,40 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 	})
 
 	if shouldFlush && len(snapshot) > 0 {
-		go func() {
-			if err := s.BatchSave(snapshot); err != nil {
-				log.Warnln("[SmartStore] Async batch save failed, re-enqueuing %d operations: %v", len(snapshot), err)
-				// Merge back into the queue without triggering the
-				// batch-save threshold again — the next periodic
-				// persist or final FlushQueue(true) on close will retry.
-				globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
-					opMap := make(map[string]StoreOperation, len(old)+len(snapshot))
-					for i := range old {
-						key := formatOperationKey(&old[i])
-						if key != "" {
-							opMap[key] = old[i]
-						}
+		// Synchronous flush under global mutex so that:
+		// 1. Two concurrent threshold-triggered flushes cannot interleave.
+		// 2. No old snapshot can land in the DB after a newer one.
+		// 3. On failure the snapshot is re-enqueued for the next persist
+		//    cycle or the final FlushQueue(true) on Close.
+		flushMutex.Lock()
+		if err := s.BatchSave(snapshot); err != nil {
+			log.Warnln("[SmartStore] Sync batch save failed, re-enqueuing %d operations: %v", len(snapshot), err)
+			// Merge old snapshot first, then current queue, so that newer
+			// values in the current queue override older snapshot values.
+			globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
+				opMap := make(map[string]StoreOperation, len(snapshot)+len(old))
+				for i := range snapshot {
+					key := formatOperationKey(&snapshot[i])
+					if key != "" {
+						opMap[key] = snapshot[i]
 					}
-					for i := range snapshot {
-						key := formatOperationKey(&snapshot[i])
-						if key != "" {
-							opMap[key] = snapshot[i]
-						}
+				}
+				for i := range old {
+					key := formatOperationKey(&old[i])
+					if key != "" {
+						opMap[key] = old[i]
 					}
-					newQueue := make([]StoreOperation, 0, len(opMap))
-					for _, op := range opMap {
-						newQueue = append(newQueue, op)
-					}
-					return newQueue
-				})
-			} else {
-				log.Debugln("[SmartStore] Queue datas saved, operations: [%d]", len(snapshot))
-			}
-		}()
+				}
+				newQueue := make([]StoreOperation, 0, len(opMap))
+				for _, op := range opMap {
+					newQueue = append(newQueue, op)
+				}
+				return newQueue
+			})
+		} else {
+			log.Debugln("[SmartStore] Queue datas saved, operations: [%d]", len(snapshot))
+		}
+		flushMutex.Unlock()
 	}
 }
 

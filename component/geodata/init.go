@@ -166,7 +166,6 @@ func InitGeoIP() error {
 }
 
 func InitASN() error {
-	asnEnable.Store(true)
 	initASNMutex.Lock()
 	defer initASNMutex.Unlock()
 	if _, err := os.Stat(C.Path.ASN()); os.IsNotExist(err) {
@@ -189,6 +188,7 @@ func InitASN() error {
 		}
 		initASN = true
 	}
+	asnEnable.Store(true)
 	return nil
 }
 

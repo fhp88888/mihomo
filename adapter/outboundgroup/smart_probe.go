@@ -275,7 +275,11 @@ func (pc *ProbeCoordinator) parallelDial(
 				// connections but still collect their connectTimes.
 				remaining := n - received
 				if remaining > 0 {
-					go drainResults(results, remaining, rt, key, true)
+					pc.wg.Add(1)
+					go func() {
+						defer pc.wg.Done()
+						drainResults(results, remaining, rt, key, true)
+					}()
 				}
 				return probeResult{proxy: res.proxy, conn: res.conn, connectTime: res.connectTime}, allMetrics, allResults
 			}
@@ -288,7 +292,11 @@ func (pc *ProbeCoordinator) parallelDial(
 			// from goroutines that completed concurrently with cancellation.
 			remaining := n - received
 			if remaining > 0 {
-				go drainResults(results, remaining, nil, "", false)
+				pc.wg.Add(1)
+				go func() {
+					defer pc.wg.Done()
+					drainResults(results, remaining, nil, "", false)
+				}()
 			}
 			return probeResult{err: ctx.Err()}, allMetrics, allResults
 		}

@@ -246,8 +246,11 @@ func TestParallelDial_ReturnsDialResults_Success(t *testing.T) {
 	if result.proxy.Name() != "p2" {
 		t.Fatalf("expected winner p2, got %s", result.proxy.Name())
 	}
-	if len(dialResults) < 2 {
-		t.Fatalf("expected at least 2 dial results, got %d", len(dialResults))
+	// The production contract is "first success returns immediately",
+	// so the winner may be the only result in dialResults.  Verify
+	// that the winner is present rather than asserting a minimum count.
+	if len(dialResults) < 1 {
+		t.Fatal("expected at least 1 dial result (the winner), got 0")
 	}
 	foundWinner := false
 	for _, dr := range dialResults {

@@ -150,9 +150,10 @@ func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Meta
 		return nil, err
 	}
 
-	// Note: Latency is written as TTFB on connection close (see wrapTCPConn),
-	// not here as connectTime, so the route table's Latency EMA reflects the
-	// end-to-end time from dial start to first byte.
+	// Write connectTime to the route table so that all paths (fast-path,
+	// serial fallback, discovery) contribute the same metric. TTFB varies
+	// by connection lifetime and is not available for losers.
+	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
 	s.routeTable.IncrementUseCount(key, proxy.Name())
 	s.routeTable.SetBestProxy(key, proxy.Name())
 	s.routeTable.SetTCPProbed(key)
@@ -225,7 +226,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 
 	// Note: probeBatch already wrote the winner's connectTime to the route table
 	// (smart_probe.go:189). Do NOT write it again here — that would double-count
-	// the sample. TTFB is written on connection close via wrapTCPConn.
+	// the sample.
 	s.routeTable.IncrementUseCount(key, proxy.Name())
 	s.routeTable.SetBestProxy(key, proxy.Name())
 	s.routeTable.SetTCPProbed(key)
@@ -261,15 +262,8 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, conne
 	return callback.NewCloseCallbackConn(c, func() {
 		key := routeKey(metadata)
 
-		// Compute TTFB = connectTime + firstReadLatency.
-		// Only write when the first read succeeded (no error) — errors like
-		// timeouts or connection resets must not be recorded as latency samples.
 		firstRead := firstReadLatency.Load()
 		readErr := firstReadErr.Load()
-		if firstRead > 0 && readErr == nil {
-			ttfb := connectTime + firstRead
-			s.routeTable.UpdateLatency(key, proxy.Name(), ttfb)
-		}
 
 		// Collect speed and pkg_loss from tracker
 		tracker := statistic.DefaultManager.Get(metadata.UUID)
@@ -429,14 +423,9 @@ func (s *Smart) dialUDPAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.M
 	return s.wrapUDPConn(pc, proxy, metadata), nil
 }
 
-// wrapUDPConn wraps a UDP packet connection to record first-response latency.
+// wrapUDPConn wraps a UDP packet connection. Unlike TCP, UDP does not collect
+// connectTime here — connectTime is already written by dialUDPAndWrap.
 func (s *Smart) wrapUDPConn(pc C.PacketConn, proxy C.Proxy, metadata *C.Metadata) C.PacketConn {
 	pc.AppendToChains(s)
-
-	pc = callback.NewFirstReadCallBackPacketConn(pc, func(latency int64) {
-		key := routeKey(metadata)
-		s.routeTable.UpdateLatency(key, proxy.Name(), latency)
-	})
-
 	return pc
 }

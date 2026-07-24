@@ -390,20 +390,24 @@ func (s *Smart) Close() error {
 
 	s.wg.Wait()
 
-	// Final persistence: snapshot remaining dirty cells and force-write
-	// the global queue so that small route tables (< batch threshold)
-	// are not lost on shutdown or config reload.
-	s.persistRouteTable()
-	if store := cachefile.GetSmartStore(); store != nil {
-		store.FlushQueue(true)
-	}
-
+	// Close the probe coordinator first so that all in-flight dials
+	// and drain goroutines finish before the final persistence pass.
+	// This ensures drain-produced latency updates are included in the
+	// final snapshot.
 	if s.probeCoordinator != nil {
 		s.probeCoordinator.Close()
 	}
 
+	// Final persistence: snapshot remaining dirty cells and force-write
+	// the global queue so that small route tables (< batch threshold)
+	// are not lost on shutdown or config reload.
+	s.persistRouteTable()
+	var flushErr error
+	if store := cachefile.GetSmartStore(); store != nil {
+		flushErr = store.FlushQueue(true)
+	}
 
-	return nil
+	return flushErr
 }
 
 // ── Background tasks ────────────────────────────────────────
