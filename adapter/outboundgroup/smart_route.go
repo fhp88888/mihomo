@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -20,7 +21,10 @@ import (
 	"github.com/metacubex/mihomo/tunnel/statistic"
 )
 
-const smartBestProxyFreshness = 10 * time.Second
+const (
+	smartBestProxyFreshness = 5 * time.Second
+	smartTCPFallbackStagger = 200 * time.Millisecond
+)
 
 // routeKey returns the route table key for a connection's metadata.
 // Format: "ASN:<number>" when ASN is available and valid,
@@ -59,87 +63,172 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 	}
 
 	// Fast path: known route with TCP-probed best proxy.
-	// 10% of requests intentionally skip the fast path to trigger re-discovery,
-	// giving the pre-ranker a chance to use accumulated per-key latency data
-	// from earlier loser measurements and potentially find a better proxy.
-	if s.routeTable.IsTCPProbed(key) && rand.Intn(100)%10 != 0 {
-		if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
-			for _, p := range proxies {
-				if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
-					log.Debugln("[Smart] tcpRoute key=%s FAST-PATH best=%s", key, bestName)
-					dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
-					conn, err := s.dialAndWrap(dialCtx, p, metadata, key)
-					dialCancel()
-					if err == nil {
-						log.Debugln("[Smart] tcpRoute key=%s FAST-PATH-OK best=%s", key, bestName)
-						return conn, nil
-					}
-					log.Infoln("[Smart] tcpRoute key=%s fast-best FAILED proxy=%s err=%v", key, bestName, err)
-					if tunnel.ShouldStopRetry(err) {
-						return nil, err
-					}
-					break
-				}
-			}
+	// 4% of requests intentionally skip the fast path to trigger re-discovery
+	if s.routeTable.IsTCPProbed(key) && rand.Intn(100)%25 != 0 {
+		conn, err := s.serialTcpConn(ctx, metadata, key, proxies)
+		if conn != nil || err != nil {
+			return conn, err
 		}
-
-		// Best proxy is stale, unavailable, or failed. Try the remaining
-		// per-key proxies serially by score, recalculated from current latency.
-		log.Infoln("[Smart] tcpRoute key=%s fast-best-miss, trying serial fallback", key)
-		names := make([]string, 0, len(proxies))
-		proxyMap := make(map[string]C.Proxy, len(proxies))
-		for _, p := range proxies {
-			if p.AliveForTestUrl(s.testUrl) {
-				names = append(names, p.Name())
-				proxyMap[p.Name()] = p
-			}
-		}
-		s.routeTable.RefreshScores(key, names)
-		ranked := s.routeTable.RankByScore(names, func(proxyName string) uint16 {
-			if p, ok := proxyMap[proxyName]; ok {
-				return p.LastDelayForTestUrl(s.testUrl)
-			}
-			return 0xffff
-		}, key)
-
-		log.Infoln("[Smart] tcpRoute key=%s SERIAL-FALLBACK %s",
-			key, s.routeTable.DebugDumpScores(key))
-		log.Infoln("[Smart] tcpRoute key=%s SERIAL-FALLBACK ranked: %v", key, ranked)
-
-		for _, name := range ranked {
-			p, ok := proxyMap[name]
-			if !ok {
-				continue
-			}
-			log.Debugln("[Smart] tcpRoute key=%s SERIAL-TRY proxy=%s", key, name)
-			dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
-			conn, err := s.dialAndWrap(dialCtx, p, metadata, key)
-			dialCancel()
-			if err == nil {
-				log.Infoln("[Smart] tcpRoute key=%s SERIAL-OK proxy=%s", key, name)
-				return conn, nil
-			}
-			log.Debugln("[Smart] tcpRoute key=%s SERIAL-FAIL proxy=%s err=%v", key, name, err)
-			if tunnel.ShouldStopRetry(err) {
-				return nil, err
-			}
-		}
-		log.Infoln("[Smart] tcpRoute key=%s serial-fallback-exhausted, falling to discovery", key)
-	} else {
-		probed := s.routeTable.IsTCPProbed(key)
-		log.Debugln("[Smart] tcpRoute key=%s NO-FAST-PATH tcpProbed=%v (cold-start or 8%% re-discover)", key, probed)
 	}
 
-	// Cold start, 10% re-discover, or all serial fallbacks exhausted:
+	// Fallback, Cold start, 4% re-discover, or all serial fallbacks exhausted:
 	// full parallel discovery.
 	return s.discoverAndRoute(ctx, metadata, key, proxies)
 }
 
-// dialAndWrap dials a known proxy and wraps the connection for metrics collection.
-func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Metadata, key string) (C.Conn, error) {
+func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key string, proxies []C.Proxy) (C.Conn, error) {
+	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
+		for _, p := range proxies {
+			if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
+				log.Debugln("[Smart] tcpRoute key=%s FAST-PATH best=%s", key, bestName)
+				dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
+				conn, err := s.dialAndWrap(dialCtx, p, metadata, key)
+				dialCancel()
+				if err == nil {
+					log.Debugln("[Smart] tcpRoute key=%s FAST-PATH-OK best=%s", key, bestName)
+					return conn, nil
+				}
+				log.Infoln("[Smart] tcpRoute key=%s fast-best FAILED proxy=%s err=%v", key, bestName, err)
+				if tunnel.ShouldStopRetry(err) {
+					return nil, err
+				}
+				break
+			}
+		}
+	}
+
+	// Best proxy is stale, unavailable, or failed. Rank the remaining
+	// per-key proxies by score and race them with a short stagger.
+	log.Infoln("[Smart] tcpRoute key=%s fast-best-miss, trying staggered fallback", key)
+	names := make([]string, 0, len(proxies))
+	proxyMap := make(map[string]C.Proxy, len(proxies))
+	for _, p := range proxies {
+		if p.AliveForTestUrl(s.testUrl) {
+			names = append(names, p.Name())
+			proxyMap[p.Name()] = p
+		}
+	}
+	s.routeTable.RefreshScores(key, names)
+	ranked := s.routeTable.RankByScore(names, func(proxyName string) uint16 {
+		if p, ok := proxyMap[proxyName]; ok {
+			return p.LastDelayForTestUrl(s.testUrl)
+		}
+		return 0xffff
+	}, key)
+
+	log.Infoln("[Smart] tcpRoute key=%s STAGGERED-FALLBACK %s",
+		key, s.routeTable.DebugDumpScores(key))
+	log.Infoln("[Smart] tcpRoute key=%s STAGGERED-FALLBACK ranked: %v", key, ranked)
+
+	conn, err := s.staggeredTCPFallback(ctx, metadata, key, ranked, proxyMap)
+	if conn != nil || err != nil {
+		return conn, err
+	}
+	log.Infoln("[Smart] tcpRoute key=%s staggered-fallback-exhausted, falling to discovery", key)
+	return nil, nil
+}
+
+func (s *Smart) staggeredTCPFallback(ctx context.Context, metadata *C.Metadata, key string, ranked []string, proxyMap map[string]C.Proxy) (C.Conn, error) {
+	ordered := make([]C.Proxy, 0, len(ranked))
+	for _, name := range ranked {
+		if proxy, ok := proxyMap[name]; ok {
+			ordered = append(ordered, proxy)
+		}
+	}
+	if len(ordered) == 0 {
+		return nil, nil
+	}
+
+	raceCtx, cancelRace := context.WithCancel(ctx)
+	defer cancelRace()
+
+	results := make(chan dialResult, len(ordered))
+	var workers sync.WaitGroup
+	launched, received := 0, 0
+
+	launch := func(proxy C.Proxy) {
+		launched++
+		workers.Add(1)
+		log.Debugln("[Smart] tcpRoute key=%s STAGGERED-TRY proxy=%s", key, proxy.Name())
+		go func() {
+			defer workers.Done()
+			dialCtx, dialCancel := context.WithTimeout(raceCtx, C.DefaultTCPTimeout)
+			conn, connectTime, err := s.dialTCP(dialCtx, proxy, metadata, key)
+			dialCancel()
+			results <- dialResult{proxy: proxy, conn: conn, connectTime: connectTime, err: err}
+		}()
+	}
+
+	stopAndDrain := func() {
+		cancelRace()
+		for received < launched {
+			result := <-results
+			received++
+			if result.err == nil && result.conn != nil {
+				s.routeTable.UpdateLatency(key, result.proxy.Name(), result.connectTime)
+				result.conn.Close()
+			}
+		}
+		workers.Wait()
+	}
+
+	launch(ordered[0])
+	next := 1
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	if next < len(ordered) {
+		timer = time.NewTimer(smartTCPFallbackStagger)
+		timerC = timer.C
+	}
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	for received < launched || next < len(ordered) {
+		select {
+		case result := <-results:
+			received++
+			if result.err == nil {
+				log.Infoln("[Smart] tcpRoute key=%s STAGGERED-OK proxy=%s", key, result.proxy.Name())
+				s.routeTable.UpdateLatency(key, result.proxy.Name(), result.connectTime)
+				s.routeTable.IncrementUseCount(key, result.proxy.Name())
+				s.routeTable.SetBestProxy(key, result.proxy.Name())
+				s.routeTable.SetTCPProbed(key)
+				stopAndDrain()
+				return s.wrapTCPConn(result.conn, result.proxy, metadata, result.connectTime), nil
+			}
+			log.Debugln("[Smart] tcpRoute key=%s STAGGERED-FAIL proxy=%s err=%v", key, result.proxy.Name(), result.err)
+			if tunnel.ShouldStopRetry(result.err) {
+				stopAndDrain()
+				return nil, result.err
+			}
+		case <-timerC:
+			launch(ordered[next])
+			next++
+			if next < len(ordered) {
+				timer.Reset(smartTCPFallbackStagger)
+			} else {
+				timerC = nil
+			}
+		case <-ctx.Done():
+			stopAndDrain()
+			return nil, ctx.Err()
+		}
+	}
+
+	return nil, nil
+}
+
+// dialTCP dials a known proxy and records a genuine dial failure.
+func (s *Smart) dialTCP(ctx context.Context, proxy C.Proxy, metadata *C.Metadata, key string) (C.Conn, int64, error) {
 	start := time.Now()
 	conn, err := proxy.DialContext(ctx, metadata)
 	connectTime := time.Since(start).Milliseconds()
+	if connectTime < 1 {
+		connectTime = 1
+	}
 
 	if err != nil {
 		log.Debugln("[Smart] dialAndWrap key=%s proxy=%s FAIL connectTime=%dms err=%v",
@@ -147,6 +236,15 @@ func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Meta
 		if !tunnel.ShouldStopRetry(err) && !errors.Is(err, context.Canceled) {
 			s.routeTable.MarkFailed(key, proxy.Name())
 		}
+	}
+
+	return conn, connectTime, err
+}
+
+// dialAndWrap dials a known proxy and wraps the connection for metrics collection.
+func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Metadata, key string) (C.Conn, error) {
+	conn, connectTime, err := s.dialTCP(ctx, proxy, metadata, key)
+	if err != nil {
 		return nil, err
 	}
 
