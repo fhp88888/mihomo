@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	smartBestProxyFreshness = 10 * time.Second
+	smartBestProxyFreshness = 5 * time.Second
 	smartTCPFallbackStagger = 200 * time.Millisecond
 )
 
@@ -63,15 +63,15 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 	}
 
 	// Fast path: known route with TCP-probed best proxy.
-	// 10% of requests intentionally skip the fast path to trigger re-discovery
-	if s.routeTable.IsTCPProbed(key) && rand.Intn(100)%10 != 0 {
+	// 4% of requests intentionally skip the fast path to trigger re-discovery
+	if s.routeTable.IsTCPProbed(key) && rand.Intn(100)%25 != 0 {
 		conn, err := s.serialTcpConn(ctx, metadata, key, proxies)
 		if conn != nil || err != nil {
 			return conn, err
 		}
 	}
 
-	// Fallback, Cold start, 10% re-discover, or all serial fallbacks exhausted:
+	// Fallback, Cold start, 4% re-discover, or all serial fallbacks exhausted:
 	// full parallel discovery.
 	return s.discoverAndRoute(ctx, metadata, key, proxies)
 }
@@ -226,6 +226,9 @@ func (s *Smart) dialTCP(ctx context.Context, proxy C.Proxy, metadata *C.Metadata
 	start := time.Now()
 	conn, err := proxy.DialContext(ctx, metadata)
 	connectTime := time.Since(start).Milliseconds()
+	if connectTime < 1 {
+		connectTime = 1
+	}
 
 	if err != nil {
 		log.Debugln("[Smart] dialAndWrap key=%s proxy=%s FAIL connectTime=%dms err=%v",
