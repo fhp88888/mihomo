@@ -82,7 +82,8 @@ func (pc *ProbeCoordinator) Discover(
 
 			if p != nil && e == nil {
 				// Follower gets a NEW connection to the same proxy
-				start := time.Now(); newConn, connectTime, dialErr := singleDial(ctx, p, metadata, start)
+				start := time.Now()
+				newConn, connectTime, dialErr := singleDial(ctx, p, metadata, start)
 				if dialErr != nil {
 					return nil, nil, 0, dialErr
 				}
@@ -114,8 +115,10 @@ func (pc *ProbeCoordinator) Discover(
 		pc.wg.Done()
 	}()
 
-	// Probe top-K in batches
-	proxy := pc.probeBatch(leaderCtx, key, proxies, metadata, preRanked, singleDial, rt)
+	// Probe top-K in batches. leaderCtx controls discovery result lifetime;
+	// ctx remains the parent for background loser probes so normal leader return
+	// does not cancel the rest of the winning batch before metrics are recorded.
+	proxy := pc.probeBatch(leaderCtx, ctx, key, proxies, metadata, preRanked, singleDial, rt)
 
 	ds.mu.Lock()
 	ds.proxy = proxy.proxy
@@ -149,7 +152,8 @@ type dialResult struct {
 
 // probeBatch probes proxies in batches of topK. Returns the first successful result.
 func (pc *ProbeCoordinator) probeBatch(
-	ctx context.Context,
+	controlCtx context.Context,
+	probeParentCtx context.Context,
 	key string,
 	proxies []C.Proxy,
 	metadata *C.Metadata,
@@ -181,7 +185,7 @@ func (pc *ProbeCoordinator) probeBatch(
 		}
 
 		log.Infoln("[Smart] probeBatch key=%s batch=%v", key, batchNames)
-		result, metrics, dialResults := pc.parallelDial(ctx, key, batch, metadata, singleDial, rt)
+		result, metrics, dialResults := pc.parallelDial(controlCtx, probeParentCtx, key, batch, metadata, singleDial, rt)
 		// Record all successful connectTimes to the route table so losers'
 		// measurements are not wasted — they improve prerank accuracy for
 		// subsequent discoveries on this route key.
@@ -220,9 +224,9 @@ func (pc *ProbeCoordinator) probeBatch(
 			return probeResult{err: fatalErr}
 		}
 
-		// If ctx is done, stop
-		if ctx.Err() != nil {
-			return probeResult{err: ctx.Err()}
+		// If controlCtx is done, stop
+		if controlCtx.Err() != nil {
+			return probeResult{err: controlCtx.Err()}
 		}
 	}
 
@@ -231,10 +235,12 @@ func (pc *ProbeCoordinator) probeBatch(
 
 // parallelDial concurrently dials all proxies in the batch.
 // Returns the FIRST successful connection immediately without waiting for
-// slower goroutines.  Remaining goroutines complete in the background and
-// write their connectTimes directly to the route table.
+// slower goroutines. Remaining goroutines from the same batch are allowed to
+// finish in the background, unless the caller or coordinator is canceled, and
+// write their successful connectTimes directly to the route table.
 func (pc *ProbeCoordinator) parallelDial(
-	ctx context.Context,
+	controlCtx context.Context,
+	probeParentCtx context.Context,
 	key string,
 	batch []C.Proxy,
 	metadata *C.Metadata,
@@ -246,6 +252,26 @@ func (pc *ProbeCoordinator) parallelDial(
 		return probeResult{err: errors.New("empty batch")}, nil, nil
 	}
 
+	probeCtx, probeCancel := context.WithCancel(probeParentCtx)
+	probeDone := make(chan struct{})
+	var stopOnce sync.Once
+	stopProbe := func() {
+		stopOnce.Do(func() {
+			probeCancel()
+			close(probeDone)
+		})
+	}
+
+	pc.wg.Add(1)
+	go func() {
+		defer pc.wg.Done()
+		select {
+		case <-pc.ctx.Done():
+			stopProbe()
+		case <-probeDone:
+		}
+	}()
+
 	results := make(chan dialResult, n)
 
 	for i := 0; i < n; i++ {
@@ -253,7 +279,7 @@ func (pc *ProbeCoordinator) parallelDial(
 		go func(p C.Proxy) {
 			defer pc.wg.Done()
 			start := time.Now()
-			conn, connectTime, err := singleDial(ctx, p, metadata, start)
+			conn, connectTime, err := singleDial(probeCtx, p, metadata, start)
 			results <- dialResult{proxy: p, conn: conn, connectTime: connectTime, err: err}
 		}(batch[i])
 	}
@@ -278,16 +304,20 @@ func (pc *ProbeCoordinator) parallelDial(
 					pc.wg.Add(1)
 					go func() {
 						defer pc.wg.Done()
+						defer stopProbe()
 						drainResults(results, remaining, rt, key, true)
 					}()
+				} else {
+					stopProbe()
 				}
 				return probeResult{proxy: res.proxy, conn: res.conn, connectTime: res.connectTime}, allMetrics, allResults
 			}
 			log.Infoln("[Smart] parallelDial key=%s proxy=%s FAILED err=%v",
 				key, res.proxy.Name(), res.err)
-		case <-ctx.Done():
+		case <-controlCtx.Done():
 			log.Infoln("[Smart] parallelDial key=%s ctx-done received=%d/%d",
 				key, received, n)
+			stopProbe()
 			// Drain remaining results to close any successful connections
 			// from goroutines that completed concurrently with cancellation.
 			remaining := n - received
@@ -298,11 +328,12 @@ func (pc *ProbeCoordinator) parallelDial(
 					drainResults(results, remaining, nil, "", false)
 				}()
 			}
-			return probeResult{err: ctx.Err()}, allMetrics, allResults
+			return probeResult{err: controlCtx.Err()}, allMetrics, allResults
 		}
 	}
 
 	log.Infoln("[Smart] parallelDial key=%s ALL-FAILED (%d proxies)", key, n)
+	stopProbe()
 	errs := make([]error, 0, len(allResults))
 	for _, r := range allResults {
 		if r.err != nil {

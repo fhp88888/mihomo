@@ -20,16 +20,16 @@ import (
 
 // stubProxy implements C.Proxy with minimal behavior for testing.
 type stubProxy struct {
-	name string
+	name  string
 	delay uint16
 	dial  func(context.Context, *C.Metadata) (C.Conn, error)
 }
 
-func (s *stubProxy) Name() string              { return s.name }
-func (s *stubProxy) Type() C.AdapterType       { return C.Direct }
-func (s *stubProxy) Addr() string              { return "" }
-func (s *stubProxy) SupportUDP() bool          { return false }
-func (s *stubProxy) ProxyInfo() C.ProxyInfo    { return C.ProxyInfo{} }
+func (s *stubProxy) Name() string           { return s.name }
+func (s *stubProxy) Type() C.AdapterType    { return C.Direct }
+func (s *stubProxy) Addr() string           { return "" }
+func (s *stubProxy) SupportUDP() bool       { return false }
+func (s *stubProxy) ProxyInfo() C.ProxyInfo { return C.ProxyInfo{} }
 func (s *stubProxy) MarshalJSON() ([]byte, error) {
 	return []byte(`"` + s.name + `"`), nil
 }
@@ -42,13 +42,13 @@ func (s *stubProxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Co
 func (s *stubProxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
 	return nil, errors.New("stub: ListenPacketContext not implemented")
 }
-func (s *stubProxy) SupportUOT() bool                      { return false }
-func (s *stubProxy) IsL3Protocol(metadata *C.Metadata) bool { return false }
-func (s *stubProxy) Unwrap(metadata *C.Metadata, touch bool) C.Proxy { return nil }
-func (s *stubProxy) Close() error                          { return nil }
-func (s *stubProxy) Adapter() C.ProxyAdapter               { return s }
-func (s *stubProxy) AliveForTestUrl(url string) bool       { return true }
-func (s *stubProxy) DelayHistory() []C.DelayHistory        { return nil }
+func (s *stubProxy) SupportUOT() bool                                   { return false }
+func (s *stubProxy) IsL3Protocol(metadata *C.Metadata) bool             { return false }
+func (s *stubProxy) Unwrap(metadata *C.Metadata, touch bool) C.Proxy    { return nil }
+func (s *stubProxy) Close() error                                       { return nil }
+func (s *stubProxy) Adapter() C.ProxyAdapter                            { return s }
+func (s *stubProxy) AliveForTestUrl(url string) bool                    { return true }
+func (s *stubProxy) DelayHistory() []C.DelayHistory                     { return nil }
 func (s *stubProxy) DelayHistoryForTestUrl(url string) []C.DelayHistory { return nil }
 func (s *stubProxy) ExtraDelayHistories() map[string]C.ProxyState       { return nil }
 func (s *stubProxy) LastDelayForTestUrl(url string) uint16              { return s.delay }
@@ -92,7 +92,7 @@ func TestParallelDial_ErrorsJoin_PreservesSentinel(t *testing.T) {
 	}
 
 	result, _, _ := pc.parallelDial(
-		context.Background(), "TARGET:example.com",
+		context.Background(), context.Background(), "TARGET:example.com",
 		proxies, &C.Metadata{}, singleDial, nil,
 	)
 
@@ -118,7 +118,7 @@ func TestParallelDial_ErrorsJoin_WrappedSentinel(t *testing.T) {
 	}
 
 	result, _, _ := pc.parallelDial(
-		context.Background(), "TARGET:example.com",
+		context.Background(), context.Background(), "TARGET:example.com",
 		proxies, &C.Metadata{}, singleDial, nil,
 	)
 
@@ -141,7 +141,7 @@ func TestParallelDial_ErrorsJoin_NoSentinel(t *testing.T) {
 	}
 
 	result, _, _ := pc.parallelDial(
-		context.Background(), "TARGET:example.com",
+		context.Background(), context.Background(), "TARGET:example.com",
 		proxies, &C.Metadata{}, singleDial, nil,
 	)
 
@@ -164,7 +164,7 @@ func TestParallelDial_ReturnsDialResults_AllFailed(t *testing.T) {
 	}
 
 	_, _, dialResults := pc.parallelDial(
-		context.Background(), "TARGET:example.com",
+		context.Background(), context.Background(), "TARGET:example.com",
 		proxies, &C.Metadata{}, singleDial, nil,
 	)
 
@@ -183,7 +183,7 @@ func TestParallelDial_EmptyBatch(t *testing.T) {
 	defer pc.Close()
 
 	result, metrics, dialResults := pc.parallelDial(
-		context.Background(), "TARGET:x",
+		context.Background(), context.Background(), "TARGET:x",
 		nil, &C.Metadata{}, nil, nil,
 	)
 
@@ -204,8 +204,8 @@ type stubConn struct {
 	closes int
 }
 
-func (s *stubConn) Read(b []byte) (n int, err error)            { return 0, io.EOF }
-func (s *stubConn) Write(b []byte) (n int, err error)           { return len(b), nil }
+func (s *stubConn) Read(b []byte) (n int, err error)  { return 0, io.EOF }
+func (s *stubConn) Write(b []byte) (n int, err error) { return len(b), nil }
 func (s *stubConn) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -217,21 +217,21 @@ func (s *stubConn) CloseCount() int {
 	defer s.mu.Unlock()
 	return s.closes
 }
-func (s *stubConn) LocalAddr() net.Addr                         { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
-func (s *stubConn) RemoteAddr() net.Addr                        { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443} }
-func (s *stubConn) SetDeadline(t time.Time) error               { return nil }
-func (s *stubConn) SetReadDeadline(t time.Time) error           { return nil }
-func (s *stubConn) SetWriteDeadline(t time.Time) error          { return nil }
-func (s *stubConn) ReadBuffer(buffer *buf.Buffer) error         { return io.EOF }
-func (s *stubConn) WriteBuffer(buffer *buf.Buffer) error        { return nil }
-func (s *stubConn) Upstream() any                               { return nil }
-func (s *stubConn) NeedHandshake() bool                         { return false }
-func (s *stubConn) ReaderReplaceable() bool                     { return false }
-func (s *stubConn) WriterReplaceable() bool                     { return false }
-func (s *stubConn) Chains() C.Chain                             { return nil }
-func (s *stubConn) ProviderChains() C.Chain                     { return nil }
-func (s *stubConn) AppendToChains(adapter C.ProxyAdapter)       {}
-func (s *stubConn) RemoteDestination() string                   { return "" }
+func (s *stubConn) LocalAddr() net.Addr                   { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
+func (s *stubConn) RemoteAddr() net.Addr                  { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443} }
+func (s *stubConn) SetDeadline(t time.Time) error         { return nil }
+func (s *stubConn) SetReadDeadline(t time.Time) error     { return nil }
+func (s *stubConn) SetWriteDeadline(t time.Time) error    { return nil }
+func (s *stubConn) ReadBuffer(buffer *buf.Buffer) error   { return io.EOF }
+func (s *stubConn) WriteBuffer(buffer *buf.Buffer) error  { return nil }
+func (s *stubConn) Upstream() any                         { return nil }
+func (s *stubConn) NeedHandshake() bool                   { return false }
+func (s *stubConn) ReaderReplaceable() bool               { return false }
+func (s *stubConn) WriterReplaceable() bool               { return false }
+func (s *stubConn) Chains() C.Chain                       { return nil }
+func (s *stubConn) ProviderChains() C.Chain               { return nil }
+func (s *stubConn) AppendToChains(adapter C.ProxyAdapter) {}
+func (s *stubConn) RemoteDestination() string             { return "" }
 
 var _ C.Conn = (*stubConn)(nil)
 
@@ -244,6 +244,202 @@ func routeFailedCount(t *testing.T, table *smart.RouteTable, key, proxy string) 
 	}
 	t.Fatalf("route row %q not found", key)
 	return 0
+}
+
+func waitForLatencies(t *testing.T, table *smart.RouteTable, key string, expected map[string]int64) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if hasLatencies(table, key, expected) {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for latencies for key %s: want %v, snapshot=%+v", key, expected, table.Snapshot(""))
+		case <-ticker.C:
+		}
+	}
+}
+
+func hasLatencies(table *smart.RouteTable, key string, expected map[string]int64) bool {
+	for _, row := range table.Snapshot("").Rows {
+		if row.Key != key {
+			continue
+		}
+		for proxy, latency := range expected {
+			record, ok := row.Proxies[proxy]
+			if !ok || record.Attributes.Latency != latency {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func waitForClosedConns(t *testing.T, conns []*stubConn, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		allClosed := true
+		for _, conn := range conns {
+			if conn == nil || conn.CloseCount() != want {
+				allClosed = false
+				break
+			}
+		}
+		if allClosed {
+			return
+		}
+		select {
+		case <-deadline:
+			counts := make([]int, len(conns))
+			for i, conn := range conns {
+				if conn != nil {
+					counts[i] = conn.CloseCount()
+				}
+			}
+			t.Fatalf("timed out waiting for close count %d, got %v", want, counts)
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestDiscover_FirstSuccessAllowsTopKLosersToRecordLatency(t *testing.T) {
+	const key = "TARGET:example.com"
+	pc := NewProbeCoordinator()
+	defer pc.Close()
+	rt := smart.NewRouteTable(100)
+	releaseLosers := make(chan struct{})
+	canceled := make(chan string, topK-1)
+	winnerConn := &stubConn{}
+	loserConns := make([]*stubConn, topK-1)
+
+	proxies := make([]C.Proxy, 0, topK)
+	preRanked := make([]string, 0, topK)
+	expected := map[string]int64{"p0": 5}
+	for i := 0; i < topK; i++ {
+		name := fmt.Sprintf("p%d", i)
+		proxies = append(proxies, &stubProxy{name: name})
+		preRanked = append(preRanked, name)
+		if i > 0 {
+			loserConns[i-1] = &stubConn{}
+			expected[name] = int64(10 + i)
+		}
+	}
+
+	singleDial := func(ctx context.Context, p C.Proxy, m *C.Metadata, start time.Time) (C.Conn, int64, error) {
+		if p.Name() == "p0" {
+			return winnerConn, 5, nil
+		}
+		select {
+		case <-releaseLosers:
+			var idx int
+			if _, err := fmt.Sscanf(p.Name(), "p%d", &idx); err != nil {
+				return nil, 0, err
+			}
+			return loserConns[idx-1], int64(10 + idx), nil
+		case <-ctx.Done():
+			canceled <- p.Name()
+			return nil, 0, ctx.Err()
+		}
+	}
+
+	start := time.Now()
+	proxy, conn, connectTime, err := pc.Discover(
+		context.Background(), key, proxies, &C.Metadata{}, preRanked, singleDial, rt,
+	)
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
+	}
+	if proxy.Name() != "p0" {
+		t.Fatalf("winner = %s, want p0", proxy.Name())
+	}
+	if conn != winnerConn {
+		t.Fatal("Discover did not return the winner connection")
+	}
+	if connectTime != 5 {
+		t.Fatalf("connectTime = %d, want 5", connectTime)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("Discover waited for loser probes, elapsed=%s", elapsed)
+	}
+
+	close(releaseLosers)
+	waitForLatencies(t, rt, key, expected)
+	waitForClosedConns(t, loserConns, 1)
+	if got := winnerConn.CloseCount(); got != 0 {
+		t.Fatalf("winner connection close count = %d, want 0", got)
+	}
+	select {
+	case name := <-canceled:
+		t.Fatalf("loser %s was canceled before latency could be recorded", name)
+	default:
+	}
+}
+
+func TestDiscover_CloseCancelsBackgroundLosersAfterWinner(t *testing.T) {
+	const key = "TARGET:example.com"
+	pc := NewProbeCoordinator()
+	rt := smart.NewRouteTable(100)
+	canceled := make(chan string, topK-1)
+
+	proxies := make([]C.Proxy, 0, topK)
+	preRanked := make([]string, 0, topK)
+	for i := 0; i < topK; i++ {
+		name := fmt.Sprintf("p%d", i)
+		proxies = append(proxies, &stubProxy{name: name})
+		preRanked = append(preRanked, name)
+	}
+
+	singleDial := func(ctx context.Context, p C.Proxy, m *C.Metadata, start time.Time) (C.Conn, int64, error) {
+		if p.Name() == "p0" {
+			return &stubConn{}, 5, nil
+		}
+		<-ctx.Done()
+		canceled <- p.Name()
+		return nil, 0, ctx.Err()
+	}
+
+	proxy, conn, _, err := pc.Discover(
+		context.Background(), key, proxies, &C.Metadata{}, preRanked, singleDial, rt,
+	)
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
+	}
+	if proxy.Name() != "p0" || conn == nil {
+		t.Fatalf("unexpected winner proxy=%v conn=%v", proxy.Name(), conn)
+	}
+
+	closed := make(chan error, 1)
+	go func() {
+		closed <- pc.Close()
+	}()
+
+	seen := make(map[string]struct{}, topK-1)
+	for len(seen) < topK-1 {
+		select {
+		case name := <-canceled:
+			seen[name] = struct{}{}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for loser cancellations, saw %d/%d", len(seen), topK-1)
+		}
+	}
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ProbeCoordinator.Close did not return")
+	}
 }
 
 func TestStaggeredTCPFallback_FirstSuccessCancelsLosers(t *testing.T) {
@@ -517,7 +713,7 @@ func TestParallelDial_ReturnsDialResults_Success(t *testing.T) {
 	}
 
 	result, _, dialResults := pc.parallelDial(
-		context.Background(), "TARGET:example.com",
+		context.Background(), context.Background(), "TARGET:example.com",
 		proxies, &C.Metadata{}, singleDial, nil,
 	)
 
@@ -562,7 +758,7 @@ func TestProbeBatch_FatalError_ReturnsImmediately(t *testing.T) {
 	}
 
 	result := pc.probeBatch(
-		context.Background(), "TARGET:example.com",
+		context.Background(), context.Background(), "TARGET:example.com",
 		proxies, &C.Metadata{}, []string{"p1", "p2"},
 		singleDial, rt,
 	)
@@ -594,7 +790,7 @@ func TestProbeBatch_FatalError_SkipsMarkFailed(t *testing.T) {
 	}
 
 	result := pc.probeBatch(
-		context.Background(), "TARGET:example.com",
+		context.Background(), context.Background(), "TARGET:example.com",
 		proxies, &C.Metadata{}, []string{"p1", "p2"},
 		singleDial, rt,
 	)
@@ -634,7 +830,7 @@ func TestProbeBatch_NodeLevelError_MarksFailingProxy(t *testing.T) {
 	}
 
 	_ = pc.probeBatch(
-		context.Background(), "TARGET:example.com",
+		context.Background(), context.Background(), "TARGET:example.com",
 		proxies, &C.Metadata{}, []string{"p1", "p2"},
 		singleDial, rt,
 	)
@@ -663,7 +859,7 @@ func TestProbeBatch_ContextCanceled_SkipsMarkFailed(t *testing.T) {
 	}
 
 	_ = pc.probeBatch(
-		context.Background(), "TARGET:example.com",
+		context.Background(), context.Background(), "TARGET:example.com",
 		proxies, &C.Metadata{}, []string{"p1"},
 		singleDial, rt,
 	)
@@ -695,7 +891,7 @@ func TestProbeBatch_MixedErrors_ReturnsFatal(t *testing.T) {
 	}
 
 	result := pc.probeBatch(
-		context.Background(), "TARGET:example.com",
+		context.Background(), context.Background(), "TARGET:example.com",
 		proxies, &C.Metadata{}, []string{"p1", "p2"},
 		singleDial, rt,
 	)
@@ -722,7 +918,7 @@ func TestProbeBatch_AllProxiesNodeLevel_NoSentinelDetected(t *testing.T) {
 	}
 
 	result := pc.probeBatch(
-		context.Background(), "TARGET:example.com",
+		context.Background(), context.Background(), "TARGET:example.com",
 		proxies, &C.Metadata{}, []string{"p1"},
 		singleDial, rt,
 	)
