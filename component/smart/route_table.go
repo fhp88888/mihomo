@@ -221,10 +221,6 @@ func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount f
 		score += math.Log1p(speed / 1024.0 / 1024.0 / 0.5)
 	}
 	score = score * (1 - pkgLoss)
-	// Penalty for consecutive failures: each failure reduces score by
-	// an additional 20% multiplicatively. This ensures per-key per-proxy
-	// scores naturally degrade under persistent failure without needing
-	// a binary block/ban mechanism.
 	if failedCount > 0 {
 		score *= math.Pow(0.8, failedCount)
 	}
@@ -503,7 +499,7 @@ func (rt *RouteTable) MarkFailed(key, proxy string) {
 		return
 	}
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.FailedCount += 1.0
+	cell.FailedCount = math.Min(cell.FailedCount + 1.0, 10.0)
 	cell.Dirty = true
 	if row.bestProxy == proxy {
 		row.bestProxy = ""

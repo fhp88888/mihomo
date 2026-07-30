@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,8 @@ import (
 // stubProxy implements C.Proxy with minimal behavior for testing.
 type stubProxy struct {
 	name string
+	delay uint16
+	dial  func(context.Context, *C.Metadata) (C.Conn, error)
 }
 
 func (s *stubProxy) Name() string              { return s.name }
@@ -31,6 +34,9 @@ func (s *stubProxy) MarshalJSON() ([]byte, error) {
 	return []byte(`"` + s.name + `"`), nil
 }
 func (s *stubProxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+	if s.dial != nil {
+		return s.dial(ctx, metadata)
+	}
 	return nil, errors.New("stub: DialContext not implemented")
 }
 func (s *stubProxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
@@ -45,7 +51,7 @@ func (s *stubProxy) AliveForTestUrl(url string) bool       { return true }
 func (s *stubProxy) DelayHistory() []C.DelayHistory        { return nil }
 func (s *stubProxy) DelayHistoryForTestUrl(url string) []C.DelayHistory { return nil }
 func (s *stubProxy) ExtraDelayHistories() map[string]C.ProxyState       { return nil }
-func (s *stubProxy) LastDelayForTestUrl(url string) uint16              { return 0 }
+func (s *stubProxy) LastDelayForTestUrl(url string) uint16              { return s.delay }
 func (s *stubProxy) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (uint16, error) {
 	return 0, nil
 }
@@ -193,11 +199,24 @@ func TestParallelDial_EmptyBatch(t *testing.T) {
 }
 
 // stubConn is a minimal C.Conn for testing successful dial results.
-type stubConn struct{}
+type stubConn struct {
+	mu     sync.Mutex
+	closes int
+}
 
 func (s *stubConn) Read(b []byte) (n int, err error)            { return 0, io.EOF }
 func (s *stubConn) Write(b []byte) (n int, err error)           { return len(b), nil }
-func (s *stubConn) Close() error                                { return nil }
+func (s *stubConn) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closes++
+	return nil
+}
+func (s *stubConn) CloseCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closes
+}
 func (s *stubConn) LocalAddr() net.Addr                         { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
 func (s *stubConn) RemoteAddr() net.Addr                        { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443} }
 func (s *stubConn) SetDeadline(t time.Time) error               { return nil }
@@ -215,6 +234,268 @@ func (s *stubConn) AppendToChains(adapter C.ProxyAdapter)       {}
 func (s *stubConn) RemoteDestination() string                   { return "" }
 
 var _ C.Conn = (*stubConn)(nil)
+
+func routeFailedCount(t *testing.T, table *smart.RouteTable, key, proxy string) float64 {
+	t.Helper()
+	for _, row := range table.Snapshot("").Rows {
+		if row.Key == key {
+			return row.Proxies[proxy].Attributes.FailedCount
+		}
+	}
+	t.Fatalf("route row %q not found", key)
+	return 0
+}
+
+func TestStaggeredTCPFallback_FirstSuccessCancelsLosers(t *testing.T) {
+	const key = "TARGET:example.com"
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	firstCanceled := make(chan struct{})
+	winner := &stubConn{}
+
+	first := &stubProxy{name: "first", delay: 10, dial: func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+		close(firstStarted)
+		<-ctx.Done()
+		close(firstCanceled)
+		return nil, ctx.Err()
+	}}
+	second := &stubProxy{name: "second", delay: 20, dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		close(secondStarted)
+		return winner, nil
+	}}
+	third := &stubProxy{name: "third", delay: 30, dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		t.Error("third proxy should not be launched after second succeeds")
+		return nil, errors.New("unexpected third dial")
+	}}
+
+	table := smart.NewRouteTable(10)
+	table.UpdateLatency(key, first.Name(), 10)
+	table.SetBestProxy(key, first.Name())
+	s := &Smart{testUrl: "test", routeTable: table}
+
+	result := make(chan struct {
+		conn C.Conn
+		err  error
+	}, 1)
+	go func() {
+		conn, err := s.staggeredTCPFallback(context.Background(), &C.Metadata{Host: "example.com"}, key,
+			[]string{first.Name(), second.Name(), third.Name()}, map[string]C.Proxy{
+				first.Name(): first, second.Name(): second, third.Name(): third,
+			})
+		result <- struct {
+			conn C.Conn
+			err  error
+		}{conn, err}
+	}()
+
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first proxy did not start")
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second proxy did not start after stagger interval")
+	}
+
+	var got struct {
+		conn C.Conn
+		err  error
+	}
+	select {
+	case got = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("staggered fallback did not return after second succeeded")
+	}
+	if got.err != nil {
+		t.Fatalf("staggered fallback returned error: %v", got.err)
+	}
+	if got.conn == nil {
+		t.Fatal("staggered fallback returned nil connection")
+	}
+	select {
+	case <-firstCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("first proxy did not observe cancellation")
+	}
+	if got := routeFailedCount(t, table, key, first.Name()); got != 0 {
+		t.Fatalf("canceled first proxy failed count = %v, want 0", got)
+	}
+	if winner.CloseCount() != 0 {
+		t.Fatalf("winner was closed %d times", winner.CloseCount())
+	}
+	_ = got.conn.Close()
+}
+
+func TestStaggeredTCPFallback_ClosesLateSuccessfulLoser(t *testing.T) {
+	const key = "TARGET:example.com"
+	firstStarted := make(chan struct{})
+	firstCanceled := make(chan struct{})
+	late := &stubConn{}
+	winner := &stubConn{}
+
+	first := &stubProxy{name: "first", dial: func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+		close(firstStarted)
+		<-ctx.Done()
+		close(firstCanceled)
+		return late, nil
+	}}
+	second := &stubProxy{name: "second", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return winner, nil
+	}}
+
+	s := &Smart{testUrl: "test", routeTable: smart.NewRouteTable(10)}
+	result := make(chan struct {
+		conn C.Conn
+		err  error
+	}, 1)
+	go func() {
+		conn, err := s.staggeredTCPFallback(context.Background(), &C.Metadata{Host: "example.com"}, key,
+			[]string{first.Name(), second.Name()}, map[string]C.Proxy{first.Name(): first, second.Name(): second})
+		result <- struct {
+			conn C.Conn
+			err  error
+		}{conn, err}
+	}()
+
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first proxy did not start")
+	}
+	var got struct {
+		conn C.Conn
+		err  error
+	}
+	select {
+	case got = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("staggered fallback did not return")
+	}
+	if got.err != nil || got.conn == nil {
+		t.Fatalf("winner result = (%v, %v), want non-nil second connection and nil error", got.conn, got.err)
+	}
+	select {
+	case <-firstCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("first proxy did not observe cancellation")
+	}
+	if late.CloseCount() != 1 {
+		t.Fatalf("late successful loser was closed %d times, want 1", late.CloseCount())
+	}
+	if winner.CloseCount() != 0 {
+		t.Fatalf("winner was closed %d times", winner.CloseCount())
+	}
+	if best, ok := s.routeTable.GetBestProxy(key); !ok || best != second.Name() {
+		t.Fatalf("best proxy = %q ok=%v, want selected winner %q", best, ok, second.Name())
+	}
+	if !s.routeTable.IsTCPProbed(key) {
+		t.Fatal("selected winner did not mark route TCP-probed")
+	}
+	var firstUseCount, secondUseCount int64
+	for _, row := range s.routeTable.Snapshot("").Rows {
+		if row.Key == key {
+			firstUseCount = row.Proxies[first.Name()].UseCount
+			secondUseCount = row.Proxies[second.Name()].UseCount
+			break
+		}
+	}
+	if firstUseCount != 0 {
+		t.Fatalf("late successful loser use count = %d, want 0", firstUseCount)
+	}
+	if secondUseCount != 1 {
+		t.Fatalf("winner use count = %d, want 1", secondUseCount)
+	}
+	_ = got.conn.Close()
+}
+
+func TestStaggeredTCPFallback_FatalErrorStopsScheduling(t *testing.T) {
+	const key = "TARGET:example.com"
+	secondStarted := make(chan struct{}, 1)
+	first := &stubProxy{name: "first", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return nil, resolver.ErrIPNotFound
+	}}
+	second := &stubProxy{name: "second", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		secondStarted <- struct{}{}
+		return nil, errors.New("unexpected second dial")
+	}}
+
+	table := smart.NewRouteTable(10)
+	table.UpdateLatency(key, first.Name(), 10)
+	table.SetBestProxy(key, first.Name())
+	s := &Smart{testUrl: "test", routeTable: table}
+	_, err := s.staggeredTCPFallback(context.Background(), &C.Metadata{Host: "example.com"}, key,
+		[]string{first.Name(), second.Name()}, map[string]C.Proxy{first.Name(): first, second.Name(): second})
+	if !errors.Is(err, resolver.ErrIPNotFound) || !tunnel.ShouldStopRetry(err) {
+		t.Fatalf("fatal error = %v, want ErrIPNotFound", err)
+	}
+	select {
+	case <-secondStarted:
+		t.Fatal("second proxy started after fatal first result")
+	case <-time.After(2 * smartTCPFallbackStagger):
+	}
+	if best, ok := table.GetBestProxy(key); !ok || best != first.Name() {
+		t.Fatalf("fatal error cleared best proxy: best=%q ok=%v", best, ok)
+	}
+}
+
+func TestStaggeredTCPFallback_ParentCancellationStopsScheduling(t *testing.T) {
+	const key = "TARGET:example.com"
+	firstStarted := make(chan struct{})
+	firstCanceled := make(chan struct{})
+	secondStarted := make(chan struct{}, 1)
+	first := &stubProxy{name: "first", dial: func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+		close(firstStarted)
+		<-ctx.Done()
+		close(firstCanceled)
+		return nil, ctx.Err()
+	}}
+	second := &stubProxy{name: "second", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		secondStarted <- struct{}{}
+		return nil, errors.New("unexpected second dial")
+	}}
+
+	table := smart.NewRouteTable(10)
+	table.UpdateLatency(key, first.Name(), 10)
+	table.SetBestProxy(key, first.Name())
+	s := &Smart{testUrl: "test", routeTable: table}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := s.staggeredTCPFallback(ctx, &C.Metadata{Host: "example.com"}, key,
+			[]string{first.Name(), second.Name()}, map[string]C.Proxy{first.Name(): first, second.Name(): second})
+		result <- err
+	}()
+
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first proxy did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("parent cancellation error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("staggered fallback did not return on parent cancellation")
+	}
+	select {
+	case <-firstCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("first proxy did not observe parent cancellation")
+	}
+	select {
+	case <-secondStarted:
+		t.Fatal("second proxy started after parent cancellation")
+	case <-time.After(2 * smartTCPFallbackStagger):
+	}
+	if got := routeFailedCount(t, table, key, first.Name()); got != 0 {
+		t.Fatalf("canceled first proxy failed count = %v, want 0", got)
+	}
+}
 
 func TestParallelDial_ReturnsDialResults_Success(t *testing.T) {
 	pc := NewProbeCoordinator()
