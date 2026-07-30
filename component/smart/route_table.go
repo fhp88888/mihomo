@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/metacubex/mihomo/log"
 )
 
 const DefaultMaxRows = 5000
@@ -117,6 +119,7 @@ func (rt *RouteTable) getOrCreateRow(key string) *rowEntry {
 	}
 	rt.rows[key] = row
 	rt.lruOrder = append(rt.lruOrder, key)
+	log.Debugln("[smart] LRU create key=%s size=%d capacity=%d", key, len(rt.rows), rt.maxRows)
 	return row
 }
 
