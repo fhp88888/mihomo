@@ -411,48 +411,43 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, conne
 				key, proxy.Name(), readErr)
 		}
 
-		// RST is a strong signal that a connection was aborted abnormally —
-		// a proxy node that dies mid-connection (crash, restart, GFW reset)
-		// surfaces as "connection reset by peer". Penalize immediately,
-		// independent of whether any data had flowed.
+		// check for TCP RST or early death and mark-failed if necessary
 		s.checkResetByPeer(key, proxy.Name(), readErr)
 		s.checkEarlyDeath(key, proxy.Name(), readErr, firstRead, tracker)
 	})
 }
 
-// checkResetByPeer penalizes a proxy when a connection was aborted with a TCP
-// RST (connection reset by peer). Unlike a graceful FIN, an RST means one side
-// gave up on the connection abnormally — almost always a real fault on the
-// proxy leg rather than a normal target-level close.
+// checkResetByPeer penalizes a proxy when a connection was aborted with a TCP RST
 func (s *Smart) checkResetByPeer(key, proxyName string, readErr error) {
 	if readErr == nil || !errors.Is(readErr, syscall.ECONNRESET) {
 		return
 	}
-	s.routeTable.MarkFailed(key, proxyName, 0.3)
+	s.routeTable.MarkFailed(key, proxyName, 0.2)
 	log.Debugln("[Smart] RST mark-failed key=%s proxy=%s err=%v", key, proxyName, readErr)
 }
 
-// checkEarlyDeath penalizes a proxy when a connection failed before any data
-// flowed within the early-death latency window. Zero total bytes plus a fast
-// failure are the strongest available signal that the proxy node itself is
-// down for this target. Connections that transferred data — however briefly —
-// are left alone, as are target-level rejections that only surface later.
+// checkEarlyDeath penalizes a proxy when a connection failed before its first
+// byte ever arrived and never completed a bidirectional flow.
 func (s *Smart) checkEarlyDeath(key, proxyName string, readErr error, firstReadLatencyMs int64, tracker statistic.Tracker) {
 	if readErr == nil || readErr == io.EOF {
+		return
+	}
+	// don't double-count RST
+	if errors.Is(readErr, syscall.ECONNRESET) {
 		return
 	}
 	if firstReadLatencyMs >= smartEarlyDeathLatencyLimit.Milliseconds() {
 		return
 	}
-	// A tracker with any transferred bytes means the connection lived past
-	// its first byte, so the failure was not an early death.
+	// A connection that carried both upload and download completed a full
+	// request/response exchange, so the failure was not an early death.
 	if tracker != nil {
 		info := tracker.Info()
-		if info.UploadTotal.Load()+info.DownloadTotal.Load() > 0 {
+		if info.UploadTotal.Load() > 0 && info.DownloadTotal.Load() > 0 {
 			return
 		}
 	}
-	s.routeTable.MarkFailed(key, proxyName, 1.0)
+	s.routeTable.MarkFailed(key, proxyName, 0.6)
 	log.Debugln("[Smart] EARLY-DEATH mark-failed key=%s proxy=%s firstReadLat=%dms err=%v",
 		key, proxyName, firstReadLatencyMs, readErr)
 }

@@ -59,6 +59,17 @@ func TestCheckEarlyDeath(t *testing.T) {
 		}
 	})
 
+	t.Run("RST is left to checkResetByPeer", func(t *testing.T) {
+		s, before := setup()
+		// RST is the primary signal handled by checkResetByPeer (0.3); early
+		// death must not add its 1.0 on top.
+		err := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
+		s.checkEarlyDeath(key, proxyName, err, 100, nil)
+		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+			t.Fatalf("FailedCount = %v, want %v", got, before)
+		}
+	})
+
 	t.Run("nil error is ignored", func(t *testing.T) {
 		s, before := setup()
 		s.checkEarlyDeath(key, proxyName, nil, 100, nil)
@@ -67,11 +78,23 @@ func TestCheckEarlyDeath(t *testing.T) {
 		}
 	})
 
-	t.Run("transferred data is ignored", func(t *testing.T) {
+	t.Run("bidirectional data is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 0))
+		// A full request/response exchange (both upload and download) means the
+		// connection survived its first byte — not an early death.
+		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 512))
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
+		}
+	})
+
+	t.Run("one-way data is still early death", func(t *testing.T) {
+		s, before := setup()
+		// Only upload flowed, no download — the response never arrived, so the
+		// connection died before completing the exchange.
+		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 0))
+		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+1 {
+			t.Fatalf("FailedCount = %v, want %v", got, before+1)
 		}
 	})
 
