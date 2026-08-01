@@ -439,11 +439,9 @@ func (s *Smart) checkEarlyDeath(key, proxyName string, readErr error, firstReadL
 	if firstReadLatencyMs >= smartEarlyDeathLatencyLimit.Milliseconds() {
 		return
 	}
-	// A connection that carried both upload and download completed a full
-	// request/response exchange, so the failure was not an early death.
 	if tracker != nil {
 		info := tracker.Info()
-		if info.UploadTotal.Load() > 0 && info.DownloadTotal.Load() > 0 {
+		if info.DownloadTotal.Load() > 0 {
 			return
 		}
 	}
