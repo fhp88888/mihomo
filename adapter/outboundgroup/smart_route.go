@@ -24,6 +24,11 @@ import (
 const (
 	smartBestProxyFreshness = 5 * time.Second
 	smartTCPFallbackStagger = 200 * time.Millisecond
+	// smartEarlyDeathLatencyLimit bounds firstReadLatency for a connection to
+	// be classified as "died before any data flowed". A connection that fails
+	// before the first byte within this window is very likely a dead proxy,
+	// not a target-level rejection that simply took longer to surface.
+	smartEarlyDeathLatencyLimit = 5 * time.Second
 )
 
 // routeKey returns the route table key for a connection's metadata.
@@ -404,7 +409,38 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, conne
 			log.Debugln("[Smart] Connection closed with error for [%s] via [%s]: %v",
 				key, proxy.Name(), readErr)
 		}
+
+		// Early-death detection: the connection failed before its first byte
+		// ever arrived and carried no traffic at all. This is a strong signal
+		// the proxy node itself is down for this target — not a target-level
+		// rejection (which usually requires the handshake to succeed first).
+		s.markEarlyDeath(key, proxy.Name(), readErr, firstRead, tracker)
 	})
+}
+
+// markEarlyDeath penalizes a proxy when a connection failed before any data
+// flowed within the early-death latency window. Zero total bytes plus a fast
+// failure are the strongest available signal that the proxy node itself is
+// down for this target. Connections that transferred data — however briefly —
+// are left alone, as are target-level rejections that only surface later.
+func (s *Smart) markEarlyDeath(key, proxyName string, readErr error, firstReadLatencyMs int64, tracker statistic.Tracker) {
+	if readErr == nil || readErr == io.EOF {
+		return
+	}
+	if firstReadLatencyMs >= smartEarlyDeathLatencyLimit.Milliseconds() {
+		return
+	}
+	// A tracker with any transferred bytes means the connection lived past
+	// its first byte, so the failure was not an early death.
+	if tracker != nil {
+		info := tracker.Info()
+		if info.UploadTotal.Load()+info.DownloadTotal.Load() > 0 {
+			return
+		}
+	}
+	s.routeTable.MarkFailed(key, proxyName)
+	log.Debugln("[Smart] EARLY-DEATH mark-failed key=%s proxy=%s firstReadLat=%dms err=%v",
+		key, proxyName, firstReadLatencyMs, readErr)
 }
 
 // udpRoute implements the UDP routing strategy.
