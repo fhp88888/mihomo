@@ -82,7 +82,8 @@ func (pc *ProbeCoordinator) Discover(
 
 			if p != nil && e == nil {
 				// Follower gets a NEW connection to the same proxy
-				start := time.Now(); newConn, connectTime, dialErr := singleDial(ctx, p, metadata, start)
+				start := time.Now()
+				newConn, connectTime, dialErr := singleDial(ctx, p, metadata, start)
 				if dialErr != nil {
 					return nil, nil, 0, dialErr
 				}
@@ -213,7 +214,7 @@ func (pc *ProbeCoordinator) probeBatch(
 			if errors.Is(dr.err, context.Canceled) {
 				continue // Don't penalize proxy for cancellation
 			}
-			rt.MarkFailed(key, dr.proxy.Name())
+			rt.MarkFailed(key, dr.proxy.Name(), 1.0)
 		}
 
 		if hasFatal {

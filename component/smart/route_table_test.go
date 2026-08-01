@@ -187,12 +187,12 @@ func TestCalculateScore(t *testing.T) {
 		{latency: 0, speed: 1048576, failedCount: 0, jitter: 0, expect: math.Log1p(2)}, // latency=0 → latency term skipped
 		{latency: -10, speed: 0, failedCount: 0, jitter: 0, expect: 0},
 		// failedCount penalty: 0.8^n multiplier
-		{latency: 100, speed: 0, failedCount: 1, jitter: 0, expect: 100.0/(100.0+10.0) * 0.8},
-		{latency: 100, speed: 0, failedCount: 3, jitter: 0, expect: 100.0/(100.0+10.0) * math.Pow(0.8, 3)},
+		{latency: 100, speed: 0, failedCount: 1, jitter: 0, expect: 100.0 / (100.0 + 10.0) * 0.8},
+		{latency: 100, speed: 0, failedCount: 3, jitter: 0, expect: 100.0 / (100.0 + 10.0) * math.Pow(0.8, 3)},
 		// jitter inflates the latency denominator: 100 / (max(latency,100) + max(jitter,10))
-		{latency: 100, speed: 0, failedCount: 0, jitter: 10, expect: 100.0 / (100.0 + 10.0)},  // max(10,10)=10
-		{latency: 100, speed: 0, failedCount: 0, jitter: 5, expect: 100.0 / (100.0 + 10.0)},   // max(5,10)=10, same floor
-		{latency: 100, speed: 0, failedCount: 0, jitter: 50, expect: 100.0 / (100.0 + 50.0)},  // 100/150
+		{latency: 100, speed: 0, failedCount: 0, jitter: 10, expect: 100.0 / (100.0 + 10.0)},   // max(10,10)=10
+		{latency: 100, speed: 0, failedCount: 0, jitter: 5, expect: 100.0 / (100.0 + 10.0)},    // max(5,10)=10, same floor
+		{latency: 100, speed: 0, failedCount: 0, jitter: 50, expect: 100.0 / (100.0 + 50.0)},   // 100/150
 		{latency: 100, speed: 0, failedCount: 0, jitter: 200, expect: 100.0 / (100.0 + 200.0)}, // 100/300
 		// jitter combined with speed
 		{latency: 100, speed: 1048576, failedCount: 0, jitter: 50, expect: 100.0/(100.0+50.0) + math.Log1p(2)},
@@ -487,7 +487,7 @@ func TestMarkFailed(t *testing.T) {
 	rt.UpdateLatency("ASN:1", "proxy-a", 42)
 	rt.SetBestProxy("ASN:1", "proxy-a")
 
-	rt.MarkFailed("ASN:1", "proxy-a")
+	rt.MarkFailed("ASN:1", "proxy-a", 1.0)
 
 	// Best proxy should be cleared
 	if bp, _ := rt.GetBestProxy("ASN:1"); bp != "" {

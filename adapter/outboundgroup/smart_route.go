@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -239,7 +240,7 @@ func (s *Smart) dialTCP(ctx context.Context, proxy C.Proxy, metadata *C.Metadata
 		log.Debugln("[Smart] dialAndWrap key=%s proxy=%s FAIL connectTime=%dms err=%v",
 			key, proxy.Name(), connectTime, err)
 		if !tunnel.ShouldStopRetry(err) && !errors.Is(err, context.Canceled) {
-			s.routeTable.MarkFailed(key, proxy.Name())
+			s.routeTable.MarkFailed(key, proxy.Name(), 1.0)
 		}
 	}
 
@@ -410,20 +411,33 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, conne
 				key, proxy.Name(), readErr)
 		}
 
-		// Early-death detection: the connection failed before its first byte
-		// ever arrived and carried no traffic at all. This is a strong signal
-		// the proxy node itself is down for this target — not a target-level
-		// rejection (which usually requires the handshake to succeed first).
-		s.markEarlyDeath(key, proxy.Name(), readErr, firstRead, tracker)
+		// RST is a strong signal that a connection was aborted abnormally —
+		// a proxy node that dies mid-connection (crash, restart, GFW reset)
+		// surfaces as "connection reset by peer". Penalize immediately,
+		// independent of whether any data had flowed.
+		s.checkResetByPeer(key, proxy.Name(), readErr)
+		s.checkEarlyDeath(key, proxy.Name(), readErr, firstRead, tracker)
 	})
 }
 
-// markEarlyDeath penalizes a proxy when a connection failed before any data
+// checkResetByPeer penalizes a proxy when a connection was aborted with a TCP
+// RST (connection reset by peer). Unlike a graceful FIN, an RST means one side
+// gave up on the connection abnormally — almost always a real fault on the
+// proxy leg rather than a normal target-level close.
+func (s *Smart) checkResetByPeer(key, proxyName string, readErr error) {
+	if readErr == nil || !errors.Is(readErr, syscall.ECONNRESET) {
+		return
+	}
+	s.routeTable.MarkFailed(key, proxyName, 0.3)
+	log.Debugln("[Smart] RST mark-failed key=%s proxy=%s err=%v", key, proxyName, readErr)
+}
+
+// checkEarlyDeath penalizes a proxy when a connection failed before any data
 // flowed within the early-death latency window. Zero total bytes plus a fast
 // failure are the strongest available signal that the proxy node itself is
 // down for this target. Connections that transferred data — however briefly —
 // are left alone, as are target-level rejections that only surface later.
-func (s *Smart) markEarlyDeath(key, proxyName string, readErr error, firstReadLatencyMs int64, tracker statistic.Tracker) {
+func (s *Smart) checkEarlyDeath(key, proxyName string, readErr error, firstReadLatencyMs int64, tracker statistic.Tracker) {
 	if readErr == nil || readErr == io.EOF {
 		return
 	}
@@ -438,7 +452,7 @@ func (s *Smart) markEarlyDeath(key, proxyName string, readErr error, firstReadLa
 			return
 		}
 	}
-	s.routeTable.MarkFailed(key, proxyName)
+	s.routeTable.MarkFailed(key, proxyName, 1.0)
 	log.Debugln("[Smart] EARLY-DEATH mark-failed key=%s proxy=%s firstReadLat=%dms err=%v",
 		key, proxyName, firstReadLatencyMs, readErr)
 }
@@ -489,7 +503,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 				if tunnel.ShouldStopRetry(err) {
 					return nil, err
 				}
-				s.routeTable.MarkFailed(key, bestName)
+				s.routeTable.MarkFailed(key, bestName, 1.0)
 				break
 			}
 		}

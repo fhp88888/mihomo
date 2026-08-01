@@ -3,6 +3,9 @@ package outboundgroup
 import (
 	"errors"
 	"io"
+	"net"
+	"os"
+	"syscall"
 	"testing"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -29,7 +32,7 @@ func newFakeTracker(upload, download int64) *fakeTracker {
 	}
 }
 
-func TestMarkEarlyDeath(t *testing.T) {
+func TestCheckEarlyDeath(t *testing.T) {
 	const key = "TARGET:example.com"
 	const proxyName = "p1"
 
@@ -42,7 +45,7 @@ func TestMarkEarlyDeath(t *testing.T) {
 
 	t.Run("early death marks failed", func(t *testing.T) {
 		s, before := setup()
-		s.markEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, nil)
+		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, nil)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+1 {
 			t.Fatalf("FailedCount = %v, want %v", got, before+1)
 		}
@@ -50,7 +53,7 @@ func TestMarkEarlyDeath(t *testing.T) {
 
 	t.Run("EOF is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.markEarlyDeath(key, proxyName, io.EOF, 100, nil)
+		s.checkEarlyDeath(key, proxyName, io.EOF, 100, nil)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
@@ -58,7 +61,7 @@ func TestMarkEarlyDeath(t *testing.T) {
 
 	t.Run("nil error is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.markEarlyDeath(key, proxyName, nil, 100, nil)
+		s.checkEarlyDeath(key, proxyName, nil, 100, nil)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
@@ -66,7 +69,7 @@ func TestMarkEarlyDeath(t *testing.T) {
 
 	t.Run("transferred data is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.markEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 0))
+		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 0))
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
@@ -75,7 +78,54 @@ func TestMarkEarlyDeath(t *testing.T) {
 	t.Run("slow failure is ignored", func(t *testing.T) {
 		s, before := setup()
 		slow := smartEarlyDeathLatencyLimit.Milliseconds() + 1000
-		s.markEarlyDeath(key, proxyName, errors.New("connection reset by peer"), slow, nil)
+		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), slow, nil)
+		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+			t.Fatalf("FailedCount = %v, want %v", got, before)
+		}
+	})
+}
+
+func TestCheckResetByPeer(t *testing.T) {
+	const key = "TARGET:example.com"
+	const proxyName = "p1"
+
+	setup := func() (*Smart, float64) {
+		rt := smart.NewRouteTable(smart.DefaultMaxRows)
+		rt.RestoreRow(key, proxyName, smart.PersistedCell{})
+		s := &Smart{routeTable: rt}
+		return s, routeFailedCount(t, rt, key, proxyName)
+	}
+
+	t.Run("ECONNRESET marks failed", func(t *testing.T) {
+		s, before := setup()
+		// Realistic error chain: *net.OpError wrapping *os.SyscallError wrapping syscall.ECONNRESET.
+		err := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
+		s.checkResetByPeer(key, proxyName, err)
+		// RST carries a lighter 0.3 penalty, not the full 1.0.
+		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.3 {
+			t.Fatalf("FailedCount = %v, want %v", got, before+0.3)
+		}
+	})
+
+	t.Run("non-reset error is ignored", func(t *testing.T) {
+		s, before := setup()
+		s.checkResetByPeer(key, proxyName, errors.New("connection closed"))
+		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+			t.Fatalf("FailedCount = %v, want %v", got, before)
+		}
+	})
+
+	t.Run("EOF is ignored", func(t *testing.T) {
+		s, before := setup()
+		s.checkResetByPeer(key, proxyName, io.EOF)
+		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+			t.Fatalf("FailedCount = %v, want %v", got, before)
+		}
+	})
+
+	t.Run("nil error is ignored", func(t *testing.T) {
+		s, before := setup()
+		s.checkResetByPeer(key, proxyName, nil)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}

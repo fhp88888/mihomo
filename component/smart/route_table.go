@@ -219,8 +219,8 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount float64, jitter float64) float64 {
 	score := 0.0
 	if latency > 0 {
-		score = 100.0 / (math.Max(float64(latency), 100.0) + 
-						math.Max(jitter, 10.0))
+		score = 100.0 / (math.Max(float64(latency), 100.0) +
+			math.Max(jitter, 10.0))
 	}
 	if speed > 0 {
 		// 500kb/s is a sensitive threshold to define what is good download speed or not.
@@ -515,7 +515,7 @@ func (rt *RouteTable) TouchRow(key string) {
 // persist a TTL-based block via the HostStatus failure tracking system
 // (see stats.go).  That gives cross-restart memory and binary exclusion
 // while the score penalty handles in-memory gradual degradation.
-func (rt *RouteTable) MarkFailed(key, proxy string) {
+func (rt *RouteTable) MarkFailed(key, proxy string, penalty float64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row, ok := rt.rows[key]
@@ -523,7 +523,7 @@ func (rt *RouteTable) MarkFailed(key, proxy string) {
 		return
 	}
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.FailedCount = math.Min(cell.FailedCount + 1.0, 10.0)
+	cell.FailedCount = math.Min(cell.FailedCount+penalty, 10.0)
 	cell.Dirty = true
 	if row.bestProxy == proxy {
 		row.bestProxy = ""
@@ -607,7 +607,7 @@ type PersistedCell struct {
 	Jitter           float64 `json:"jitter"`
 	UseCount         int64   `json:"use_count"`
 	FailedCount      float64 `json:"failed_count"`
-	HasSample        bool    `json:"has_sample"`          // retained for backward compat with old persisted data
+	HasSample        bool    `json:"has_sample"` // retained for backward compat with old persisted data
 	HasLatencySample bool    `json:"has_latency_sample"`
 	HasPkgLossSample bool    `json:"has_pkg_loss_sample"`
 	HasSpeedSample   bool    `json:"has_speed_sample"`
