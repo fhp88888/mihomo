@@ -21,6 +21,7 @@ type ProxyAttributes struct {
 	Speed       float64 `json:"speed"`
 	Score       float64 `json:"score"`
 	FailedCount float64 `json:"failed_count"`
+	Jitter      float64 `json:"jitter"`
 }
 
 // ProxyRecord is the per-proxy entry in a route table row.
@@ -46,16 +47,18 @@ type proxyCell struct {
 	Latency          int64   // EMA, 0 means no sample yet
 	PkgLoss          float64 // EMA
 	Speed            float64 // EMA
+	Jitter           float64 // EMA of |sample - previous latency EMA|, 0 means no sample yet
 	Score            float64 // non-EMA score derived from latency, speed, pkgLoss and failedCount
 	HasLatencySample bool
 	HasPkgLossSample bool
 	HasSpeedSample   bool
+	HasJitterSample  bool
 	Dirty            bool // true when cell has unsaved changes
 }
 
 // hasSample returns true when any metric has been sampled at least once.
 func (c *proxyCell) hasSample() bool {
-	return c.HasLatencySample || c.HasPkgLossSample || c.HasSpeedSample
+	return c.HasLatencySample || c.HasPkgLossSample || c.HasSpeedSample || c.HasJitterSample
 }
 
 // RowSnapshot is a read-only copy of a row for the REST API.
@@ -213,10 +216,11 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 	return int64(float64(old)*3.0/4.0 + float64(new)/4.0)
 }
 
-func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount float64) float64 {
+func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount float64, jitter float64) float64 {
 	score := 0.0
 	if latency > 0 {
-		score = 100.0 / math.Max(float64(latency), 100.0)
+		score = 100.0 / (math.Max(float64(latency), 100.0) + 
+						math.Max(jitter, 10.0))
 	}
 	if speed > 0 {
 		// 500kb/s is a sensitive threshold to define what is good download speed or not.
@@ -234,7 +238,7 @@ func scoreFromHealthCheckLatency(latency uint16) float64 {
 	if latency == 0 || latency == 0xffff {
 		return 0
 	}
-	return calculateScore(int64(latency), 0, 0, 0)
+	return calculateScore(int64(latency), 0, 0, 0, 0)
 }
 
 // RefreshScores updates non-EMA scores for existing proxy samples in a route row.
@@ -250,7 +254,7 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 		if !ok || !cell.hasSample() {
 			continue
 		}
-		cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount)
+		cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
 	}
 }
 
@@ -269,6 +273,7 @@ func (rt *RouteTable) DebugDumpScores(key string) string {
 		lat   int64
 		spd   float64
 		loss  float64
+		jit   float64
 		fail  float64
 		score float64
 	}
@@ -279,6 +284,7 @@ func (rt *RouteTable) DebugDumpScores(key string) string {
 			lat:   cell.Latency,
 			spd:   cell.Speed,
 			loss:  cell.PkgLoss,
+			jit:   cell.Jitter,
 			fail:  cell.FailedCount,
 			score: cell.Score,
 		})
@@ -291,21 +297,36 @@ func (rt *RouteTable) DebugDumpScores(key string) string {
 		if i > 0 {
 			sb.WriteString(" ")
 		}
-		sb.WriteString(fmt.Sprintf("%s(lat=%d,spd=%.0f,loss=%.3f,fail=%.1f→score=%.3f)",
-			e.name, e.lat, e.spd, e.loss, e.fail, e.score))
+		sb.WriteString(fmt.Sprintf("%s(lat=%d,spd=%.0f,loss=%.3f,jit=%.1f,fail=%.1f→score=%.3f)",
+			e.name, e.lat, e.spd, e.loss, e.jit, e.fail, e.score))
 	}
 	sb.WriteString("]")
 	return sb.String()
 }
 
 // UpdateLatency updates the EMA latency for a (key, proxy) pair.
+// Jitter is updated alongside using the same sample: the absolute deviation
+// of this sample from the previous latency EMA, smoothed with EMA.
 func (rt *RouteTable) UpdateLatency(key, proxy string, latency int64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
+	oldLatency := cell.Latency
 	cell.Latency = applyEMAInt64(cell.Latency, latency, cell.HasLatencySample)
 	cell.HasLatencySample = true
+
+	// Jitter = EMA of |sample - previous latency EMA|. On the first latency
+	// sample there is no baseline yet (oldLatency is 0), so skip the jitter update.
+	if oldLatency > 0 {
+		deviation := float64(latency - oldLatency)
+		if deviation < 0 {
+			deviation = -deviation
+		}
+		cell.Jitter = applyEMA(cell.Jitter, deviation, cell.HasJitterSample)
+		cell.HasJitterSample = true
+	}
+
 	cell.Dirty = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
@@ -454,7 +475,7 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 				if cell.Score > 0 {
 					scores[proxy] = cell.Score
 				} else {
-					scores[proxy] = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount)
+					scores[proxy] = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
 				}
 				continue
 			}
@@ -546,11 +567,13 @@ func (rt *RouteTable) SnapshotAndClearDirty() map[string]PersistedCell {
 					Latency:          cell.Latency,
 					PkgLoss:          cell.PkgLoss,
 					Speed:            cell.Speed,
+					Jitter:           cell.Jitter,
 					UseCount:         cell.UseCount,
 					FailedCount:      cell.FailedCount,
 					HasLatencySample: cell.HasLatencySample,
 					HasPkgLossSample: cell.HasPkgLossSample,
 					HasSpeedSample:   cell.HasSpeedSample,
+					HasJitterSample:  cell.HasJitterSample,
 				}
 				cell.Dirty = false
 			}
@@ -581,12 +604,14 @@ type PersistedCell struct {
 	Latency          int64   `json:"latency"`
 	PkgLoss          float64 `json:"pkg_loss"`
 	Speed            float64 `json:"speed"`
+	Jitter           float64 `json:"jitter"`
 	UseCount         int64   `json:"use_count"`
 	FailedCount      float64 `json:"failed_count"`
 	HasSample        bool    `json:"has_sample"`          // retained for backward compat with old persisted data
 	HasLatencySample bool    `json:"has_latency_sample"`
 	HasPkgLossSample bool    `json:"has_pkg_loss_sample"`
 	HasSpeedSample   bool    `json:"has_speed_sample"`
+	HasJitterSample  bool    `json:"has_jitter_sample"`
 }
 
 // RestoreRow restores a per-(key,proxy) cell from previously persisted data.
@@ -599,21 +624,23 @@ func (rt *RouteTable) RestoreRow(key, proxy string, pc PersistedCell) {
 	cell.Latency = pc.Latency
 	cell.PkgLoss = pc.PkgLoss
 	cell.Speed = pc.Speed
+	cell.Jitter = pc.Jitter
 	cell.UseCount = pc.UseCount
 	cell.FailedCount = pc.FailedCount
 	cell.HasLatencySample = pc.HasLatencySample
 	cell.HasPkgLossSample = pc.HasPkgLossSample
 	cell.HasSpeedSample = pc.HasSpeedSample
+	cell.HasJitterSample = pc.HasJitterSample
 	// Backward compat: old persisted data only had HasSample.
 	// Old code only wrote Speed/PkgLoss when > 0, so a zero value
 	// for those fields means "no sample".  Infer each per-metric
 	// flag from whether the stored value is non-zero.
-	if pc.HasSample && !cell.HasLatencySample && !cell.HasPkgLossSample && !cell.HasSpeedSample {
+	if pc.HasSample && !cell.HasLatencySample && !cell.HasPkgLossSample && !cell.HasSpeedSample && !cell.HasJitterSample {
 		cell.HasLatencySample = pc.Latency > 0
 		cell.HasPkgLossSample = pc.PkgLoss > 0
 		cell.HasSpeedSample = pc.Speed > 0
 	}
-	cell.Score = calculateScore(pc.Latency, pc.Speed, pc.PkgLoss, pc.FailedCount)
+	cell.Score = calculateScore(pc.Latency, pc.Speed, pc.PkgLoss, pc.FailedCount, pc.Jitter)
 	cell.Dirty = false
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
@@ -656,6 +683,7 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 					Speed:       cell.Speed,
 					Score:       cell.Score,
 					FailedCount: cell.FailedCount,
+					Jitter:      cell.Jitter,
 				},
 			}
 		}
@@ -697,6 +725,7 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 		use          int64
 		fail         float64
 		loss         float64
+		jitter       float64
 		speed        float64
 		latencyScore float64
 		speedScore   float64
@@ -710,9 +739,10 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 			use:          cell.UseCount,
 			fail:         cell.FailedCount,
 			loss:         cell.PkgLoss,
+			jitter:       cell.Jitter,
 			speed:        cell.Speed,
-			latencyScore: calculateScore(cell.Latency, 0, 0, cell.FailedCount),
-			speedScore:   calculateScore(0, cell.Speed, 0, cell.FailedCount),
+			latencyScore: calculateScore(cell.Latency, 0, 0, cell.FailedCount, cell.Jitter),
+			speedScore:   calculateScore(0, cell.Speed, 0, cell.FailedCount, cell.Jitter),
 			score:        cell.Score,
 		})
 	}
@@ -730,8 +760,8 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 		if i > 0 {
 			sb.WriteString(" ")
 		}
-		sb.WriteString(fmt.Sprintf("%s(lat=%d,use=%d,fail=%.1f,loss=%.3f,spd=%.0f,[latScore=%.4f,speedScore=%.4f,score=%.4f])",
-			e.name, e.latency, e.use, e.fail, e.loss, e.speed, e.latencyScore, e.speedScore, e.score))
+		sb.WriteString(fmt.Sprintf("%s(lat=%d,use=%d,fail=%.1f,loss=%.3f,jit=%.1f,spd=%.0f,[latScore=%.4f,speedScore=%.4f,score=%.4f])",
+			e.name, e.latency, e.use, e.fail, e.loss, e.jitter, e.speed, e.latencyScore, e.speedScore, e.score))
 	}
 	sb.WriteString("]")
 	return sb.String()

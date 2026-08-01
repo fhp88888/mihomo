@@ -96,6 +96,46 @@ func TestEMAPkgLoss(t *testing.T) {
 	}
 }
 
+func TestEMAJitter(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	proxy := "proxy-a"
+
+	// First latency sample: no baseline yet, jitter stays 0.
+	rt.UpdateLatency(key, proxy, 100)
+	snap := rt.Snapshot("test")
+	rec := snap.Rows[0].Proxies[proxy]
+	if rec.Attributes.Jitter != 0 {
+		t.Fatalf("expected jitter=0 on first sample, got %.2f", rec.Attributes.Jitter)
+	}
+	if rec.Attributes.Latency != 100 {
+		t.Fatalf("expected first latency=100, got %d", rec.Attributes.Latency)
+	}
+
+	// Second sample: previous EMA latency was 100, new sample 40.
+	// deviation = |40-100| = 60, first jitter sample writes directly.
+	rt.UpdateLatency(key, proxy, 40)
+	snap = rt.Snapshot("test")
+	rec = snap.Rows[0].Proxies[proxy]
+	if rec.Attributes.Jitter != 60 {
+		t.Fatalf("expected first jitter=60, got %.2f", rec.Attributes.Jitter)
+	}
+	// EMA latency = 100*3/4 + 40/4 = 85
+	if rec.Attributes.Latency != 85 {
+		t.Fatalf("expected EMA latency=85, got %d", rec.Attributes.Latency)
+	}
+
+	// Third sample: previous EMA latency was 85, new sample 100.
+	// deviation = |100-85| = 15. Jitter EMA = 60*3/4 + 15/4 = 48.75.
+	rt.UpdateLatency(key, proxy, 100)
+	snap = rt.Snapshot("test")
+	rec = snap.Rows[0].Proxies[proxy]
+	expectedJitter := 60*3.0/4.0 + 15.0/4.0
+	if rec.Attributes.Jitter < expectedJitter-0.01 || rec.Attributes.Jitter > expectedJitter+0.01 {
+		t.Fatalf("expected jitter=%.2f, got %.2f", expectedJitter, rec.Attributes.Jitter)
+	}
+}
+
 func TestEMASpeed(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
@@ -134,26 +174,36 @@ func TestCalculateScore(t *testing.T) {
 		latency     int64
 		speed       float64
 		failedCount float64
+		jitter      float64
 		expect      float64
 	}{
-		// score = 100 / max(latency, 100)  when speed=0, pkgLoss=0, failedCount=0
-		{latency: 100, speed: 0, failedCount: 0, expect: 1.0},
-		{latency: 50, speed: 0, failedCount: 0, expect: 1.0}, // max(50, 100)=100 → 100/100=1.0
-		{latency: 200, speed: 0, failedCount: 0, expect: 0.5}, // max(200, 100)=200 → 100/200=0.5
-		// speed=10MiB/s → speed_mbps=20 → score = 1.0 + log1p(20/0.5) = 1.0 + log1p(40)
-		{latency: 100, speed: 10485760, failedCount: 0, expect: 1.0 + math.Log1p(20)},
-		// speed=1MiB/s → speed_mbps=2 → score = log1p(2/0.5) = log1p(4)
-		{latency: 0, speed: 1048576, failedCount: 0, expect: math.Log1p(2)},
-		{latency: -10, speed: 0, failedCount: 0, expect: 0},
+		// latency-only: score = 100 / (max(latency, 100) + max(jitter, 10)).
+		// jitter=0 still applies the 10ms floor to the denominator.
+		{latency: 100, speed: 0, failedCount: 0, jitter: 0, expect: 100.0 / (100.0 + 10.0)}, // 100/110
+		{latency: 50, speed: 0, failedCount: 0, jitter: 0, expect: 100.0 / (100.0 + 10.0)},  // max(50,100)=100
+		{latency: 200, speed: 0, failedCount: 0, jitter: 0, expect: 100.0 / (200.0 + 10.0)}, // 100/210
+		// speed contributes log1p(speed / 0.5MBps)
+		{latency: 100, speed: 10485760, failedCount: 0, jitter: 0, expect: 100.0/(100.0+10.0) + math.Log1p(20)},
+		{latency: 0, speed: 1048576, failedCount: 0, jitter: 0, expect: math.Log1p(2)}, // latency=0 → latency term skipped
+		{latency: -10, speed: 0, failedCount: 0, jitter: 0, expect: 0},
 		// failedCount penalty: 0.8^n multiplier
-		{latency: 100, speed: 0, failedCount: 1, expect: 1.0 * 0.8},
-		{latency: 100, speed: 0, failedCount: 3, expect: 1.0 * math.Pow(0.8, 3)},
+		{latency: 100, speed: 0, failedCount: 1, jitter: 0, expect: 100.0/(100.0+10.0) * 0.8},
+		{latency: 100, speed: 0, failedCount: 3, jitter: 0, expect: 100.0/(100.0+10.0) * math.Pow(0.8, 3)},
+		// jitter inflates the latency denominator: 100 / (max(latency,100) + max(jitter,10))
+		{latency: 100, speed: 0, failedCount: 0, jitter: 10, expect: 100.0 / (100.0 + 10.0)},  // max(10,10)=10
+		{latency: 100, speed: 0, failedCount: 0, jitter: 5, expect: 100.0 / (100.0 + 10.0)},   // max(5,10)=10, same floor
+		{latency: 100, speed: 0, failedCount: 0, jitter: 50, expect: 100.0 / (100.0 + 50.0)},  // 100/150
+		{latency: 100, speed: 0, failedCount: 0, jitter: 200, expect: 100.0 / (100.0 + 200.0)}, // 100/300
+		// jitter combined with speed
+		{latency: 100, speed: 1048576, failedCount: 0, jitter: 50, expect: 100.0/(100.0+50.0) + math.Log1p(2)},
+		// latency=0 with jitter: latency term (and thus jitter) is skipped
+		{latency: 0, speed: 1048576, failedCount: 0, jitter: 50, expect: math.Log1p(2)},
 	}
 
 	for _, tc := range cases {
-		got := calculateScore(tc.latency, tc.speed, 0, tc.failedCount)
+		got := calculateScore(tc.latency, tc.speed, 0, tc.failedCount, tc.jitter)
 		if math.Abs(got-tc.expect) > 0.000001 {
-			t.Fatalf("latency=%d speed=%.0f fail=%.1f: expected score %.6f, got %.6f", tc.latency, tc.speed, tc.failedCount, tc.expect, got)
+			t.Fatalf("latency=%d speed=%.0f fail=%.1f jitter=%.1f: expected score %.6f, got %.6f", tc.latency, tc.speed, tc.failedCount, tc.jitter, tc.expect, got)
 		}
 	}
 }
@@ -169,7 +219,7 @@ func TestRefreshScoresStoresNonEMA(t *testing.T) {
 	snap := rt.Snapshot("test")
 	got := snap.Rows[0].Proxies[proxy].Attributes.Score
 	rec := snap.Rows[0].Proxies[proxy]
-	expected := 100.0/math.Max(float64(rec.Attributes.Latency), 100.0) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
+	expected := 100.0/(math.Max(float64(rec.Attributes.Latency), 100.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
 	if math.Abs(got-expected) > 0.000001 {
 		t.Fatalf("expected initial score %.6f, got %.6f", expected, got)
 	}
@@ -179,7 +229,7 @@ func TestRefreshScoresStoresNonEMA(t *testing.T) {
 	rt.RefreshScores(key, []string{proxy})
 	snap = rt.Snapshot("test")
 	rec = snap.Rows[0].Proxies[proxy]
-	expected = 100.0/math.Max(float64(rec.Attributes.Latency), 100.0) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
+	expected = 100.0/(math.Max(float64(rec.Attributes.Latency), 100.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
 	if math.Abs(rec.Attributes.Score-expected) > 0.000001 {
 		t.Fatalf("expected score from current latency/speed %.6f, got %.6f", expected, rec.Attributes.Score)
 	}
@@ -266,7 +316,7 @@ func TestSnapshotIncludesScore(t *testing.T) {
 	snap := rt.Snapshot("test")
 	got := snap.Rows[0].Proxies[proxy].Attributes.Score
 	rec := snap.Rows[0].Proxies[proxy]
-	expected := 100.0/math.Max(float64(rec.Attributes.Latency), 100.0) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
+	expected := 100.0/(math.Max(float64(rec.Attributes.Latency), 100.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
 	if math.Abs(got-expected) > 0.000001 {
 		t.Fatalf("expected snapshot score %.6f, got %.6f", expected, got)
 	}
