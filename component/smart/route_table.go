@@ -227,7 +227,7 @@ func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount f
 		// so divided by 0.5
 		score += math.Log1p(speed / 1024.0 / 1024.0 / 0.5)
 	}
-	score = score * (1 - pkgLoss)
+	score = score * (1 - math.Pow(pkgLoss, 0.7))
 	if failedCount > 0 {
 		score *= math.Pow(0.8, failedCount)
 	}
