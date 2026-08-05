@@ -665,7 +665,10 @@ func applyPolicyPriority(s *Smart, policyPriority string) {
 // ── ASN resolution ──────────────────────────────────────────
 
 func (s *Smart) getASNCode(metadata *C.Metadata) string {
-	if metadata.DstIPASN == "unknown" {
+	// "0" is the failure sentinel written below; "unknown" is the legacy
+	// sentinel still written by the IP-ASN rule path (rules/common/ipasn.go).
+	// Treat both as "no usable ASN" so routeKey falls back to ASN+domain.
+	if metadata.DstIPASN == "0" || metadata.DstIPASN == "unknown" {
 		return ""
 	}
 
@@ -681,12 +684,12 @@ func (s *Smart) getASNCode(metadata *C.Metadata) string {
 			ip, err = resolver.ResolveIP(ctx, metadata.Host)
 			if err != nil {
 				log.Debugln("[DNS] resolve %s error: %s", metadata.Host, err.Error())
-				metadata.DstIPASN = "unknown"
+				metadata.DstIPASN = "0"
 				return ""
 			}
 			log.Debugln("[DNS] %s --> %s", metadata.Host, ip.String())
 			if !ip.IsValid() {
-				metadata.DstIPASN = "unknown"
+				metadata.DstIPASN = "0"
 				return ""
 			}
 		} else {
@@ -696,13 +699,13 @@ func (s *Smart) getASNCode(metadata *C.Metadata) string {
 		if !geodata.ASNEnable() {
 			if err := geodata.InitASN(); err != nil {
 				log.Warnln("[Smart] ASN not initialized: %v", err)
-				metadata.DstIPASN = "unknown"
+				metadata.DstIPASN = "0"
 				return ""
 			}
 		}
 		asn, aso := mmdb.ASNInstance().LookupASN(ip.AsSlice())
 		if asn == "" {
-			metadata.DstIPASN = "unknown"
+			metadata.DstIPASN = "0"
 		} else {
 			metadata.DstIPASN = asn + " " + aso
 		}
