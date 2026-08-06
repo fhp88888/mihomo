@@ -170,8 +170,10 @@ func getSmartTable(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if sp, ok := proxy.Adapter().(*outboundgroup.Smart); ok {
-		snapshot := sp.RouteTableSnapshot()
-		render.JSON(w, r, snapshot)
+		render.JSON(w, r, render.M{
+			"smart_table":       sp.RouteTableSnapshot(),
+			"proxy_aggregation": sp.ProxyAggregationSnapshot(),
+		})
 		return
 	}
 

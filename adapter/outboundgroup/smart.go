@@ -59,6 +59,10 @@ type Smart struct {
 	routeTable       *smart.RouteTable
 	probeCoordinator *ProbeCoordinator
 
+	// per-proxy aggregation (5-min weighted average across the route table)
+	proxyAggMu sync.RWMutex
+	proxyAgg   smart.ProxyAggregation
+
 	// Policy priority (retained for compatibility)
 	policyPriority []priorityRule
 	priorityCache  xsync.Map[string, float64]
@@ -217,6 +221,7 @@ func (s *Smart) InitSmart() {
 	s.startTimedTask(10*time.Minute, 10*time.Minute, "Route table persistence", s.persistRouteTable, false)
 	s.startTimedTask(10*time.Minute, 10*time.Minute, "FailedCount decay", s.decayFailedCounts, false)
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, true)
+	s.startTimedTask(5*time.Minute, 5*time.Minute, "Proxy aggregation", s.aggregateProxies, false)
 }
 
 // ── Public proxy methods ────────────────────────────────────
@@ -398,6 +403,26 @@ func (s *Smart) URLTest(ctx context.Context, url string, expectedStatus utils.In
 // RouteTableSnapshot returns a read-only snapshot of the route table for the REST API.
 func (s *Smart) RouteTableSnapshot() smart.TableSnapshot {
 	return s.routeTable.Snapshot(s.Name())
+}
+
+// ProxyAggregationSnapshot returns the latest per-proxy aggregation for the REST API.
+func (s *Smart) ProxyAggregationSnapshot() smart.ProxyAggregation {
+	s.proxyAggMu.RLock()
+	defer s.proxyAggMu.RUnlock()
+	return s.proxyAgg
+}
+
+// aggregateProxies recomputes the per-proxy aggregation from the current
+// route table and stores it for the REST API.
+func (s *Smart) aggregateProxies() {
+	agg := s.routeTable.AggregateByProxy()
+	agg.Group = s.Name()
+
+	s.proxyAggMu.Lock()
+	s.proxyAgg = agg
+	s.proxyAggMu.Unlock()
+
+	log.Debugln("[Smart] Proxy aggregation updated for group [%s]: %d proxies", s.Name(), agg.Count)
 }
 
 // ── Lifecycle ───────────────────────────────────────────────
