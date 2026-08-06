@@ -92,7 +92,8 @@ type RouteTable struct {
 	// proxyAttrs holds the per-proxy aggregation computed by AggregateByProxy.
 	// It backs the proxy-wise component of calculateScore: scores blend the
 	// per-target (cell) view with this cross-target view.  A missing proxy
-	// means "no aggregation yet" and scores as all-zero proxy-wise.
+	// means "no aggregation yet" — calculateScore returns the unblended
+	// per-target score in that case.
 	proxyAttrs map[string]ProxyAttributes
 }
 
@@ -246,11 +247,15 @@ func calculateScoreAtom(latency int64, speed float64, pkgLoss float64, failedCou
 }
 
 func (rt *RouteTable) calculateScore(proxy string, latency int64, speed, pkgLoss, failedCount, jitter float64) float64 {
+	attrs, ok := rt.proxyAttrs[proxy]
+	if !ok {
+		// No aggregation yet (cold start, new proxy) -> use the raw
+		// per-target score unblended.
+		return calculateScoreAtom(latency, speed, pkgLoss, failedCount, jitter)
+	}
 	// Target wise score
 	score := calculateScoreAtom(latency, speed, pkgLoss, failedCount, jitter) * 0.7
 	// Proxy wise score
-	// a proxy without aggregation yields all 0, so nothing is added.
-	attrs := rt.proxyAttrs[proxy]
 	score += calculateScoreAtom(attrs.Latency, attrs.Speed, attrs.PkgLoss, attrs.FailedCount, attrs.Jitter) * 0.3
 	return score
 }

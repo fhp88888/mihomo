@@ -212,11 +212,11 @@ func TestCalculateScoreBlend(t *testing.T) {
 	rt := NewRouteTable(100)
 
 	// Target-wise: latency=100 -> atom = 100/110.
-	// Proxy-wise absent -> all-zero -> contributes 0.  Blended = atom*0.7.
+	// Proxy-wise absent -> raw per-target score, unblended = atom.
 	atom := calculateScoreAtom(100, 0, 0, 0, 0)
 	got := rt.calculateScore("proxy-a", 100, 0, 0, 0, 0)
-	if math.Abs(got-atom*0.7) > 0.000001 {
-		t.Fatalf("expected blended score %.6f (atom*0.7), got %.6f", atom*0.7, got)
+	if math.Abs(got-atom) > 0.000001 {
+		t.Fatalf("expected unblended score %.6f (atom), got %.6f", atom, got)
 	}
 
 	// Proxy-wise present: latency=200 -> atom_p = 100/(200+10).
@@ -230,11 +230,10 @@ func TestCalculateScoreBlend(t *testing.T) {
 	}
 
 	// Proxy-wise lookup MISS: proxy-b is not in the aggregation table even
-	// though proxy-a is.  A missing map entry yields the zero value, so the
-	// proxy-wise atom is 0 and only the target-wise term remains.
+	// though proxy-a is.  A missing entry returns the raw per-target score.
 	got = rt.calculateScore("proxy-b", 100, 0, 0, 0, 0)
-	if math.Abs(got-atom*0.7) > 0.000001 {
-		t.Fatalf("expected miss score %.6f (atom*0.7), got %.6f", atom*0.7, got)
+	if math.Abs(got-atom) > 0.000001 {
+		t.Fatalf("expected miss score %.6f (atom), got %.6f", atom, got)
 	}
 }
 
@@ -250,7 +249,7 @@ func TestRefreshScoresStoresNonEMA(t *testing.T) {
 	got := snap.Rows[0].Proxies[proxy].Attributes.Score
 	rec := snap.Rows[0].Proxies[proxy]
 	atom := 100.0/(math.Max(float64(rec.Attributes.Latency), 100.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
-	expected := atom * 0.7 // no per-proxy aggregation -> proxy-wise term is 0
+	expected := atom // no per-proxy aggregation -> raw unblended score
 	if math.Abs(got-expected) > 0.000001 {
 		t.Fatalf("expected initial score %.6f, got %.6f", expected, got)
 	}
@@ -261,7 +260,7 @@ func TestRefreshScoresStoresNonEMA(t *testing.T) {
 	snap = rt.Snapshot("test")
 	rec = snap.Rows[0].Proxies[proxy]
 	atom = 100.0/(math.Max(float64(rec.Attributes.Latency), 100.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
-	expected = atom * 0.7
+	expected = atom
 	if math.Abs(rec.Attributes.Score-expected) > 0.000001 {
 		t.Fatalf("expected score from current latency/speed %.6f, got %.6f", expected, rec.Attributes.Score)
 	}
@@ -349,7 +348,7 @@ func TestSnapshotIncludesScore(t *testing.T) {
 	got := snap.Rows[0].Proxies[proxy].Attributes.Score
 	rec := snap.Rows[0].Proxies[proxy]
 	atom := 100.0/(math.Max(float64(rec.Attributes.Latency), 100.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
-	expected := atom * 0.7 // proxy-wise term absent in this test
+	expected := atom // no per-proxy aggregation -> raw unblended score
 	if math.Abs(got-expected) > 0.000001 {
 		t.Fatalf("expected snapshot score %.6f, got %.6f", expected, got)
 	}
