@@ -134,9 +134,10 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 	return s, nil
 }
 
-// restoreRouteTable loads persisted route cells from the bbolt store into the
-// in-memory route table.  Cells that were loaded are marked clean so the
-// periodic flush won't re-persist them until they actually change.
+// restoreRouteTable loads persisted route cells and per-row routing state
+// (best proxy, tcp-probed flag) from the bbolt store into the in-memory route
+// table.  Cells and rows that were loaded are marked clean so the periodic
+// flush won't re-persist them until they actually change.
 func (s *Smart) restoreRouteTable(rt *smart.RouteTable, configName string) {
 	store := cachefile.GetSmartStore()
 	if store == nil {
@@ -149,30 +150,48 @@ func (s *Smart) restoreRouteTable(rt *smart.RouteTable, configName string) {
 		return
 	}
 
-	if len(rawCells) == 0 {
+	if len(rawCells) > 0 {
+		log.Infoln("[Smart] Loaded %d persisted route cells from cache.db for group [%s], restoring...", len(rawCells), s.Name())
+
+		loaded := 0
+		for keyProxy, data := range rawCells {
+			var pc smart.PersistedCell
+			if json.Unmarshal(data, &pc) != nil {
+				continue
+			}
+			// keyProxy format: {routeKey}/{proxyName}
+			slash := strings.LastIndex(keyProxy, "/")
+			if slash < 0 {
+				continue
+			}
+			key := keyProxy[:slash]
+			proxy := keyProxy[slash+1:]
+			rt.RestoreRow(key, proxy, pc)
+			loaded++
+		}
+		if loaded > 0 {
+			log.Infoln("[Smart] Restored %d persisted route cells for group [%s]", loaded, s.Name())
+		}
+	}
+
+	// Restore per-row routing state so a known route can take the fast path
+	// immediately after restart instead of re-running full discovery.
+	rawRows, err := store.LoadRouteRows(configName, s.Name())
+	if err != nil {
+		log.Debugln("[Smart] No persisted route rows for group [%s]: %v", s.Name(), err)
 		return
 	}
-
-	log.Infoln("[Smart] Loaded %d persisted route cells from cache.db for group [%s], restoring...", len(rawCells), s.Name())
-
-	loaded := 0
-	for keyProxy, data := range rawCells {
-		var pc smart.PersistedCell
-		if json.Unmarshal(data, &pc) != nil {
+	rowLoaded := 0
+	for key, data := range rawRows {
+		var pr smart.PersistedRow
+		if json.Unmarshal(data, &pr) != nil {
 			continue
 		}
-		// keyProxy format: {routeKey}/{proxyName}
-		slash := strings.LastIndex(keyProxy, "/")
-		if slash < 0 {
-			continue
-		}
-		key := keyProxy[:slash]
-		proxy := keyProxy[slash+1:]
-		rt.RestoreRow(key, proxy, pc)
-		loaded++
+		rt.RestoreRowMeta(key, pr)
+		rowLoaded++
 	}
-	if loaded > 0 {
-		log.Infoln("[Smart] Restored %d persisted route cells for group [%s]", loaded, s.Name())
+	if rowLoaded > 0 {
+		log.Infoln("[Smart] Restored %d route rows (best proxy) for group [%s]", rowLoaded, s.Name())
 	}
 }
 
@@ -496,19 +515,21 @@ func (s *Smart) cleanupOrphanedNodeCache() {
 	}
 }
 
-// persistRouteTable atomically snapshots dirty cells and enqueues them
-// to the global bbolt batch queue.  The snapshot-and-clear is a single
-// lock window, so no dirty flag is lost to concurrent mutations.
+// persistRouteTable atomically snapshots dirty cells and dirty row routing
+// state, then enqueues them to the global bbolt batch queue.  The
+// snapshot-and-clear is a single lock window, so no dirty flag is lost to
+// concurrent mutations.
 func (s *Smart) persistRouteTable() {
 	dirty := s.routeTable.SnapshotAndClearDirty()
-	if len(dirty) == 0 {
+	dirtyRows := s.routeTable.SnapshotAndClearDirtyRows()
+	if len(dirty) == 0 && len(dirtyRows) == 0 {
 		return
 	}
 
 	store := cachefile.GetSmartStore()
 
 	// Check whether the underlying DB is available.  If not, re-mark the
-	// cells dirty so the next cycle retries — otherwise we'd silently
+	// cells and rows dirty so the next cycle retries — otherwise we'd silently
 	// discard data when the bbolt file can't be opened.
 	if !store.IsDBAvailable() {
 		for cellKey := range dirty {
@@ -516,7 +537,10 @@ func (s *Smart) persistRouteTable() {
 				s.routeTable.MarkDirty(cellKey[:idx], cellKey[idx+1:])
 			}
 		}
-		log.Infoln("[Smart] DB unavailable, re-marked %d dirty route cells for group [%s]", len(dirty), s.Name())
+		for routeKey := range dirtyRows {
+			s.routeTable.MarkRowDirty(routeKey)
+		}
+		log.Infoln("[Smart] DB unavailable, re-marked %d dirty route cells and %d rows for group [%s]", len(dirty), len(dirtyRows), s.Name())
 		return
 	}
 
@@ -541,7 +565,21 @@ func (s *Smart) persistRouteTable() {
 		}
 	}
 
-	log.Infoln("[Smart] Enqueued %d dirty route cells for group [%s]", len(dirty), s.Name())
+	for routeKey, pr := range dirtyRows {
+		data, err := json.Marshal(pr)
+		if err != nil {
+			continue
+		}
+		store.AppendToGlobalQueue(smart.StoreOperation{
+			Type:   smart.OpSaveRouteMeta,
+			Group:  s.Name(),
+			Config: s.configName,
+			Target: routeKey,
+			Data:   data,
+		})
+	}
+
+	log.Infoln("[Smart] Enqueued %d dirty route cells and %d rows for group [%s]", len(dirty), len(dirtyRows), s.Name())
 }
 
 // decayFailedCounts reduces every route cell's FailedCount by 0.1 (floor 0).

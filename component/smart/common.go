@@ -24,6 +24,7 @@ const (
 	OpSaveRanking
 	OpSaveHostFailures
 	OpSaveRoute
+	OpSaveRouteMeta
 )
 
 const (
@@ -33,6 +34,7 @@ const (
 	KeyTypeRanking      = "ranking"
 	KeyTypeHostFailures = "failures"
 	KeyTypeRoute        = "route"
+	KeyTypeRouteMeta    = "route_meta"
 
 	WeightTypeTCP    = "tcp"
 	WeightTypeUDP    = "udp"
@@ -180,6 +182,8 @@ func formatOperationKey(op *StoreOperation) string {
 		return FormatDBKey(KeyTypeHostFailures, op.Config, op.Group, op.Target)
 	case OpSaveRoute:
 		return FormatDBKey(KeyTypeRoute, op.Config, op.Group, op.Target)
+	case OpSaveRouteMeta:
+		return FormatDBKey(KeyTypeRouteMeta, op.Config, op.Group, op.Target)
 	default:
 		return ""
 	}

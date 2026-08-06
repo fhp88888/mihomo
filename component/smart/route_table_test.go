@@ -738,3 +738,114 @@ func TestIntegrationLatencySpeedLossFromSingleConnection(t *testing.T) {
 		t.Fatalf("expected latency=%d (connectTime, single write), got %d", connectTime, rec.Attributes.Latency)
 	}
 }
+
+func TestRowMetaDirtyTracking(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// Fresh row: not dirty, no state.
+	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
+		t.Fatalf("expected no dirty rows on fresh table, got %d", len(snap))
+	}
+
+	// SetBestProxy marks the row dirty and snapshots the best proxy.
+	rt.SetBestProxy(key, "proxy-a")
+	rt.SetTCPProbed(key)
+	snap := rt.SnapshotAndClearDirtyRows()
+	if len(snap) != 1 {
+		t.Fatalf("expected 1 dirty row, got %d", len(snap))
+	}
+	pr, ok := snap[key]
+	if !ok {
+		t.Fatalf("dirty snapshot missing key %q", key)
+	}
+	if pr.BestProxy != "proxy-a" {
+		t.Fatalf("BestProxy = %q, want %q", pr.BestProxy, "proxy-a")
+	}
+	if !pr.TCPProbed {
+		t.Fatal("TCPProbed should be true")
+	}
+
+	// After snapshot-and-clear the row is clean again.
+	if snap = rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
+		t.Fatalf("expected no dirty rows after clear, got %d", len(snap))
+	}
+
+	// MarkFailed clears the routing state and re-marks the row dirty.
+	rt.MarkFailed(key, "proxy-a", 1.0)
+	snap = rt.SnapshotAndClearDirtyRows()
+	if len(snap) != 1 {
+		t.Fatalf("expected 1 dirty row after MarkFailed, got %d", len(snap))
+	}
+	pr = snap[key]
+	if pr.BestProxy != "" {
+		t.Fatalf("BestProxy should be cleared by MarkFailed, got %q", pr.BestProxy)
+	}
+	if pr.TCPProbed {
+		t.Fatal("TCPProbed should be cleared by MarkFailed")
+	}
+}
+
+func TestRestoreRowMetaRoundtrip(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// A fresh restore must be clean and immediately serve the fast path.
+	rt.RestoreRowMeta(key, PersistedRow{BestProxy: "proxy-a", TCPProbed: true})
+	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
+		t.Fatalf("restored row should be clean, got %d dirty", len(snap))
+	}
+	if best, ok := rt.GetBestProxy(key); !ok || best != "proxy-a" {
+		t.Fatalf("GetBestProxy = %q, %v; want proxy-a, true", best, ok)
+	}
+	if !rt.IsTCPProbed(key) {
+		t.Fatal("IsTCPProbed should be true after restore")
+	}
+
+	// Restoring again with different state updates in place and stays clean.
+	rt.RestoreRowMeta(key, PersistedRow{BestProxy: "proxy-b", TCPProbed: false})
+	if best, ok := rt.GetBestProxy(key); !ok || best != "proxy-b" {
+		t.Fatalf("GetBestProxy after second restore = %q, %v; want proxy-b, true", best, ok)
+	}
+	if rt.IsTCPProbed(key) {
+		t.Fatal("IsTCPProbed should be false after second restore")
+	}
+	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
+		t.Fatalf("second restore should also be clean, got %d dirty", len(snap))
+	}
+
+	// MarkRowDirty marks a clean restored row for re-persist.
+	rt.MarkRowDirty(key)
+	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 1 {
+		t.Fatalf("expected 1 dirty row after MarkRowDirty, got %d", len(snap))
+	}
+}
+
+func TestRowMetaRemoveProxyClearsBest(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	rt.SetBestProxy(key, "proxy-a")
+	rt.SetTCPProbed(key)
+
+	rt.RemoveProxy("proxy-a")
+	snap := rt.SnapshotAndClearDirtyRows()
+	if len(snap) != 1 {
+		t.Fatalf("expected 1 dirty row after RemoveProxy, got %d", len(snap))
+	}
+	pr := snap[key]
+	if pr.BestProxy != "" {
+		t.Fatalf("BestProxy should be cleared by RemoveProxy, got %q", pr.BestProxy)
+	}
+	if pr.TCPProbed {
+		t.Fatal("TCPProbed should be cleared by RemoveProxy")
+	}
+
+	// Removing a proxy that was never best must not mark the row dirty.
+	rt.SetBestProxy(key, "proxy-b")
+	rt.SnapshotAndClearDirtyRows()
+	rt.RemoveProxy("proxy-c")
+	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
+		t.Fatalf("RemoveProxy of non-best proxy marked row dirty")
+	}
+}

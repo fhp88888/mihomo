@@ -38,6 +38,9 @@ type rowEntry struct {
 	tcpProbed bool
 	lastUsed  int64
 	proxies   map[string]*proxyCell
+	// rowDirty is true when the row's routing state (bestProxy, tcpProbed)
+	// has changed and the row snapshot has not been persisted yet.
+	rowDirty bool
 }
 
 type proxyCell struct {
@@ -178,6 +181,7 @@ func (rt *RouteTable) SetBestProxy(key, proxy string) {
 	row := rt.getOrCreateRow(key)
 	row.bestProxy = proxy
 	row.lastUsed = time.Now().Unix()
+	row.rowDirty = true
 	rt.touchLRU(key)
 }
 
@@ -187,6 +191,7 @@ func (rt *RouteTable) SetTCPProbed(key string) {
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	row.tcpProbed = true
+	row.rowDirty = true
 	rt.touchLRU(key)
 }
 
@@ -529,6 +534,7 @@ func (rt *RouteTable) MarkFailed(key, proxy string, penalty float64) {
 		row.bestProxy = ""
 	}
 	row.tcpProbed = false
+	row.rowDirty = true
 }
 
 // DecayFailedCounts reduces every cell's FailedCount by 0.1 (floor 0) across all
@@ -646,6 +652,65 @@ func (rt *RouteTable) RestoreRow(key, proxy string, pc PersistedCell) {
 	rt.touchLRU(key)
 }
 
+// PersistedRow is the JSON-serializable form of a rowEntry's routing state
+// (the fields a fresh route would otherwise have to re-learn by discovery).
+type PersistedRow struct {
+	BestProxy string `json:"best_proxy"`
+	TCPProbed bool   `json:"tcp_probed"`
+}
+
+// RestoreRowMeta restores a row's routing state (bestProxy, tcpProbed) from
+// previously persisted data.  The restored row is marked clean so it won't be
+// flushed until its state actually changes.
+//
+// lastUsed is deliberately reset to time.Now() (not the persisted last-used),
+// because the row's route data is old: allowing the freshness window to start
+// from now means the restored best proxy is eligible for the fast path until it
+// either stays fresh or is displaced by MarkFailed.
+func (rt *RouteTable) RestoreRowMeta(key string, pr PersistedRow) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row := rt.getOrCreateRow(key)
+	row.bestProxy = pr.BestProxy
+	row.tcpProbed = pr.TCPProbed
+	row.rowDirty = false
+	row.lastUsed = time.Now().Unix()
+	rt.touchLRU(key)
+}
+
+// SnapshotAndClearDirtyRows atomically snapshots all rows whose routing state
+// changed and clears their dirty flag in a single lock window.  Returns a deep
+// copy of each row's persisted fields so the caller can serialize without
+// holding the lock.  The map key is the route key.
+func (rt *RouteTable) SnapshotAndClearDirtyRows() map[string]PersistedRow {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	snapshot := make(map[string]PersistedRow)
+	for key, row := range rt.rows {
+		if row.rowDirty {
+			snapshot[key] = PersistedRow{
+				BestProxy: row.bestProxy,
+				TCPProbed: row.tcpProbed,
+			}
+			row.rowDirty = false
+		}
+	}
+	return snapshot
+}
+
+// MarkRowDirty sets the dirty flag on a row so its routing state will be
+// persisted on the next cycle.  Unlike RestoreRowMeta, it does not touch the
+// row's state, LRU order, or lastUsed.
+func (rt *RouteTable) MarkRowDirty(key string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return
+	}
+	row.rowDirty = true
+}
+
 // RemoveProxy removes a proxy from all rows (e.g., when it leaves the provider).
 func (rt *RouteTable) RemoveProxy(name string) {
 	rt.mu.Lock()
@@ -654,6 +719,8 @@ func (rt *RouteTable) RemoveProxy(name string) {
 		delete(row.proxies, name)
 		if row.bestProxy == name {
 			row.bestProxy = ""
+			row.tcpProbed = false
+			row.rowDirty = true
 		}
 	}
 }

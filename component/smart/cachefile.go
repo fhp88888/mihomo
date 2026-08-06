@@ -233,6 +233,13 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 				}
 				result[FormatDBKey(KeyTypeRoute, op.Config, op.Group, op.Target)] = op.Data
 			}
+		case KeyTypeRouteMeta:
+			if op.Type == OpSaveRouteMeta && op.Target != "" {
+				if depth >= 5 && seg4 != op.Target {
+					continue
+				}
+				result[FormatDBKey(KeyTypeRouteMeta, op.Config, op.Group, op.Target)] = op.Data
+			}
 		}
 	}
 
@@ -249,7 +256,7 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 	var groupPrefix string
 
 	switch keyType {
-	case KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures, KeyTypeRanking, KeyTypeRoute:
+	case KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures, KeyTypeRanking, KeyTypeRoute, KeyTypeRouteMeta:
 		if depth >= 4 {
 			hasGroupLevel = true
 			groupPrefix = FormatDBKey(keyType, config, group)
@@ -486,6 +493,29 @@ func (s *Store) LoadRouteCells(config, group string) (map[string][]byte, error) 
 		// keyProxy  = {routeKey}/{proxyName}
 		keyProxy := fullPath[len(prefix):]
 		result[keyProxy] = data
+	}
+	return result, nil
+}
+
+// LoadRouteRows loads persisted per-row routing state (best proxy, tcp-probed
+// flag) for all route keys in a group.  Returns a map of route key -> raw JSON
+// PersistedRow.  Old databases without row metadata return an empty map.
+func (s *Store) LoadRouteRows(config, group string) (map[string][]byte, error) {
+	pathPrefix := FormatDBKey(KeyTypeRouteMeta, config, group)
+	rawResult, err := s.GetSubBytesByPath(pathPrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string][]byte, len(rawResult))
+	prefix := pathPrefix + "/"
+	for fullPath, data := range rawResult {
+		if !strings.HasPrefix(fullPath, prefix) {
+			continue
+		}
+		// fullPath = smart/route_meta/{config}/{group}/{routeKey}
+		routeKey := fullPath[len(prefix):]
+		result[routeKey] = data
 	}
 	return result, nil
 }

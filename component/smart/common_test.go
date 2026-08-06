@@ -197,3 +197,76 @@ func TestConcurrentFlushQueue(t *testing.T) {
 	queueLen := len(globalOperationQueue.Load())
 	t.Logf("final queue length: %d (total ops sent: %d)", queueLen, totalOps)
 }
+
+// makeRouteMetaOps creates n OpSaveRouteMeta operations with unique route keys.
+func makeRouteMetaOps(n int, group, config string) []StoreOperation {
+	ops := make([]StoreOperation, n)
+	for i := 0; i < n; i++ {
+		ops[i] = StoreOperation{
+			Type:   OpSaveRouteMeta,
+			Group:  group,
+			Config: config,
+			Target: fmt.Sprintf("ASN:%d", 1000+i),
+			Data:   []byte(fmt.Sprintf(`{"best_proxy":"proxy-%d","tcp_probed":true}`, i)),
+		}
+	}
+	return ops
+}
+
+func TestRouteMetaRoundtrip_Flushed(t *testing.T) {
+	store, dbPath := newTestStore(t)
+	defer closeTestStore(t, dbPath)
+
+	ops := makeRouteMetaOps(20, "test-group", "test-config")
+	store.AppendToGlobalQueue(ops...)
+	store.FlushQueue(true)
+
+	// Verify the bytes landed at the route_meta keys.
+	for i, op := range ops {
+		key := FormatDBKey(KeyTypeRouteMeta, "test-config", "test-group", op.Target)
+		data, err := store.DBViewGetItem(key)
+		if err != nil {
+			t.Fatalf("item %d not found in DB: %v", i, err)
+		}
+		if string(data) != string(op.Data) {
+			t.Errorf("item %d data mismatch: got %s, want %s", i, data, op.Data)
+		}
+	}
+
+	// LoadRouteRows must return them keyed by route key.
+	rows, err := store.LoadRouteRows("test-config", "test-group")
+	if err != nil {
+		t.Fatalf("LoadRouteRows: %v", err)
+	}
+	if len(rows) != len(ops) {
+		t.Fatalf("LoadRouteRows returned %d rows, want %d", len(rows), len(ops))
+	}
+	for _, op := range ops {
+		if string(rows[op.Target]) != string(op.Data) {
+			t.Errorf("row %s data mismatch: got %s, want %s", op.Target, rows[op.Target], op.Data)
+		}
+	}
+}
+
+func TestRouteMetaRoundtrip_QueuedOnly(t *testing.T) {
+	store, dbPath := newTestStore(t)
+	defer closeTestStore(t, dbPath)
+
+	// Below the batch threshold so nothing is flushed; LoadRouteRows must
+	// still see the queued ops through GetSubBytesByPath's queue merge.
+	ops := makeRouteMetaOps(20, "test-group", "test-config")
+	store.AppendToGlobalQueue(ops...)
+
+	rows, err := store.LoadRouteRows("test-config", "test-group")
+	if err != nil {
+		t.Fatalf("LoadRouteRows: %v", err)
+	}
+	if len(rows) != len(ops) {
+		t.Fatalf("LoadRouteRows returned %d rows, want %d", len(rows), len(ops))
+	}
+	for _, op := range ops {
+		if string(rows[op.Target]) != string(op.Data) {
+			t.Errorf("row %s data mismatch: got %s, want %s", op.Target, rows[op.Target], op.Data)
+		}
+	}
+}
