@@ -221,7 +221,7 @@ func (s *Smart) InitSmart() {
 	s.startTimedTask(10*time.Minute, 10*time.Minute, "Route table persistence", s.persistRouteTable, false)
 	s.startTimedTask(10*time.Minute, 10*time.Minute, "FailedCount decay", s.decayFailedCounts, false)
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, true)
-	s.startTimedTask(5*time.Minute, 5*time.Minute, "Proxy aggregation", s.aggregateProxies, false)
+	s.startTimedTask(1*time.Minute, 1*time.Minute, "Proxy aggregation", s.aggregateProxies, false)
 }
 
 // ── Public proxy methods ────────────────────────────────────
