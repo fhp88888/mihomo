@@ -270,3 +270,33 @@ func TestRouteMetaRoundtrip_QueuedOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestFlushByGroupDeletesRouteMeta(t *testing.T) {
+	store, dbPath := newTestStore(t)
+	defer closeTestStore(t, dbPath)
+
+	// Persist both route cells and route meta rows for the same group.
+	cellOps := makeRouteOps(10, "test-group", "test-config")
+	metaOps := makeRouteMetaOps(10, "test-group", "test-config")
+	store.AppendToGlobalQueue(append(cellOps, metaOps...)...)
+	store.FlushQueue(true)
+
+	// A group-level flush must clear both key types (this was the regression:
+	// route_meta was cache-invalidated but never deleted from the DB, so stale
+	// rows resurrected on the next restart).
+	if err := store.FlushByGroup("test-group", "test-config"); err != nil {
+		t.Fatalf("FlushByGroup: %v", err)
+	}
+
+	if data, err := store.DBViewGetItem(FormatDBKey(KeyTypeRoute, "test-config", "test-group", "target-0/proxy-0")); err == nil {
+		t.Fatalf("route cell survived group flush: %s", data)
+	}
+	if data, err := store.DBViewGetItem(FormatDBKey(KeyTypeRouteMeta, "test-config", "test-group", "ASN:1000")); err == nil {
+		t.Fatalf("route_meta survived group flush: %s", data)
+	}
+
+	// A different group must be untouched.
+	if _, err := store.DBViewGetItem(FormatDBKey(KeyTypeRouteMeta, "test-config", "other-group", "ASN:1000")); err == nil {
+		t.Fatal("route_meta for another group was deleted")
+	}
+}

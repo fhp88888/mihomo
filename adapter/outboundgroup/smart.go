@@ -541,9 +541,9 @@ func (s *Smart) cleanupOrphanedNodeCache() {
 }
 
 // persistRouteTable atomically snapshots dirty cells and dirty row routing
-// state, then enqueues them to the global bbolt batch queue.  The
-// snapshot-and-clear is a single lock window, so no dirty flag is lost to
-// concurrent mutations.
+// state, then enqueues them to the global bbolt batch queue.  Each snapshot
+// (cells and rows) is a single lock window and clears its own dirty flags, so
+// no dirty flag is lost to concurrent mutations.
 func (s *Smart) persistRouteTable() {
 	dirty := s.routeTable.SnapshotAndClearDirty()
 	dirtyRows := s.routeTable.SnapshotAndClearDirtyRows()

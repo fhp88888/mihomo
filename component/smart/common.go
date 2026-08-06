@@ -628,6 +628,7 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 			FormatDBKey(KeyTypePrefetch, config),
 			FormatDBKey(KeyTypeHostFailures, config),
 			FormatDBKey(KeyTypeRoute, config),
+			FormatDBKey(KeyTypeRouteMeta, config),
 		}, false)
 	} else if level == "group" {
 		s.DBBatchDeletePrefix([]string{
@@ -637,6 +638,7 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 			FormatDBKey(KeyTypePrefetch, config, group),
 			FormatDBKey(KeyTypeHostFailures, config, group),
 			FormatDBKey(KeyTypeRoute, config, group),
+			FormatDBKey(KeyTypeRouteMeta, config, group),
 		}, false)
 	}
 
