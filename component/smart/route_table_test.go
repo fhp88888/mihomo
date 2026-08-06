@@ -219,12 +219,11 @@ func TestCalculateScoreBlend(t *testing.T) {
 		t.Fatalf("expected unblended score %.6f (atom), got %.6f", atom, got)
 	}
 
-	// Proxy-wise present: latency=200 -> atom_p = 100/(200+10).
-	// Blended = atom*0.7 + atom_p*0.3.
+	// Proxy-wise present: latency=200 -> blended latency = 100*0.7 + 200*0.3 = 130.
+	// The atom is computed once on the blended metrics.
 	rt.proxyAttrs["proxy-a"] = ProxyAttributes{Latency: 200}
-	atomP := calculateScoreAtom(200, 0, 0, 0, 0)
 	got = rt.calculateScore("proxy-a", 100, 0, 0, 0, 0)
-	want := atom*0.7 + atomP*0.3
+	want := calculateScoreAtom(130, 0, 0, 0, 0)
 	if math.Abs(got-want) > 0.000001 {
 		t.Fatalf("expected blended score %.6f, got %.6f", want, got)
 	}
