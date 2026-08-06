@@ -158,10 +158,8 @@ func TestCheckResetByPeer(t *testing.T) {
 }
 
 // TestRouteKey verifies the route table key selection rules:
-//   - ASN lookup failed ("0"):      "ASN:0|<domain>"
-//   - ASN in CdnASNs (CDN):         "ASN:<n>|<domain>"
-//   - ASN not in CdnASNs (regular): "ASN:<n>"
-//   - IP-only traffic (no host):    domain falls back to the IP
+//   - ASN available and valid: "ASN:<number>"
+//   - ASN lookup failed ("0" or "unknown"): "TARGET:<effective-target>"
 func TestRouteKey(t *testing.T) {
 	mkMeta := func(host string, dstIP string, asn string) *C.Metadata {
 		ip, err := netip.ParseAddr(dstIP)
@@ -176,29 +174,6 @@ func TestRouteKey(t *testing.T) {
 		}
 	}
 
-	t.Run("asn lookup failed becomes ASN+domain", func(t *testing.T) {
-		// getASNCode writes "0" when resolution fails; routeKey must fall back
-		// to the ASN+domain form so CDN-style targets still share a row.
-		m := mkMeta("www.example.com", "1.2.3.4", "0")
-		if got := routeKey(m); got != "ASN:0|www.example.com" {
-			t.Fatalf("routeKey = %q, want %q", got, "ASN:0|www.example.com")
-		}
-		// SmartTarget should be populated so the close callback (which re-derives
-		// the key) agrees with the route-time key.
-		if m.SmartTarget != "www.example.com" {
-			t.Fatalf("SmartTarget = %q, want %q", m.SmartTarget, "www.example.com")
-		}
-	})
-
-	t.Run("legacy unknown sentinel also becomes ASN+domain", func(t *testing.T) {
-		// rules/common/ipasn.go still writes "unknown" when the ASN rule
-		// matches nothing; treat it the same as "0".
-		m := mkMeta("www.example.com", "1.2.3.4", "unknown")
-		if got := routeKey(m); got != "ASN:0|www.example.com" {
-			t.Fatalf("routeKey = %q, want %q", got, "ASN:0|www.example.com")
-		}
-	})
-
 	t.Run("regular ASN uses ASN only", func(t *testing.T) {
 		// A non-CDN ASN (e.g. a residential ISP) shares one row across all
 		// targets in that ASN — the domain is not part of the key.
@@ -208,30 +183,44 @@ func TestRouteKey(t *testing.T) {
 		}
 	})
 
-	t.Run("cdn ASN uses ASN+domain", func(t *testing.T) {
-		// 13335 = Cloudflare, listed in CdnASNs. Different Cloudflare targets
-		// must not share one row, so the effective domain is part of the key.
-		m := mkMeta("www.cloudflare.com", "1.2.3.4", "13335 Cloudflare")
-		if got := routeKey(m); got != "ASN:13335|www.cloudflare.com" {
-			t.Fatalf("routeKey = %q, want %q", got, "ASN:13335|www.cloudflare.com")
+	t.Run("asn lookup failed becomes TARGET", func(t *testing.T) {
+		// getASNCode writes "0" when resolution fails; routeKey must fall back
+		// to the TARGET form keyed by the effective target.
+		m := mkMeta("www.example.com", "1.2.3.4", "0")
+		if got := routeKey(m); got != "TARGET:www.example.com" {
+			t.Fatalf("routeKey = %q, want %q", got, "TARGET:www.example.com")
+		}
+		// SmartTarget should be populated so the close callback (which re-derives
+		// the key) agrees with the route-time key.
+		if m.SmartTarget != "www.example.com" {
+			t.Fatalf("SmartTarget = %q, want %q", m.SmartTarget, "www.example.com")
 		}
 	})
 
-	t.Run("cdn random subdomain is collapsed", func(t *testing.T) {
-		// GetEffectiveTarget collapses CDN random subdomains to a wildcard, so
-		// a1b2c3d4.cloudfront.net and xyz.cloudfront.net share a row.
-		m := mkMeta("a1b2c3d4.cloudfront.net", "1.2.3.4", "16509 AmazonCloudFront")
-		if got := routeKey(m); got != "ASN:16509|*.cloudfront.net" {
-			t.Fatalf("routeKey = %q, want %q", got, "ASN:16509|*.cloudfront.net")
+	t.Run("legacy unknown sentinel also becomes TARGET", func(t *testing.T) {
+		// rules/common/ipasn.go still writes "unknown" when the ASN rule
+		// matches nothing; AsnOf treats it the same as "0".
+		m := mkMeta("www.example.com", "1.2.3.4", "unknown")
+		if got := routeKey(m); got != "TARGET:www.example.com" {
+			t.Fatalf("routeKey = %q, want %q", got, "TARGET:www.example.com")
+		}
+	})
+
+	t.Run("cdn ASN is not special-cased", func(t *testing.T) {
+		// 13335 = Cloudflare, listed in CdnASNs. The CDN key form is gone, so
+		// Cloudflare targets key by ASN alone like any other ASN.
+		m := mkMeta("www.cloudflare.com", "1.2.3.4", "13335 Cloudflare")
+		if got := routeKey(m); got != "ASN:13335" {
+			t.Fatalf("routeKey = %q, want %q", got, "ASN:13335")
 		}
 	})
 
 	t.Run("ip-only traffic falls back to the ip", func(t *testing.T) {
 		// No host: GetEffectiveTarget passes the IP through, and the key still
-		// carries the ASN+domain form when ASN resolution failed.
+		// carries the TARGET form when ASN resolution failed.
 		m := mkMeta("", "1.2.3.4", "0")
-		if got := routeKey(m); got != "ASN:0|1.2.3.4" {
-			t.Fatalf("routeKey = %q, want %q", got, "ASN:0|1.2.3.4")
+		if got := routeKey(m); got != "TARGET:1.2.3.4" {
+			t.Fatalf("routeKey = %q, want %q", got, "TARGET:1.2.3.4")
 		}
 	})
 }

@@ -32,28 +32,20 @@ const (
 )
 
 // routeKey returns the route table key for a connection's metadata.
-//
-// Key selection (write and read both go through this single function, so they
-// always agree):
-//   - ASN lookup failed or unavailable (asn == "0"):   "ASN:0|<domain>"
-//   - ASN resolved and in CdnASNs (CDN):               "ASN:<n>|<domain>"
-//   - ASN resolved and NOT in CdnASNs (regular ASN):   "ASN:<n>"
-//
-// domain is the effective target (GetEffectiveTarget) — CDN random subdomains
-// are already collapsed (e.g. "*.cloudfront.net") and a bare IP passes through
-// unchanged, so IP-only traffic still lands on a stable key.
+// Format: "ASN:<number>" when ASN is available and valid,
+// otherwise "TARGET:<effective-target>".
 func routeKey(metadata *C.Metadata) string {
-	domain := metadata.SmartTarget
-	if domain == "" {
-		domain = smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
-		metadata.SmartTarget = domain
+	asn := smart.AsnOf(metadata.DstIPASN)
+	if asn != "0" {
+		return "ASN:" + asn
 	}
 
-	asn := smart.AsnOf(metadata.DstIPASN)
-	if asn == "0" || smart.CdnASNs[asn] {
-		return "ASN:" + asn + "|" + domain
+	target := metadata.SmartTarget
+	if target == "" {
+		target = smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
+		metadata.SmartTarget = target
 	}
-	return "ASN:" + asn
+	return "TARGET:" + target
 }
 
 // tcpRoute implements the TCP routing strategy using the route table and probe coordinator.
