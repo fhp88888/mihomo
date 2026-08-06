@@ -89,6 +89,11 @@ type RouteTable struct {
 	maxRows int
 	// LRU order: index 0 = least recently used
 	lruOrder []string
+	// proxyAttrs holds the per-proxy aggregation computed by AggregateByProxy.
+	// It backs the proxy-wise component of calculateScore: scores blend the
+	// per-target (cell) view with this cross-target view.  A missing proxy
+	// means "no aggregation yet" and scores as all-zero proxy-wise.
+	proxyAttrs map[string]ProxyAttributes
 }
 
 // NewRouteTable creates a new RouteTable with the given capacity.
@@ -97,9 +102,10 @@ func NewRouteTable(maxRows int) *RouteTable {
 		maxRows = DefaultMaxRows
 	}
 	return &RouteTable{
-		rows:     make(map[string]*rowEntry),
-		maxRows:  maxRows,
-		lruOrder: make([]string, 0, maxRows),
+		rows:       make(map[string]*rowEntry),
+		maxRows:    maxRows,
+		lruOrder:   make([]string, 0, maxRows),
+		proxyAttrs: make(map[string]ProxyAttributes),
 	}
 }
 
@@ -221,7 +227,7 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 	return int64(float64(old)*3.0/4.0 + float64(new)/4.0)
 }
 
-func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount float64, jitter float64) float64 {
+func calculateScoreAtom(latency int64, speed float64, pkgLoss float64, failedCount float64, jitter float64) float64 {
 	score := 0.0
 	if latency > 0 {
 		score = 100.0 / (math.Max(float64(latency), 100.0) +
@@ -239,11 +245,14 @@ func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount f
 	return score
 }
 
-func scoreFromHealthCheckLatency(latency uint16) float64 {
-	if latency == 0 || latency == 0xffff {
-		return 0
-	}
-	return calculateScore(int64(latency), 0, 0, 0, 0)
+func (rt *RouteTable) calculateScore(proxy string, latency int64, speed, pkgLoss, failedCount, jitter float64) float64 {
+	// Target wise score
+	score := calculateScoreAtom(latency, speed, pkgLoss, failedCount, jitter) * 0.7
+	// Proxy wise score
+	// a proxy without aggregation yields all 0, so nothing is added.
+	attrs := rt.proxyAttrs[proxy]
+	score += calculateScoreAtom(attrs.Latency, attrs.Speed, attrs.PkgLoss, attrs.FailedCount, attrs.Jitter) * 0.3
+	return score
 }
 
 // RefreshScores updates non-EMA scores for existing proxy samples in a route row.
@@ -259,7 +268,7 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 		if !ok || !cell.hasSample() {
 			continue
 		}
-		cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
+		cell.Score = rt.calculateScore(proxy, cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
 	}
 }
 
@@ -480,13 +489,17 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 				if cell.Score > 0 {
 					scores[proxy] = cell.Score
 				} else {
-					scores[proxy] = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
+					scores[proxy] = rt.calculateScore(proxy, cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
 				}
 				continue
 			}
 		}
 		if healthCheckLatency != nil {
-			scores[proxy] = scoreFromHealthCheckLatency(healthCheckLatency(proxy))
+			if hc := healthCheckLatency(proxy); hc != 0 && hc != 0xffff {
+				scores[proxy] = rt.calculateScore(proxy, int64(hc), 0, 0, 0, 0)
+			} else {
+				scores[proxy] = 0
+			}
 		}
 	}
 
@@ -646,7 +659,7 @@ func (rt *RouteTable) RestoreRow(key, proxy string, pc PersistedCell) {
 		cell.HasPkgLossSample = pc.PkgLoss > 0
 		cell.HasSpeedSample = pc.Speed > 0
 	}
-	cell.Score = calculateScore(pc.Latency, pc.Speed, pc.PkgLoss, pc.FailedCount, pc.Jitter)
+	cell.Score = rt.calculateScore(proxy, cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
 	cell.Dirty = false
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
@@ -723,6 +736,28 @@ func (rt *RouteTable) RemoveProxy(name string) {
 			row.rowDirty = true
 		}
 	}
+	delete(rt.proxyAttrs, name)
+}
+
+// SetProxyAttrs stores the per-proxy aggregation backing the proxy-wise score
+// component.  The aggregation is computed externally (AggregateByProxy) and
+// pushed back so scoring stays group-local.  Proxies that vanish from the
+// table are dropped so stale entries don't linger.
+func (rt *RouteTable) SetProxyAttrs(attrs map[string]ProxyAttributes) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.proxyAttrs = attrs
+}
+
+// ProxyAttrsSnapshot returns a copy of the current per-proxy aggregation.
+func (rt *RouteTable) ProxyAttrsSnapshot() map[string]ProxyAttributes {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	snap := make(map[string]ProxyAttributes, len(rt.proxyAttrs))
+	for k, v := range rt.proxyAttrs {
+		snap[k] = v
+	}
+	return snap
 }
 
 // Len returns the current number of rows in the table.
@@ -808,8 +843,8 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 			loss:         cell.PkgLoss,
 			jitter:       cell.Jitter,
 			speed:        cell.Speed,
-			latencyScore: calculateScore(cell.Latency, 0, 0, cell.FailedCount, cell.Jitter),
-			speedScore:   calculateScore(0, cell.Speed, 0, cell.FailedCount, cell.Jitter),
+			latencyScore: rt.calculateScore(cell.Name, cell.Latency, 0, 0, cell.FailedCount, cell.Jitter),
+			speedScore:   rt.calculateScore(cell.Name, 0, cell.Speed, 0, cell.FailedCount, cell.Jitter),
 			score:        cell.Score,
 		})
 	}

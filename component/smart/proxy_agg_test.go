@@ -1,6 +1,7 @@
 package smart
 
 import (
+	"math"
 	"testing"
 )
 
@@ -84,5 +85,41 @@ func TestAggregateByProxyEmpty(t *testing.T) {
 	}
 	if agg.UpdatedAt <= 0 {
 		t.Fatalf("expected UpdatedAt > 0 even for empty table, got %d", agg.UpdatedAt)
+	}
+}
+
+// TestAggregateFeedsBlendedScore verifies that the aggregation pushes back into
+// the route table and the proxy-wise component of the blended score picks it up.
+func TestAggregateFeedsBlendedScore(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:100|example.com"
+
+	// Two targets on the same proxy; heavy use on the low-latency one.
+	rt.UpdateLatency(key, "p1", 50)
+	for i := 0; i < 3; i++ {
+		rt.IncrementUseCount(key, "p1")
+	}
+
+	// Before any aggregation: proxy-wise term absent -> score = atom*0.7.
+	rt.RefreshScores(key, []string{"p1"})
+	snap := rt.Snapshot("test")
+	pre := snap.Rows[0].Proxies["p1"].Attributes.Score
+	atom := calculateScoreAtom(50, 0, 0, 0, 0)
+	if math.Abs(pre-atom*0.7) > 0.000001 {
+		t.Fatalf("expected pre-aggregation score atom*0.7=%.6f, got %.6f", atom*0.7, pre)
+	}
+
+	// Aggregate: p1 proxy-wise latency = 50.
+	agg := rt.AggregateByProxy()
+	if len(agg.Proxies) != 1 || agg.Proxies[0].Name != "p1" {
+		t.Fatalf("expected single p1 aggregation, got %+v", agg.Proxies)
+	}
+
+	// After: blended = atom*0.7 + atom(proxy-wise)*0.3 (same 50 -> same atom).
+	rt.RefreshScores(key, []string{"p1"})
+	snap = rt.Snapshot("test")
+	post := snap.Rows[0].Proxies["p1"].Attributes.Score
+	if math.Abs(post-atom) > 0.000001 {
+		t.Fatalf("expected blended score atom=%.6f, got %.6f", atom, post)
 	}
 }

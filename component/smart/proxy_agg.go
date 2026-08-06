@@ -32,12 +32,13 @@ type ProxyAggregation struct {
 // contribution.  Cells without any sample are skipped entirely — they have no
 // data to contribute and would otherwise drag the means toward zero.
 //
-// Score is derived on the fly from the aggregated attributes via
-// calculateScore, so the displayed value stays consistent with per-target
-// scores even though no new samples are written.
+// The result is both returned and pushed back into rt.proxyAttrs, where it
+// backs the proxy-wise component of calculateScore (via SetProxyAttrs).
+// The per-proxy Score uses the raw atom formula — this data IS the proxy-wise
+// view, so blending it with itself would be a self-reference.
 func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 
 	// name -> accumulator
 	type agg struct {
@@ -110,7 +111,7 @@ func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
 				PkgLoss:     pkgLoss,
 				Jitter:      jitter,
 				FailedCount: failedCount,
-				Score:       calculateScore(latency, speed, pkgLoss, failedCount, jitter),
+				Score:       calculateScoreAtom(latency, speed, pkgLoss, failedCount, jitter),
 			},
 		})
 	}
@@ -123,9 +124,18 @@ func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
 		return proxies[i].Name < proxies[j].Name
 	})
 
-	return ProxyAggregation{
+	result := ProxyAggregation{
 		UpdatedAt: time.Now().Unix(),
 		Count:     len(proxies),
 		Proxies:   proxies,
 	}
+
+	// Push back so the proxy-wise score component reflects this aggregation.
+	attrs := make(map[string]ProxyAttributes, len(proxies))
+	for i := range proxies {
+		attrs[proxies[i].Name] = proxies[i].Attributes
+	}
+	rt.proxyAttrs = attrs
+
+	return result
 }
