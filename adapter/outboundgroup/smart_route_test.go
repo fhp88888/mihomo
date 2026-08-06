@@ -4,12 +4,14 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"syscall"
 	"testing"
 
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/component/smart"
+	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 )
 
@@ -46,8 +48,8 @@ func TestCheckEarlyDeath(t *testing.T) {
 	t.Run("early death marks failed", func(t *testing.T) {
 		s, before := setup()
 		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+1 {
-			t.Fatalf("FailedCount = %v, want %v", got, before+1)
+		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.6 {
+			t.Fatalf("FailedCount = %v, want %v", got, before+0.6)
 		}
 	})
 
@@ -93,8 +95,8 @@ func TestCheckEarlyDeath(t *testing.T) {
 		// Only upload flowed, no download — the response never arrived, so the
 		// connection died before completing the exchange.
 		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 0))
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+1 {
-			t.Fatalf("FailedCount = %v, want %v", got, before+1)
+		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.6 {
+			t.Fatalf("FailedCount = %v, want %v", got, before+0.6)
 		}
 	})
 
@@ -124,9 +126,9 @@ func TestCheckResetByPeer(t *testing.T) {
 		// Realistic error chain: *net.OpError wrapping *os.SyscallError wrapping syscall.ECONNRESET.
 		err := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
 		s.checkResetByPeer(key, proxyName, err)
-		// RST carries a lighter 0.3 penalty, not the full 1.0.
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.3 {
-			t.Fatalf("FailedCount = %v, want %v", got, before+0.3)
+		// RST carries a lighter 0.2 penalty, not the full 1.0.
+		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.2 {
+			t.Fatalf("FailedCount = %v, want %v", got, before+0.2)
 		}
 	})
 
@@ -151,6 +153,85 @@ func TestCheckResetByPeer(t *testing.T) {
 		s.checkResetByPeer(key, proxyName, nil)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
+		}
+	})
+}
+
+// TestRouteKey verifies the route table key selection rules:
+//   - ASN lookup failed ("0"):      "ASN:0|<domain>"
+//   - ASN in CdnASNs (CDN):         "ASN:<n>|<domain>"
+//   - ASN not in CdnASNs (regular): "ASN:<n>"
+//   - IP-only traffic (no host):    domain falls back to the IP
+func TestRouteKey(t *testing.T) {
+	mkMeta := func(host string, dstIP string, asn string) *C.Metadata {
+		ip, err := netip.ParseAddr(dstIP)
+		if err != nil {
+			t.Fatalf("bad test dstIP %q: %v", dstIP, err)
+		}
+		return &C.Metadata{
+			Host:        host,
+			DstIP:       ip,
+			DstIPASN:    asn,
+			SmartTarget: "",
+		}
+	}
+
+	t.Run("asn lookup failed becomes ASN+domain", func(t *testing.T) {
+		// getASNCode writes "0" when resolution fails; routeKey must fall back
+		// to the ASN+domain form so CDN-style targets still share a row.
+		m := mkMeta("www.example.com", "1.2.3.4", "0")
+		if got := routeKey(m); got != "ASN:0|www.example.com" {
+			t.Fatalf("routeKey = %q, want %q", got, "ASN:0|www.example.com")
+		}
+		// SmartTarget should be populated so the close callback (which re-derives
+		// the key) agrees with the route-time key.
+		if m.SmartTarget != "www.example.com" {
+			t.Fatalf("SmartTarget = %q, want %q", m.SmartTarget, "www.example.com")
+		}
+	})
+
+	t.Run("legacy unknown sentinel also becomes ASN+domain", func(t *testing.T) {
+		// rules/common/ipasn.go still writes "unknown" when the ASN rule
+		// matches nothing; treat it the same as "0".
+		m := mkMeta("www.example.com", "1.2.3.4", "unknown")
+		if got := routeKey(m); got != "ASN:0|www.example.com" {
+			t.Fatalf("routeKey = %q, want %q", got, "ASN:0|www.example.com")
+		}
+	})
+
+	t.Run("regular ASN uses ASN only", func(t *testing.T) {
+		// A non-CDN ASN (e.g. a residential ISP) shares one row across all
+		// targets in that ASN — the domain is not part of the key.
+		m := mkMeta("www.example.com", "1.2.3.4", "2497 "+"KDDI")
+		if got := routeKey(m); got != "ASN:2497" {
+			t.Fatalf("routeKey = %q, want %q", got, "ASN:2497")
+		}
+	})
+
+	t.Run("cdn ASN uses ASN+domain", func(t *testing.T) {
+		// 13335 = Cloudflare, listed in CdnASNs. Different Cloudflare targets
+		// must not share one row, so the effective domain is part of the key.
+		m := mkMeta("www.cloudflare.com", "1.2.3.4", "13335 Cloudflare")
+		if got := routeKey(m); got != "ASN:13335|www.cloudflare.com" {
+			t.Fatalf("routeKey = %q, want %q", got, "ASN:13335|www.cloudflare.com")
+		}
+	})
+
+	t.Run("cdn random subdomain is collapsed", func(t *testing.T) {
+		// GetEffectiveTarget collapses CDN random subdomains to a wildcard, so
+		// a1b2c3d4.cloudfront.net and xyz.cloudfront.net share a row.
+		m := mkMeta("a1b2c3d4.cloudfront.net", "1.2.3.4", "16509 AmazonCloudFront")
+		if got := routeKey(m); got != "ASN:16509|*.cloudfront.net" {
+			t.Fatalf("routeKey = %q, want %q", got, "ASN:16509|*.cloudfront.net")
+		}
+	})
+
+	t.Run("ip-only traffic falls back to the ip", func(t *testing.T) {
+		// No host: GetEffectiveTarget passes the IP through, and the key still
+		// carries the ASN+domain form when ASN resolution failed.
+		m := mkMeta("", "1.2.3.4", "0")
+		if got := routeKey(m); got != "ASN:0|1.2.3.4" {
+			t.Fatalf("routeKey = %q, want %q", got, "ASN:0|1.2.3.4")
 		}
 	})
 }

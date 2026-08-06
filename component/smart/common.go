@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	OpSaveNodeState         = iota
+	OpSaveNodeState = iota
 	OpSaveStats
 	OpSavePrefetch
 	OpSaveRanking
@@ -27,40 +27,40 @@ const (
 )
 
 const (
-	KeyTypePrefetch         = "prefetch"
-	KeyTypeNode             = "node"
-	KeyTypeStats            = "stats"
-	KeyTypeRanking          = "ranking"
-	KeyTypeHostFailures     = "failures"
-	KeyTypeRoute            = "route"
+	KeyTypePrefetch     = "prefetch"
+	KeyTypeNode         = "node"
+	KeyTypeStats        = "stats"
+	KeyTypeRanking      = "ranking"
+	KeyTypeHostFailures = "failures"
+	KeyTypeRoute        = "route"
 
-	WeightTypeTCP           = "tcp"
-	WeightTypeUDP           = "udp"
-	WeightTypeTCPASN        = "tcp_asn"
-	WeightTypeUDPASN        = "udp_asn"
+	WeightTypeTCP    = "tcp"
+	WeightTypeUDP    = "udp"
+	WeightTypeTCPASN = "tcp_asn"
+	WeightTypeUDPASN = "udp_asn"
 )
 
 const (
-	DefaultMinSampleCount   = 2
+	DefaultMinSampleCount = 2
 
-	MaxTargetsLimit         = 5000
-	MinTargetsLimit         = 500
-	MaxBatchThreshLimit     = 300
-	MinBatchThreshLimit     = 50
+	MaxTargetsLimit     = 5000
+	MinTargetsLimit     = 500
+	MaxBatchThreshLimit = 300
+	MinBatchThreshLimit = 50
 
-	RecordExpiredTime       = 7 * 24 * time.Hour
+	RecordExpiredTime = 7 * 24 * time.Hour
 
-	HostFailureNodeTTL      = 24 * time.Hour
+	HostFailureNodeTTL = 24 * time.Hour
 
-	AllowedWeight           = 0.4
+	AllowedWeight = 0.4
 
-	RankMostUsed            = "MostUsed"
-	RankOccasional          = "OccasionalUsed"
-	RankRarelyUsed          = "RarelyUsed"
+	RankMostUsed   = "MostUsed"
+	RankOccasional = "OccasionalUsed"
+	RankRarelyUsed = "RarelyUsed"
 )
 
 var (
-	db *bbolt.DB
+	db               *bbolt.DB
 	bucketSmartStats = []byte("smart_stats")
 
 	globalOperationQueue atomic.TypedValue[[]StoreOperation]
@@ -110,8 +110,24 @@ var CdnASNs = map[string]bool{
 	"8452":   true, // Infospace
 }
 
+// AsnOf extracts the numeric ASN from a DstIPASN value.
+//
+// DstIPASN holds either "ASN orgname" (e.g. "13335 Cloudflare"), "0" (ASN
+// lookup failed — see getASNCode), or "" (never resolved).  It returns the
+// numeric part on success and "0" when no usable ASN is available, so callers
+// can branch on asn == "0" without distinguishing the empty/failed cases.
+func AsnOf(dstIPASN string) string {
+	if dstIPASN == "" || dstIPASN == "unknown" {
+		return "0"
+	}
+	if idx := strings.IndexByte(dstIPASN, ' '); idx >= 0 {
+		return dstIPASN[:idx]
+	}
+	return dstIPASN
+}
+
 type (
-	Store struct {}
+	Store struct{}
 
 	StoreOperation struct {
 		Type   int
@@ -412,7 +428,7 @@ func GetSystemMemoryUsage() float64 {
 	return 0.5
 }
 
-func InitQueue()  {
+func InitQueue() {
 	threshold := GetBatchSaveThreshold()
 	emptyQueue := make([]StoreOperation, 0, threshold)
 	replaceGlobalQueue(emptyQueue)
