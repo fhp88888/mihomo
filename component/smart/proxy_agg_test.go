@@ -89,7 +89,6 @@ func TestAggregateByProxyEmpty(t *testing.T) {
 }
 
 // TestAggregateFeedsBlendedScore verifies that the aggregation pushes back into
-// TestAggregateFeedsBlendedScore verifies that the aggregation pushes back into
 // the route table and the proxy-wise component of the blended score picks it up.
 func TestAggregateFeedsBlendedScore(t *testing.T) {
 	rt := NewRouteTable(100)
@@ -106,7 +105,7 @@ func TestAggregateFeedsBlendedScore(t *testing.T) {
 	// Before any aggregation: proxy-wise absent -> raw unblended score.
 	rt.RefreshScores(key, []string{"p1"})
 	snap := rt.Snapshot("test")
-	pre := snap.Rows[0].Proxies["p1"].Attributes.Score
+	pre := rowByKey(t, snap, key).Proxies["p1"].Attributes.Score
 	atom := calculateScoreAtom(50, 0, 0, 0, 0)
 	if math.Abs(pre-atom) > 0.000001 {
 		t.Fatalf("expected pre-aggregation score atom=%.6f, got %.6f", atom, pre)
@@ -118,13 +117,26 @@ func TestAggregateFeedsBlendedScore(t *testing.T) {
 		t.Fatalf("expected single p1 aggregation, got %+v", agg.Proxies)
 	}
 
-	// After: blended = atom*0.7 + atom(proxy-wise=75)*0.3 — distinct from atom.
+	// After: blended latency = 50*0.7 + 75*0.3 = 57.5, then a single atom call.
 	rt.RefreshScores(key, []string{"p1"})
 	snap = rt.Snapshot("test")
-	post := snap.Rows[0].Proxies["p1"].Attributes.Score
-	atomP := calculateScoreAtom(75, 0, 0, 0, 0)
-	want := atom*0.7 + atomP*0.3
+	post := rowByKey(t, snap, key).Proxies["p1"].Attributes.Score
+	want := calculateScoreAtom(50*7/10+75*3/10, 0, 0, 0, 0)
 	if math.Abs(post-want) > 0.000001 {
 		t.Fatalf("expected blended score %.6f, got %.6f", want, post)
 	}
+}
+
+// rowByKey returns the row snapshot for key, so tests don't depend on the
+// snapshot's LastUsed ordering (rows created in the same second tie, making
+// Rows[0] non-deterministic).
+func rowByKey(t *testing.T, snap TableSnapshot, key string) RowSnapshot {
+	t.Helper()
+	for _, r := range snap.Rows {
+		if r.Key == key {
+			return r
+		}
+	}
+	t.Fatalf("row %q not found in snapshot (%d rows)", key, len(snap.Rows))
+	return RowSnapshot{}
 }
