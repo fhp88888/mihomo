@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sort"
 	"syscall"
 	"testing"
 
@@ -223,4 +224,163 @@ func TestRouteKey(t *testing.T) {
 			t.Fatalf("routeKey = %q, want %q", got, "TARGET:1.2.3.4")
 		}
 	})
+}
+
+// =========================================================================
+// exploreOrder tests
+// =========================================================================
+
+// seededProxyNames returns the names in the order they appear in ps.
+func orderedNames(ps []C.Proxy) []string {
+	out := make([]string, len(ps))
+	for i, p := range ps {
+		out[i] = p.Name()
+	}
+	return out
+}
+
+// hasDupNames reports whether the name slice contains the same name twice.
+func hasDupNames(names []string) bool {
+	seen := make(map[string]bool, len(names))
+	for _, n := range names {
+		if seen[n] {
+			return true
+		}
+		seen[n] = true
+	}
+	return false
+}
+
+// TestExploreOrder_DeferredLast verifies that proxies with FailedCount > 0 or
+// pkg-loss above the threshold are placed at the very end, never in the top
+// exploration tier.
+func TestExploreOrder_DeferredLast(t *testing.T) {
+	rt := smart.NewRouteTable(10)
+	rt.SetProxyAttrs(map[string]smart.ProxyAttributes{
+		"good":    {Score: 5.0},
+		"deferred": {Score: 6.0, FailedCount: 1.0}, // high score but failed
+		"lossy":   {Score: 4.0, PkgLoss: 0.3},      // high pkg loss
+	})
+	s := &Smart{routeTable: rt, testUrl: "test"}
+
+	proxies := makeStubProxies("good", "deferred", "lossy")
+	ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com")
+
+	names := orderedNames(ordered)
+	if len(names) != 3 || hasDupNames(names) {
+		t.Fatalf("expected 3 unique proxies, got %v", names)
+	}
+	// deferred/lossy must both be after every non-deferred proxy.
+	if names[0] != "good" {
+		t.Fatalf("expected first candidate good, got %v", names)
+	}
+	if names[1] == "good" || names[2] == "good" {
+		t.Fatalf("good must be first (no deferral), got %v", names)
+	}
+}
+
+// TestExploreOrder_UnsampledUsesNeutral verifies that proxies absent from the
+// aggregation stay in the candidate pool (they do not get dropped) and that
+// they are not all squeezed to the very end — they participate via the median
+// score.
+func TestExploreOrder_UnsampledUsesNeutral(t *testing.T) {
+	rt := smart.NewRouteTable(10)
+	// Sampled proxies have wide scores; the median is (2+10)/2 = 6.
+	rt.SetProxyAttrs(map[string]smart.ProxyAttributes{
+		"a": {Score: 2.0},
+		"b": {Score: 10.0},
+	})
+	s := &Smart{routeTable: rt, testUrl: "test"}
+
+	proxies := makeStubProxies("a", "b", "unsampled")
+	ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com")
+	names := orderedNames(ordered)
+
+	if len(names) != 3 || hasDupNames(names) {
+		t.Fatalf("expected all 3 proxies in the pool, got %v", names)
+	}
+	// unsampled uses the neutral median 6, so it sorts between a(2) and b(10).
+	// It must not be last unless b(10) is also before it.
+	idx := func(n string) int {
+		for i, x := range names {
+			if x == n {
+				return i
+			}
+		}
+		t.Fatalf("proxy %q not in explore order %v", n, names)
+		return -1
+	}
+	if idx("b") > idx("unsampled") {
+		t.Fatalf("b(10) must sort before unsampled(neutral 6), got %v", names)
+	}
+	if idx("unsampled") > idx("a") {
+		t.Fatalf("unsampled(neutral 6) must sort before a(2), got %v", names)
+	}
+}
+
+// TestExploreOrder_TopShuffledOnlyForLargePool verifies that the top tier is
+// only shuffled when the pool is bigger than exploreBatch, and that deferred
+// proxies are never pulled forward by the shuffle.
+func TestExploreOrder_TopShuffledOnlyForLargePool(t *testing.T) {
+	rt := smart.NewRouteTable(10)
+	attrs := make(map[string]smart.ProxyAttributes, 8)
+	for i := 0; i < 8; i++ {
+		name := string(rune('a' + i))
+		attrs[name] = smart.ProxyAttributes{Score: float64(8 - i)}
+	}
+	attrs["z"] = smart.ProxyAttributes{Score: 100, FailedCount: 1} // deferred
+	rt.SetProxyAttrs(attrs)
+	s := &Smart{routeTable: rt, testUrl: "test"}
+
+	makeAll := func() []C.Proxy {
+		names := make([]string, 0, 9)
+		for i := 0; i < 8; i++ {
+			names = append(names, string(rune('a'+i)))
+		}
+		names = append(names, "z")
+		return makeStubProxies(names...)
+	}
+
+	// The deferred proxy z must always be last across many runs, and the
+	// non-deferred tier must only ever be a permutation of the same 8.
+	for i := 0; i < 20; i++ {
+		proxies := makeAll()
+		ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com")
+		names := orderedNames(ordered)
+		if len(names) != 9 || hasDupNames(names) {
+			t.Fatalf("expected 9 unique proxies, got %v", names)
+		}
+		if names[8] != "z" {
+			t.Fatalf("deferred z must always be last, got %v", names)
+		}
+		nonDeferred := names[:8]
+		sorted := append([]string(nil), nonDeferred...)
+		sort.Strings(sorted)
+		want := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
+		for j := range want {
+			if sorted[j] != want[j] {
+				t.Fatalf("non-deferred tier must be a permutation of the 8 candidates, got %v", nonDeferred)
+			}
+		}
+	}
+}
+
+// TestExploreOrder_EmptyAggregationFallsBack verifies that an empty
+// aggregation (cold start) falls back to the latency PreRankLatency order.
+func TestExploreOrder_EmptyAggregationFallsBack(t *testing.T) {
+	rt := smart.NewRouteTable(10)
+	const key = "TARGET:example.com"
+	// Seed per-key latency so PreRankLatency sorts deterministically (without
+	// per-key data it shuffles to avoid always favoring the same proxy).
+	rt.UpdateLatency(key, "slow", 300)
+	rt.UpdateLatency(key, "fast", 50)
+	s := &Smart{routeTable: rt, testUrl: "test"}
+
+	proxies := makeStubProxies("slow", "fast")
+	ordered := s.exploreOrder(proxies, proxies, key)
+	names := orderedNames(ordered)
+	// Stable pre-rank by per-key latency: fast(50) before slow(300).
+	if len(names) != 2 || names[0] != "fast" || names[1] != "slow" {
+		t.Fatalf("expected fallback latency order [fast slow], got %v", names)
+	}
 }

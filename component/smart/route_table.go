@@ -253,13 +253,13 @@ func (rt *RouteTable) calculateScore(proxy string, latency int64, speed, pkgLoss
 		// per-target score unblended.
 		return calculateScoreAtom(latency, speed, pkgLoss, failedCount, jitter)
 	}
-	// proxy wise * 0.3 + per-target * 0.7
+
 	return calculateScoreAtom(
-		latency*7/10+attrs.Latency*3/10,
-		speed*0.7+attrs.Speed*0.3,
-		pkgLoss*0.7+attrs.PkgLoss*0.3,
+		latency,
+		speed,
+		math.Max(pkgLoss, attrs.PkgLoss),
 		math.Max(failedCount, attrs.FailedCount),
-		jitter*0.7+attrs.Jitter*0.3,
+		jitter,
 	)
 }
 

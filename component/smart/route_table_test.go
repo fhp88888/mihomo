@@ -219,13 +219,21 @@ func TestCalculateScoreBlend(t *testing.T) {
 		t.Fatalf("expected unblended score %.6f (atom), got %.6f", atom, got)
 	}
 
-	// Proxy-wise present: latency=200 -> blended latency = 100*0.7 + 200*0.3 = 130.
-	// The atom is computed once on the blended metrics.
+	// Proxy-wise present: latency keeps its raw per-target value (not blended).
 	rt.proxyAttrs["proxy-a"] = ProxyAttributes{Latency: 200}
 	got = rt.calculateScore("proxy-a", 100, 0, 0, 0, 0)
-	want := calculateScoreAtom(130, 0, 0, 0, 0)
+	if math.Abs(got-atom) > 0.000001 {
+		t.Fatalf("expected latency-unblended score %.6f (atom), got %.6f", atom, got)
+	}
+
+	// Proxy-wise degradation applies a floor to the blended penalties: speed
+	// takes the min, pkg-loss/failed-count/jitter take the max across
+	// target and proxy-wise values.
+	rt.proxyAttrs["proxy-a"] = ProxyAttributes{Speed: 100, PkgLoss: 0.2, FailedCount: 2, Jitter: 30}
+	got = rt.calculateScore("proxy-a", 100, 1048576, 0.05, 0, 0)
+	want := calculateScoreAtom(100, math.Min(1048576, 100), math.Max(0.05, 0.2), math.Max(0, 2), math.Max(0, 30))
 	if math.Abs(got-want) > 0.000001 {
-		t.Fatalf("expected blended score %.6f, got %.6f", want, got)
+		t.Fatalf("expected worst-case-blended score %.6f, got %.6f", want, got)
 	}
 
 	// Proxy-wise lookup MISS: proxy-b is not in the aggregation table even

@@ -70,12 +70,19 @@ func makeStubProxies(names ...string) []C.Proxy {
 }
 
 // =========================================================================
-// parallelDial tests
+// probeBatch error-classification tests
+//
+// These cover the semantics that parallelDial used to own: fatal
+// (target-level) errors must surface and not penalize the proxy, while
+// node-level errors are MarkFailed.  parallelDial is gone; the classification
+// now lives inside probeBatch's race onFail hook, so these tests drive
+// probeBatch directly.
 // =========================================================================
 
-func TestParallelDial_ErrorsJoin_PreservesSentinel(t *testing.T) {
+func TestProbeBatch_ErrorsJoin_PreservesSentinel(t *testing.T) {
 	pc := NewProbeCoordinator()
 	defer pc.Close()
+	rt := smart.NewRouteTable(10)
 
 	proxies := makeStubProxies("p1", "p2", "p3")
 
@@ -91,9 +98,10 @@ func TestParallelDial_ErrorsJoin_PreservesSentinel(t *testing.T) {
 		return nil, 0, nil
 	}
 
-	result, _, _ := pc.parallelDial(
+	result := pc.probeBatch(
 		context.Background(), "TARGET:example.com",
-		proxies, &C.Metadata{}, singleDial, nil,
+		proxies, &C.Metadata{}, []string{"p1", "p2", "p3"},
+		singleDial, rt,
 	)
 
 	if result.err == nil {
@@ -107,9 +115,10 @@ func TestParallelDial_ErrorsJoin_PreservesSentinel(t *testing.T) {
 	}
 }
 
-func TestParallelDial_ErrorsJoin_WrappedSentinel(t *testing.T) {
+func TestProbeBatch_ErrorsJoin_WrappedSentinel(t *testing.T) {
 	pc := NewProbeCoordinator()
 	defer pc.Close()
+	rt := smart.NewRouteTable(10)
 
 	proxies := makeStubProxies("p1", "p2")
 
@@ -117,9 +126,10 @@ func TestParallelDial_ErrorsJoin_WrappedSentinel(t *testing.T) {
 		return nil, 0, fmt.Errorf("resolve failed: %w", resolver.ErrIPNotFound)
 	}
 
-	result, _, _ := pc.parallelDial(
+	result := pc.probeBatch(
 		context.Background(), "TARGET:example.com",
-		proxies, &C.Metadata{}, singleDial, nil,
+		proxies, &C.Metadata{}, []string{"p1", "p2"},
+		singleDial, rt,
 	)
 
 	if result.err == nil {
@@ -130,9 +140,10 @@ func TestParallelDial_ErrorsJoin_WrappedSentinel(t *testing.T) {
 	}
 }
 
-func TestParallelDial_ErrorsJoin_NoSentinel(t *testing.T) {
+func TestProbeBatch_ErrorsJoin_NoSentinel(t *testing.T) {
 	pc := NewProbeCoordinator()
 	defer pc.Close()
+	rt := smart.NewRouteTable(10)
 
 	proxies := makeStubProxies("p1", "p2")
 
@@ -140,9 +151,10 @@ func TestParallelDial_ErrorsJoin_NoSentinel(t *testing.T) {
 		return nil, 10, fmt.Errorf("network timeout")
 	}
 
-	result, _, _ := pc.parallelDial(
+	result := pc.probeBatch(
 		context.Background(), "TARGET:example.com",
-		proxies, &C.Metadata{}, singleDial, nil,
+		proxies, &C.Metadata{}, []string{"p1", "p2"},
+		singleDial, rt,
 	)
 
 	if result.err == nil {
@@ -153,9 +165,10 @@ func TestParallelDial_ErrorsJoin_NoSentinel(t *testing.T) {
 	}
 }
 
-func TestParallelDial_ReturnsDialResults_AllFailed(t *testing.T) {
+func TestProbeBatch_AllFailed_NodeLevel(t *testing.T) {
 	pc := NewProbeCoordinator()
 	defer pc.Close()
+	rt := smart.NewRouteTable(10)
 
 	proxies := makeStubProxies("p1", "p2", "p3")
 
@@ -163,38 +176,29 @@ func TestParallelDial_ReturnsDialResults_AllFailed(t *testing.T) {
 		return nil, 0, fmt.Errorf("fail: %s", p.Name())
 	}
 
-	_, _, dialResults := pc.parallelDial(
+	result := pc.probeBatch(
 		context.Background(), "TARGET:example.com",
-		proxies, &C.Metadata{}, singleDial, nil,
+		proxies, &C.Metadata{}, []string{"p1", "p2", "p3"},
+		singleDial, rt,
 	)
 
-	if len(dialResults) != 3 {
-		t.Fatalf("expected 3 dial results, got %d", len(dialResults))
-	}
-	for _, dr := range dialResults {
-		if dr.err == nil {
-			t.Fatalf("expected all results to have errors, but %s succeeded", dr.proxy.Name())
-		}
+	if result.err == nil {
+		t.Fatal("expected error when every proxy failed, got nil")
 	}
 }
 
-func TestParallelDial_EmptyBatch(t *testing.T) {
+func TestProbeBatch_EmptyBatch(t *testing.T) {
 	pc := NewProbeCoordinator()
 	defer pc.Close()
 
-	result, metrics, dialResults := pc.parallelDial(
+	result := pc.probeBatch(
 		context.Background(), "TARGET:x",
-		nil, &C.Metadata{}, nil, nil,
+		nil, &C.Metadata{}, nil,
+		nil, nil,
 	)
 
 	if result.err == nil {
 		t.Fatal("expected error for empty batch")
-	}
-	if metrics != nil {
-		t.Error("metrics should be nil for empty batch")
-	}
-	if dialResults != nil {
-		t.Error("dialResults should be nil for empty batch")
 	}
 }
 
@@ -497,9 +501,10 @@ func TestStaggeredTCPFallback_ParentCancellationStopsScheduling(t *testing.T) {
 	}
 }
 
-func TestParallelDial_ReturnsDialResults_Success(t *testing.T) {
+func TestProbeBatch_ReturnsWinner_Success(t *testing.T) {
 	pc := NewProbeCoordinator()
 	defer pc.Close()
+	rt := smart.NewRouteTable(10)
 
 	proxies := makeStubProxies("p1", "p2", "p3")
 
@@ -516,9 +521,10 @@ func TestParallelDial_ReturnsDialResults_Success(t *testing.T) {
 		return nil, 0, nil
 	}
 
-	result, _, dialResults := pc.parallelDial(
+	result := pc.probeBatch(
 		context.Background(), "TARGET:example.com",
-		proxies, &C.Metadata{}, singleDial, nil,
+		proxies, &C.Metadata{}, []string{"p1", "p2", "p3"},
+		singleDial, rt,
 	)
 
 	if result.err != nil {
@@ -526,22 +532,6 @@ func TestParallelDial_ReturnsDialResults_Success(t *testing.T) {
 	}
 	if result.proxy.Name() != "p2" {
 		t.Fatalf("expected winner p2, got %s", result.proxy.Name())
-	}
-	// The production contract is "first success returns immediately",
-	// so the winner may be the only result in dialResults.  Verify
-	// that the winner is present rather than asserting a minimum count.
-	if len(dialResults) < 1 {
-		t.Fatal("expected at least 1 dial result (the winner), got 0")
-	}
-	foundWinner := false
-	for _, dr := range dialResults {
-		if dr.err == nil && dr.proxy.Name() == "p2" {
-			foundWinner = true
-			break
-		}
-	}
-	if !foundWinner {
-		t.Error("p2 should be in dialResults as the winner")
 	}
 }
 

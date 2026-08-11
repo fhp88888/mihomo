@@ -89,41 +89,42 @@ func TestAggregateByProxyEmpty(t *testing.T) {
 }
 
 // TestAggregateFeedsBlendedScore verifies that the aggregation pushes back into
-// the route table and the proxy-wise component of the blended score picks it up.
+// the route table and the proxy-wise component of the score picks it up.
 func TestAggregateFeedsBlendedScore(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:100|example.com"
 
-	// Two rows on the same proxy; heavy use on the low-latency one.
-	rt.UpdateLatency(key, "p1", 50)
+	// Two rows on the same proxy; heavy use on the low-latency one.  Use
+	// latencies well above the 100ms score floor so the values discriminate.
+	rt.UpdateLatency(key, "p1", 150)
 	for i := 0; i < 3; i++ {
 		rt.IncrementUseCount(key, "p1")
 	}
-	rt.UpdateLatency("ASN:200", "p1", 150)
+	rt.UpdateLatency("ASN:200", "p1", 450)
 	rt.IncrementUseCount("ASN:200", "p1")
 
 	// Before any aggregation: proxy-wise absent -> raw unblended score.
 	rt.RefreshScores(key, []string{"p1"})
 	snap := rt.Snapshot("test")
 	pre := rowByKey(t, snap, key).Proxies["p1"].Attributes.Score
-	atom := calculateScoreAtom(50, 0, 0, 0, 0)
+	atom := calculateScoreAtom(150, 0, 0, 0, 0)
 	if math.Abs(pre-atom) > 0.000001 {
 		t.Fatalf("expected pre-aggregation score atom=%.6f, got %.6f", atom, pre)
 	}
 
-	// Aggregate: p1 proxy-wise latency = (50*3/4 + 150*1/4) / (3/4+1/4) = 75.
+	// Aggregate: p1 proxy-wise latency = (150*3/4 + 450*1/4) / (3/4+1/4) = 225.
 	agg := rt.AggregateByProxy()
 	if len(agg.Proxies) != 1 || agg.Proxies[0].Name != "p1" {
 		t.Fatalf("expected single p1 aggregation, got %+v", agg.Proxies)
 	}
 
-	// After: blended latency = 50*0.7 + 75*0.3 = 57.5, then a single atom call.
+	// After: latency stays raw (150, NOT blended toward the proxy-wise 225),
+	// so the score is unchanged from the pre-aggregation atom.
 	rt.RefreshScores(key, []string{"p1"})
 	snap = rt.Snapshot("test")
 	post := rowByKey(t, snap, key).Proxies["p1"].Attributes.Score
-	want := calculateScoreAtom(50*7/10+75*3/10, 0, 0, 0, 0)
-	if math.Abs(post-want) > 0.000001 {
-		t.Fatalf("expected blended score %.6f, got %.6f", want, post)
+	if math.Abs(post-atom) > 0.000001 {
+		t.Fatalf("expected latency-unblended score %.6f, got %.6f", atom, post)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -29,6 +30,14 @@ const (
 	// before the first byte within this window is very likely a dead proxy,
 	// not a target-level rejection that simply took longer to surface.
 	smartEarlyDeathLatencyLimit = 5 * time.Second
+	// exploreBatch is the number of top-quality candidates dialed first in a
+	// discovery wave.  When the candidate set is larger than this, the
+	// quality-best candidates are shuffled before dialing so we don't always
+	// dial the same proxy first.
+	exploreBatch = 4
+	// highLossThreshold is the aggregated pkg-loss EMA above which a proxy is
+	// treated as low-quality for discovery ordering (deferred to the end).
+	highLossThreshold = 0.1
 )
 
 // routeKey returns the route table key for a connection's metadata.
@@ -144,6 +153,47 @@ func (s *Smart) staggeredTCPFallback(ctx context.Context, metadata *C.Metadata, 
 		return nil, nil
 	}
 
+	winner, conn, connectTime, err := raceStaggered(ctx, key, ordered, nil,
+		// Fallback dials go through dialTCP, which records a genuine dial
+		// failure as MarkFailed.
+		func(dialCtx context.Context, proxy C.Proxy) (C.Conn, int64, error) {
+			return s.dialTCP(dialCtx, proxy, metadata, key)
+		},
+		// onConnect: successful dials (winner + late successful losers) each
+		// contribute a latency sample.
+		func(proxyName string, connectTime int64) {
+			s.routeTable.UpdateLatency(key, proxyName, connectTime)
+		},
+		// onFail: dialTCP already handles MarkFailed for genuine failures, so
+		// the fallback has nothing to add for failures.
+		nil,
+		// onWinner: promote the winner to best proxy and mark the route
+		// probed.  The winner's latency is already sampled via onConnect.
+		func(proxy C.Proxy, connectTime int64) {
+			s.routeTable.IncrementUseCount(key, proxy.Name())
+			s.routeTable.SetBestProxy(key, proxy.Name())
+			s.routeTable.SetTCPProbed(key)
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if conn == nil {
+		return nil, nil
+	}
+	return s.wrapTCPConn(conn, winner, metadata, connectTime), nil
+}
+
+func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.WaitGroup,
+	dial func(context.Context, C.Proxy) (C.Conn, int64, error),
+	onConnect func(proxyName string, connectTime int64),
+	onFail func(proxy C.Proxy, err error),
+	onWinner func(proxy C.Proxy, connectTime int64),
+) (C.Proxy, C.Conn, int64, error) {
+	if len(ordered) == 0 {
+		return nil, nil, 0, nil
+	}
+
 	raceCtx, cancelRace := context.WithCancel(ctx)
 	defer cancelRace()
 
@@ -158,23 +208,42 @@ func (s *Smart) staggeredTCPFallback(ctx context.Context, metadata *C.Metadata, 
 		go func() {
 			defer workers.Done()
 			dialCtx, dialCancel := context.WithTimeout(raceCtx, C.DefaultTCPTimeout)
-			conn, connectTime, err := s.dialTCP(dialCtx, proxy, metadata, key)
+			conn, connectTime, err := dial(dialCtx, proxy)
 			dialCancel()
 			results <- dialResult{proxy: proxy, conn: conn, connectTime: connectTime, err: err}
 		}()
 	}
 
-	stopAndDrain := func() {
-		cancelRace()
-		for received < launched {
+	// drain consumes n results, closing successful connections and feeding
+	// onConnect.  It runs from the select-loop goroutine only.
+	drain := func(n int) {
+		for i := 0; i < n; i++ {
 			result := <-results
-			received++
 			if result.err == nil && result.conn != nil {
-				s.routeTable.UpdateLatency(key, result.proxy.Name(), result.connectTime)
+				onConnect(result.proxy.Name(), result.connectTime)
 				result.conn.Close()
 			}
 		}
-		workers.Wait()
+	}
+
+	// stopAndDrain cancels in-flight dials and clears the remaining results.
+	// With wg nil it does so synchronously (deterministic, fallback).  With wg
+	// set it hands the drain to a background goroutine so the caller can return
+	// the winner immediately (discovery hot path).
+	stopAndDrain := func() {
+		cancelRace()
+		remaining := launched - received
+		if wg == nil {
+			drain(remaining)
+			workers.Wait()
+			return
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			drain(remaining)
+			workers.Wait()
+		}()
 	}
 
 	launch(ordered[0])
@@ -197,17 +266,20 @@ func (s *Smart) staggeredTCPFallback(ctx context.Context, metadata *C.Metadata, 
 			received++
 			if result.err == nil {
 				log.Infoln("[Smart] tcpRoute key=%s STAGGERED-OK proxy=%s", key, result.proxy.Name())
-				s.routeTable.UpdateLatency(key, result.proxy.Name(), result.connectTime)
-				s.routeTable.IncrementUseCount(key, result.proxy.Name())
-				s.routeTable.SetBestProxy(key, result.proxy.Name())
-				s.routeTable.SetTCPProbed(key)
+				onConnect(result.proxy.Name(), result.connectTime)
+				if onWinner != nil {
+					onWinner(result.proxy, result.connectTime)
+				}
 				stopAndDrain()
-				return s.wrapTCPConn(result.conn, result.proxy, metadata, result.connectTime), nil
+				return result.proxy, result.conn, result.connectTime, nil
 			}
 			log.Debugln("[Smart] tcpRoute key=%s STAGGERED-FAIL proxy=%s err=%v", key, result.proxy.Name(), result.err)
+			if onFail != nil {
+				onFail(result.proxy, result.err)
+			}
 			if tunnel.ShouldStopRetry(result.err) {
 				stopAndDrain()
-				return nil, result.err
+				return nil, nil, 0, result.err
 			}
 		case <-timerC:
 			launch(ordered[next])
@@ -219,11 +291,11 @@ func (s *Smart) staggeredTCPFallback(ctx context.Context, metadata *C.Metadata, 
 			}
 		case <-ctx.Done():
 			stopAndDrain()
-			return nil, ctx.Err()
+			return nil, nil, 0, ctx.Err()
 		}
 	}
 
-	return nil, nil
+	return nil, nil, 0, nil
 }
 
 // dialTCP dials a known proxy and records a genuine dial failure.
@@ -279,22 +351,17 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 		return nil, errors.New("no alive proxies available")
 	}
 
-	// Pre-rank using per-key latency (not cross-row) to avoid bias from other targets
-	names := make([]string, len(available))
-	for i, p := range available {
-		names[i] = p.Name()
-	}
-	preRanked := s.routeTable.PreRankLatency(names, func(proxyName string) uint16 {
-		for _, p := range proxies {
-			if p.Name() == proxyName {
-				return p.LastDelayForTestUrl(s.testUrl)
-			}
-		}
-		return 0xffff
-	}, key)
+	// Build the exploration order.  The aggregated per-proxy quality (latency,
+	// speed, pkg loss, failed count, jitter fused into one Score by
+	// AggregateByProxy) decides who gets dialed first, with a randomized
+	// shuffle inside the best candidates so we don't always dial the same
+	// proxy first.  Proxies with no aggregation samples yet (e.g. a quality
+	// node that rarely wins and thus is never sampled) are kept in the
+	// candidate pool with a neutral score so they still get discovered.
+	names := namesOf(available)
+	ordered := s.exploreOrder(available, proxies, key)
 
-	log.Infoln("[Smart] discoverAndRoute key=%s PRE-RANK %s preRanked=%v",
-		key, s.routeTable.DebugDumpRow(key), preRanked)
+	log.Infoln("[Smart] discoverAndRoute key=%s EXPLORE-ORDER %v", key, namesOf(ordered))
 
 	// Refresh scores and dump them for decision traceability
 	s.routeTable.RefreshScores(key, names)
@@ -303,7 +370,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 
 	// Concurrent discovery through probe coordinator
 	proxy, conn, connectTime, err := s.probeCoordinator.Discover(
-		ctx, key, available, metadata, preRanked,
+		ctx, key, available, metadata, namesOf(ordered),
 		func(ctx context.Context, p C.Proxy, m *C.Metadata, start time.Time) (C.Conn, int64, error) {
 			dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
 			conn, err := p.DialContext(dialCtx, m)
@@ -335,6 +402,117 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	s.routeTable.SetTCPProbed(key)
 
 	return s.wrapTCPConn(conn, proxy, metadata, connectTime), nil
+}
+
+func (s *Smart) exploreOrder(available []C.Proxy, proxies []C.Proxy, key string) []C.Proxy {
+	attrs := s.routeTable.ProxyAttrsSnapshot()
+	if len(attrs) == 0 {
+		names := namesOf(available)
+		preRanked := s.routeTable.PreRankLatency(names, func(proxyName string) uint16 {
+			for _, p := range proxies {
+				if p.Name() == proxyName {
+					return p.LastDelayForTestUrl(s.testUrl)
+				}
+			}
+			return 0xffff
+		}, key)
+		return orderByNames(available, preRanked)
+	}
+
+	// Neutral score: median of the sampled proxies' Scores.
+	var sampled []float64
+	for _, a := range attrs {
+		sampled = append(sampled, a.Score)
+	}
+	median := median(sampled)
+
+	type cand struct {
+		proxy    C.Proxy
+		score    float64
+		deferred bool
+	}
+	cands := make([]cand, 0, len(available))
+	for _, p := range available {
+		a, ok := attrs[p.Name()]
+		score := median
+		if ok {
+			score = a.Score
+		}
+		cands = append(cands, cand{
+			proxy:    p,
+			score:    score,
+			deferred: ok && (a.FailedCount > 0 || a.PkgLoss > highLossThreshold),
+		})
+	}
+
+	// Sort: deferred last; otherwise Score descending; ties by name.
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].deferred != cands[j].deferred {
+			return !cands[i].deferred
+		}
+		if cands[i].score != cands[j].score {
+			return cands[i].score > cands[j].score
+		}
+		return cands[i].proxy.Name() < cands[j].proxy.Name()
+	})
+
+	// Shuffle the best exploreBatch non-deferred candidates so the dial order
+	// within the top quality tier is randomized (exploration).  This only kicks
+	// in when the pool is bigger than exploreBatch — a small pool keeps its
+	// deterministic quality order.  Deferred proxies stay at the end — they are
+	// the last-resort tier and must not be pulled forward by the shuffle.
+	nonDeferred := 0
+	for i := range cands {
+		if !cands[i].deferred {
+			nonDeferred++
+		}
+	}
+	if nonDeferred > exploreBatch {
+		rand.Shuffle(exploreBatch, func(i, j int) {
+			cands[i], cands[j] = cands[j], cands[i]
+		})
+	}
+
+	out := make([]C.Proxy, 0, len(cands))
+	for i := range cands {
+		out = append(out, cands[i].proxy)
+	}
+	return out
+}
+
+func namesOf(ps []C.Proxy) []string {
+	out := make([]string, len(ps))
+	for i, p := range ps {
+		out[i] = p.Name()
+	}
+	return out
+}
+
+func orderByNames(ps []C.Proxy, names []string) []C.Proxy {
+	byName := make(map[string]C.Proxy, len(ps))
+	for _, p := range ps {
+		byName[p.Name()] = p
+	}
+	out := make([]C.Proxy, 0, len(names))
+	for _, name := range names {
+		if p, ok := byName[name]; ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func median(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sorted := append([]float64(nil), vals...)
+	sort.Float64s(sorted)
+	mid := len(sorted) / 2
+	if len(sorted)%2 == 1 {
+		return sorted[mid]
+	}
+	return (sorted[mid-1] + sorted[mid]) / 2
 }
 
 // wrapTCPConn wraps a TCP connection with close-callback to collect latency (TTFB), pkg_loss and speed.
