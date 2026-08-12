@@ -633,7 +633,7 @@ func (s *Smart) checkResetByPeer(key, proxyName string, readErr error) {
 	if readErr == nil || !errors.Is(readErr, syscall.ECONNRESET) {
 		return
 	}
-	s.routeTable.MarkFailed(key, proxyName, 0.2)
+	s.routeTable.MarkFailed(key, proxyName, 0.4)
 	log.Debugln("[Smart] RST mark-failed key=%s proxy=%s err=%v", key, proxyName, readErr)
 }
 
@@ -656,7 +656,7 @@ func (s *Smart) checkEarlyDeath(key, proxyName string, readErr error, firstReadL
 			return
 		}
 	}
-	s.routeTable.MarkFailed(key, proxyName, 0.6)
+	s.routeTable.MarkFailed(key, proxyName, 0.8)
 	log.Debugln("[Smart] EARLY-DEATH mark-failed key=%s proxy=%s firstReadLat=%dms err=%v",
 		key, proxyName, firstReadLatencyMs, readErr)
 }

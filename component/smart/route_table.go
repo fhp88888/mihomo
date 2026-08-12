@@ -247,20 +247,7 @@ func calculateScoreAtom(latency int64, speed float64, pkgLoss float64, failedCou
 }
 
 func (rt *RouteTable) calculateScore(proxy string, latency int64, speed, pkgLoss, failedCount, jitter float64) float64 {
-	attrs, ok := rt.proxyAttrs[proxy]
-	if !ok {
-		// No aggregation yet (cold start, new proxy) -> use the raw
-		// per-target score unblended.
-		return calculateScoreAtom(latency, speed, pkgLoss, failedCount, jitter)
-	}
-
-	return calculateScoreAtom(
-		latency,
-		speed,
-		math.Max(pkgLoss, attrs.PkgLoss),
-		math.Max(failedCount, attrs.FailedCount),
-		jitter,
-	)
+	return calculateScoreAtom(latency, speed, pkgLoss, failedCount, jitter)
 }
 
 // RefreshScores updates non-EMA scores for existing proxy samples in a route row.
