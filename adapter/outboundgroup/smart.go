@@ -1482,9 +1482,10 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	// 额外检查和权重调整
 	// 不再进行强制权重调整，仅在异常时对特定域名屏蔽节点，防止优秀节点被整个 target 完全屏蔽
+	totalSamples := atomicRecord.Get("success").(int64) + atomicRecord.Get("failure").(int64)
 	adjWeight, isDegraded, checked, blockCode := s.checkNodeQuality(
 		err, metadata, proxy, wildcardTarget,
-		addressDisplay, proxyName, calculatedWeight, oldWeight,
+		addressDisplay, proxyName, calculatedWeight, oldWeight, totalSamples,
 		connectionDuration, uploadTotalMB, downloadTotalMB,
 		networkStr, asnInfo, isUDP)
 
@@ -1579,7 +1580,7 @@ func (s *Smart) registerPacketClosureMetricsCallback(pc C.PacketConn, proxy C.Pr
 func (s *Smart) checkNodeQuality(
 	err error, metadata *C.Metadata, proxy C.Proxy, wildcardTarget string,
 	addressDisplay, proxyName string,
-	newWeight, oldWeight float64,
+	newWeight, oldWeight float64, totalSamples int64,
 	connectionDuration int64, uploadTotal, downloadTotal float64,
 	networkType string, asnInfo string, isUDP bool) (float64, bool, bool, int64) {
 
@@ -1605,7 +1606,11 @@ func (s *Smart) checkNodeQuality(
 		return newWeight, false, false, 0
 	}
 
-	if newWeight < smart.AllowedWeight {
+	// 冷启动：样本数不足时 CalculateWeight 恒返回 0（见 weight.go），不代表节点降级。
+	// 否则新域名首次访问的节点会被误判 code5 屏蔽 24h，并连带中断同域名其他在途连接，
+	// 导致页面首开失败、需要刷新一次才能恢复。
+	// 失败连接会走下方 code 3 累计屏蔽，成功连接按后续检查正常处理。
+	if newWeight < smart.AllowedWeight && totalSamples >= smart.DefaultMinSampleCount {
 		return newWeight, true, true, 5
 	}
 
