@@ -107,7 +107,16 @@ func (pc *ProbeCoordinator) Discover(
 	pc.mu.Unlock()
 
 	defer func() {
-		leaderCancel()
+		// NOTE: leaderCancel is NOT called here.  raceStaggered (reached via
+		// probeBatch below) owns cancellation of raceCtx for the normal path:
+		// on a winner it defers cancelRace until the background drain finishes
+		// sampling late losers' connectTime (keepLosersAlive), and on failure
+		// paths its deferred cancelRace fires immediately.  Canceling
+		// leaderCtx here would abort those in-flight loser dials the instant
+		// the winner returns, defeating the loser sampling.  leaderCtx is only
+		// canceled by Close() for shutdown, or GC'd once this discovery is
+		// deleted and unreferenced (no goroutine blocks on it besides the
+		// self-bounded 2s dials).
 		pc.mu.Lock()
 		delete(pc.discoveries, key)
 		pc.mu.Unlock()

@@ -724,3 +724,239 @@ func TestProbeBatch_AllProxiesNodeLevel_NoSentinelDetected(t *testing.T) {
 		t.Fatal("ShouldStopRetry returned true for node-level error, should be false")
 	}
 }
+
+// TestProbeBatch_KeepsLosersAliveAfterWinner verifies the discovery-path
+// raceStaggered behavior: once a winner is found, in-flight loser dials are
+// NOT immediately canceled — they run to their own dial timeout, and any that
+// succeed get their connectTime sampled into the route table (EMA update) via
+// onConnect, then their connection is closed by the background drain.  The
+// winner's conn and its best-proxy routing state must be unaffected.
+func TestProbeBatch_KeepsLosersAliveAfterWinner(t *testing.T) {
+	const key = "TARGET:example.com"
+
+	loserStarted := make(chan struct{})
+	loserDone := make(chan struct{})
+	loserCtxCanceled := make(chan struct{})
+	loserConn := &stubConn{}
+	winnerConn := &stubConn{}
+
+	// Loser is preRanked first (dialed at t=0) but blocks until released, so
+	// the winner (dialed after the 200ms stagger) wins the race while the
+	// loser is still in flight.
+	loser := &stubProxy{name: "loser", dial: func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+		close(loserStarted)
+		<-loserDone
+		select {
+		case <-ctx.Done():
+			close(loserCtxCanceled)
+			return nil, ctx.Err()
+		default:
+			return loserConn, nil
+		}
+	}}
+	winner := &stubProxy{name: "winner", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return winnerConn, nil
+	}}
+
+	pc := NewProbeCoordinator()
+	defer pc.Close()
+	rt := smart.NewRouteTable(100)
+	// Seed the winner as best proxy, as discoverAndRoute would after a win.
+	// The late loser's onConnect must not displace or clear it.
+	rt.SetBestProxy(key, "winner")
+
+	result := make(chan struct {
+		conn C.Conn
+		err  error
+	}, 1)
+	go func() {
+		pr := pc.probeBatch(
+			context.Background(), key,
+			[]C.Proxy{loser, winner}, &C.Metadata{}, []string{"loser", "winner"},
+			func(ctx context.Context, p C.Proxy, m *C.Metadata, start time.Time) (C.Conn, int64, error) {
+				conn, err := p.DialContext(ctx, m)
+				return conn, 42, err
+			},
+			rt,
+		)
+		result <- struct {
+			conn C.Conn
+			err  error
+		}{pr.conn, pr.err}
+	}()
+
+	select {
+	case <-loserStarted:
+	case <-time.After(time.Second):
+		t.Fatal("loser dial did not start")
+	}
+
+	// Winner fires after the stagger interval and wins while the loser is
+	// still blocked.  probeBatch must return immediately with the winner.
+	select {
+	case r := <-result:
+		if r.err != nil {
+			t.Fatalf("probeBatch returned error: %v", r.err)
+		}
+		if r.conn == nil {
+			t.Fatal("probeBatch returned nil connection")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("probeBatch did not return after winner succeeded")
+	}
+
+	// Now release the loser.  With the discovery path keeping losers alive,
+	// its dial ctx is still live and it returns its successful conn.  Without
+	// it, cancelRace would have fired and the loser would return canceled.
+	close(loserDone)
+
+	// Wait for the loser's conn to be drained and closed by the background
+	// drain goroutine (after onConnect samples its connectTime).
+	deadline := time.Now().Add(2 * time.Second)
+	for loserConn.CloseCount() == 0 {
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	select {
+	case <-loserCtxCanceled:
+		t.Fatal("loser dial was canceled after winner — loser should be kept alive on discovery path")
+	default:
+	}
+	if loserConn.CloseCount() != 1 {
+		t.Fatalf("loser conn closed %d times, want 1 (drained after sampling)", loserConn.CloseCount())
+	}
+	if winnerConn.CloseCount() != 0 {
+		t.Fatalf("winner conn closed %d times, want 0", winnerConn.CloseCount())
+	}
+
+	// loser's connectTime (42ms) must have been recorded into the route table
+	// via onConnect → UpdateLatency.
+	var loserLat int64
+	for _, row := range rt.Snapshot("").Rows {
+		if row.Key == key {
+			loserLat = row.Proxies["loser"].Attributes.Latency
+		}
+	}
+	if loserLat != 42 {
+		t.Fatalf("loser latency = %dms, want 42ms (sampled via onConnect)", loserLat)
+	}
+
+	// winner must remain the best proxy; the late loser must not displace it.
+	if best, ok := rt.GetBestProxy(key); !ok || best != "winner" {
+		t.Fatalf("best proxy = %q ok=%v, want winner", best, ok)
+	}
+}
+
+// TestProbeBatch_KeepsLosersAliveThroughDiscover drives the full Discover
+// path (leader + defer) to confirm the leader's deferred cleanup does NOT
+// cancel leaderCtx early — otherwise the winner returning would abort the
+// in-flight loser dial before the background drain samples it.  This is the
+// regression guard for the Discover-side half of the keep-losers-alive fix.
+func TestProbeBatch_KeepsLosersAliveThroughDiscover(t *testing.T) {
+	const key = "TARGET:example.com"
+
+	loserStarted := make(chan struct{})
+	loserDone := make(chan struct{})
+	loserCtxCanceled := make(chan struct{})
+	loserConn := &stubConn{}
+	winnerConn := &stubConn{}
+
+	loser := &stubProxy{name: "loser", dial: func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+		close(loserStarted)
+		<-loserDone
+		select {
+		case <-ctx.Done():
+			close(loserCtxCanceled)
+			return nil, ctx.Err()
+		default:
+			return loserConn, nil
+		}
+	}}
+	winner := &stubProxy{name: "winner", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return winnerConn, nil
+	}}
+
+	pc := NewProbeCoordinator()
+	defer pc.Close()
+	rt := smart.NewRouteTable(100)
+	rt.SetBestProxy(key, "winner")
+
+	result := make(chan struct {
+		conn C.Conn
+		err  error
+	}, 1)
+	go func() {
+		_, c, _, e := pc.Discover(
+			context.Background(), key,
+			[]C.Proxy{loser, winner}, &C.Metadata{}, []string{"loser", "winner"},
+			func(ctx context.Context, p C.Proxy, m *C.Metadata, start time.Time) (C.Conn, int64, error) {
+				conn, err := p.DialContext(ctx, m)
+				return conn, 42, err
+			},
+			rt,
+		)
+		result <- struct {
+			conn C.Conn
+			err  error
+		}{c, e}
+	}()
+
+	select {
+	case <-loserStarted:
+	case <-time.After(time.Second):
+		t.Fatal("loser dial did not start")
+	}
+
+	// Winner fires after the stagger and wins while the loser is still blocked.
+	// Discover must return immediately with the winner (leader cleanup must not
+	// wait on losers synchronously).
+	select {
+	case r := <-result:
+		if r.err != nil {
+			t.Fatalf("Discover returned error: %v", r.err)
+		}
+		if r.conn == nil {
+			t.Fatal("Discover returned nil connection")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Discover did not return after winner succeeded")
+	}
+
+	// Now release the loser.  The winner-return must NOT have canceled it —
+	// the leader's deferred cleanup must leave leaderCtx alive so the loser
+	// completes and the background drain samples its connectTime.
+	close(loserDone)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for loserConn.CloseCount() == 0 {
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	select {
+	case <-loserCtxCanceled:
+		t.Fatal("loser dial was canceled after winner — leader cleanup must keep loser alive")
+	default:
+	}
+	if loserConn.CloseCount() != 1 {
+		t.Fatalf("loser conn closed %d times, want 1 (drained after sampling)", loserConn.CloseCount())
+	}
+	if winnerConn.CloseCount() != 0 {
+		t.Fatalf("winner conn closed %d times, want 0", winnerConn.CloseCount())
+	}
+
+	var loserLat int64
+	for _, row := range rt.Snapshot("").Rows {
+		if row.Key == key {
+			loserLat = row.Proxies["loser"].Attributes.Latency
+		}
+	}
+	if loserLat != 42 {
+		t.Fatalf("loser latency = %dms, want 42ms (sampled via onConnect)", loserLat)
+	}
+}

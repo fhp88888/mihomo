@@ -3,10 +3,12 @@ package outboundgroup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -34,7 +36,7 @@ const (
 	// discovery wave.  When the candidate set is larger than this, the
 	// quality-best candidates are shuffled before dialing so we don't always
 	// dial the same proxy first.
-	exploreBatch = 4
+	exploreBatch = 16
 	// highLossThreshold is the aggregated pkg-loss EMA above which a proxy is
 	// treated as low-quality for discovery ordering (deferred to the end).
 	highLossThreshold = 0.1
@@ -195,7 +197,18 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 	}
 
 	raceCtx, cancelRace := context.WithCancel(ctx)
-	defer cancelRace()
+
+	// keepLosersAlive: 只对 discovery 异步路径（wg != nil）的 winner 分支放开。
+	// 置位后 deferred cancelRace 被跳过，让在途 loser 拨号跑到各自的 2s 超时，
+	// 由后台 drain goroutine 采集真实 connectTime 并更新 EMA（onConnect →
+	// UpdateLatency）。fallback 同步路径（wg == nil）及 ShouldStopRetry /
+	// ctx.Done 返回路径保持立刻取消，避免调用方被最慢的 loser 阻塞。
+	keepLosersAlive := false
+	defer func() {
+		if !keepLosersAlive {
+			cancelRace()
+		}
+	}()
 
 	results := make(chan dialResult, len(ordered))
 	var workers sync.WaitGroup
@@ -215,25 +228,34 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 	}
 
 	// drain consumes n results, closing successful connections and feeding
-	// onConnect.  It runs from the select-loop goroutine only.
+	// onConnect.  It runs from the select-loop goroutine (sync drain) or the
+	// stopAndDrain background goroutine (async discovery drain).  Successful
+	// loser samples are aggregated and logged once per batch.
 	drain := func(n int) {
+		samples := make([]string, 0, n)
 		for i := 0; i < n; i++ {
 			result := <-results
 			if result.err == nil && result.conn != nil {
 				onConnect(result.proxy.Name(), result.connectTime)
+				samples = append(samples, fmt.Sprintf("%s=%dms", result.proxy.Name(), result.connectTime))
 				result.conn.Close()
 			}
+		}
+		if len(samples) > 0 {
+			log.Debugln("[Smart] tcpRoute key=%s LOSER-SAMPLED %s", key, strings.Join(samples, " "))
 		}
 	}
 
 	// stopAndDrain cancels in-flight dials and clears the remaining results.
 	// With wg nil it does so synchronously (deterministic, fallback).  With wg
 	// set it hands the drain to a background goroutine so the caller can return
-	// the winner immediately (discovery hot path).
+	// the winner immediately (discovery hot path).  On that path the goroutine
+	// skips cancelRace until all losers finish, so late successful losers still
+	// contribute a latency sample via onConnect before their conn is closed.
 	stopAndDrain := func() {
-		cancelRace()
 		remaining := launched - received
 		if wg == nil {
+			cancelRace()
 			drain(remaining)
 			workers.Wait()
 			return
@@ -241,6 +263,10 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// Cancel raceCtx when the drain settles — even if drain or
+			// workers.Wait panics, the deferred cancelRace fires so in-flight
+			// dial contexts are never leaked.
+			defer cancelRace()
 			drain(remaining)
 			workers.Wait()
 		}()
@@ -269,6 +295,14 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 				onConnect(result.proxy.Name(), result.connectTime)
 				if onWinner != nil {
 					onWinner(result.proxy, result.connectTime)
+				}
+				// Winner found: on the async discovery path let the in-flight
+				// losers finish dialing so their connectTime is sampled, then
+				// hand them to the background drain goroutine.  The deferred
+				// cancelRace is skipped (keepLosersAlive) and the goroutine
+				// cancels after all losers settle.
+				if wg != nil {
+					keepLosersAlive = true
 				}
 				stopAndDrain()
 				return result.proxy, result.conn, result.connectTime, nil
