@@ -576,7 +576,7 @@ func (s *Store) GetBestProxyForTarget(group, config, target, asnNumber string, i
 	nodesWithWeight := make(map[string]float64)
 
 	// 优先使用 ASN
-	if asnNumber != "" && !CdnASNs[asnNumber] {
+	if asnNumber != "" {
 		asnWeightType := WeightTypeTCPASN + ":" + asnNumber
 		if isUDP {
 			asnWeightType = WeightTypeUDPASN + ":" + asnNumber
@@ -833,7 +833,7 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 		var bestWeights []float64
 		var err error
 
-		if active.ASN != "" && !CdnASNs[active.ASN] {
+		if active.ASN != "" {
 			key := asnCacheKey{active.ASN, active.IsUDP}
 			if v, ok := asnCache[key]; ok {
 				bestNodes = v.nodes
@@ -897,7 +897,7 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 		var sortedWeights []float64
 		var needUpdate bool
 		cacheHit := false
-		if item.asnNumber != "" && !CdnASNs[item.asnNumber] {
+		if item.asnNumber != "" {
 			key := asnCacheKey{item.asnNumber, item.isUDP}
 			if v, ok := asnCache[key]; ok {
 				sortedNodes = v.nodes
@@ -979,7 +979,7 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 				}
 			}
 
-			if item.asnNumber != "" && !CdnASNs[item.asnNumber] {
+			if item.asnNumber != "" {
 				key := asnCacheKey{item.asnNumber, item.isUDP}
 				asnCache[key] = asnCacheValue{
 					nodes:      sortedNodes,

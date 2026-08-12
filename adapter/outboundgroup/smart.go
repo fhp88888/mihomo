@@ -1823,16 +1823,26 @@ func (s *Smart) getASNCode(metadata *C.Metadata) string {
 		}
 
 		asn, aso := mmdb.ASNInstance().LookupASN(ip.AsSlice())
-		if asn == "" {
+		if asn == "" || asn == "0" {
+			// "0" is how a GeoLite2-ASN miss is reported (zero-value uint32);
+			// treat it as unknown so it doesn't get bucketed as ASN "0".
 			metadata.DstIPASN = "unknown"
-		} else {
-			metadata.DstIPASN = asn + " " + aso
+			return ""
 		}
+		metadata.DstIPASN = asn + " " + aso
 		return asn
 	}
 
 	if idx := strings.IndexByte(metadata.DstIPASN, ' '); idx >= 0 {
+		if metadata.DstIPASN[:idx] == "0" {
+			metadata.DstIPASN = "unknown"
+			return ""
+		}
 		return metadata.DstIPASN[:idx]
+	}
+	if metadata.DstIPASN == "0" {
+		metadata.DstIPASN = "unknown"
+		return ""
 	}
 	return metadata.DstIPASN
 }

@@ -119,7 +119,7 @@ func (s *Store) StorePrefetchResult(group, config string, target string, asnNumb
 		})
 	}
 
-	if asnNumber != "" && !CdnASNs[asnNumber] {
+	if asnNumber != "" {
 		targetCacheKey := FormatDBKey(KeyTypePrefetch, config, group, target)
 		var asnPm PrefetchMap
 		if isUDP {
@@ -180,7 +180,7 @@ func (s *Store) GetPrefetchResult(group, config string, target string, asnNumber
 	}
 
 	// ASN
-	if asnNumber != "" && !CdnASNs[asnNumber] {
+	if asnNumber != "" {
 		if pm, ok := loadPM(FormatDBKey(KeyTypePrefetch, config, group, asnNumber)); ok {
 			if nodes, weights := pick(pm); nodes != nil {
 				return nodes, weights
@@ -223,7 +223,7 @@ func (s *Store) StoreUnwrapResult(group, config string, target string, asnNumber
 
 	targetKey := FormatDBKey(config, group, target)
 
-	if asnNumber != "" && !CdnASNs[asnNumber] {
+	if asnNumber != "" {
 		asnKey := FormatDBKey(config, group, asnNumber)
 		if value, found := unwrapCache.Get(asnKey); found {
 			um := value
@@ -273,7 +273,7 @@ func (s *Store) GetUnwrapResult(group, config, target, asnNumber string) []strin
 		}
 	}
 
-	if asnNumber != "" && !CdnASNs[asnNumber] {
+	if asnNumber != "" {
 		asnKey := FormatDBKey(config, group, asnNumber)
 		if value, found := unwrapCache.Get(asnKey); found {
 			return value.Proxies
@@ -301,7 +301,7 @@ func (s *Store) DeleteUnwrapResult(group, config string, target string, asnNumbe
 		}
 	}
 
-	if asnNumber != "" && !CdnASNs[asnNumber] {
+	if asnNumber != "" {
 		asnKey := FormatDBKey(config, group, asnNumber)
 		if value, found := unwrapCache.Get(asnKey); found {
 			um := value

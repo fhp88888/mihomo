@@ -71,42 +71,6 @@ var (
 	}
 )
 
-var CdnASNs = map[string]bool{
-	"13335":  true, // Cloudflare
-	"12222":  true, // Akamai
-	"16625":  true, // Akamai
-	"20940":  true, // Akamai
-	"31110":  true, // Akamai
-	"35994":  true, // Akamai
-	"54113":  true, // Fastly
-	"22822":  true, // Limelight Networks
-	"15133":  true, // EdgeCast (Verizon)
-	"19551":  true, // Incapsula (Imperva)
-	"20446":  true, // StackPath / Bunny
-	"60068":  true, // CDN77
-	"16509":  true, // Amazon CloudFront
-	"36408":  true, // CDNetworks
-	"4809":   true, // ChinaCache
-	"199524": true, // Gcore
-	"212238": true, // BelugaCDN
-	"55933":  true, // QUANTIL
-	"43260":  true, // Medianova
-	"43317":  true, // CDNvideo
-	"43996":  true, // CDNsun
-	"52320":  true, // GlobeNet
-	"396982": true, // Leaseweb CDN
-	"16276":  true, // OVH CDN
-	"30081":  true, // CacheFly
-	"12389":  true, // Zenlayer (跨境CDN)
-	"37888":  true, // Alibaba CDN
-	"45090":  true, // Tencent CDN
-	"174":    true, // Cogent Communications (CDN)
-	"3356":   true, // Level 3 Communications (CDN)
-	"3209":   true, // Vodafone (CDN服务)
-	"14061":  true, // DigitalOcean
-	"8452":   true, // Infospace
-}
-
 type (
 	Store struct {}
 
