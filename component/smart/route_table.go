@@ -64,6 +64,17 @@ func (c *proxyCell) hasSample() bool {
 	return c.HasLatencySample || c.HasPkgLossSample || c.HasSpeedSample || c.HasJitterSample
 }
 
+// hasDirtyCell returns true when any cell in the row has unsaved changes.
+// Must be called with mu held.
+func hasDirtyCell(row *rowEntry) bool {
+	for _, cell := range row.proxies {
+		if cell.Dirty {
+			return true
+		}
+	}
+	return false
+}
+
 // RowSnapshot is a read-only copy of a row for the REST API.
 type RowSnapshot struct {
 	Key       string                 `json:"key"`
@@ -117,10 +128,23 @@ func (rt *RouteTable) getOrCreateRow(key string) *rowEntry {
 		return row
 	}
 
-	// Evict if at capacity
+	// Evict if at capacity.  Prefer the least-recently-used row with no
+	// unpersisted changes so we don't silently discard dirty metrics before the
+	// periodic flush.  If every row is dirty, fall back to evicting the LRU row
+	// anyway — unbounded growth is worse than dropping a dirty row.
 	if len(rt.rows) >= rt.maxRows && len(rt.lruOrder) > 0 {
-		evictKey := rt.lruOrder[0]
-		rt.lruOrder = rt.lruOrder[1:]
+		evictIdx := -1
+		for i, k := range rt.lruOrder {
+			if r := rt.rows[k]; r != nil && !r.rowDirty && !hasDirtyCell(r) {
+				evictIdx = i
+				break
+			}
+		}
+		if evictIdx < 0 {
+			evictIdx = 0
+		}
+		evictKey := rt.lruOrder[evictIdx]
+		rt.lruOrder = append(rt.lruOrder[:evictIdx], rt.lruOrder[evictIdx+1:]...)
 		delete(rt.rows, evictKey)
 	}
 
