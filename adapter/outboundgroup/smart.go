@@ -569,6 +569,11 @@ func (s *Smart) persistRouteTable() {
 		return
 	}
 
+	// Collect all operations into a single slice and append them in one call.
+	// AppendToGlobalQueue rebuilds the whole queue on every call, so enqueuing
+	// N operations one-by-one is O(N * queueLen); batching makes it one pass.
+	ops := make([]smart.StoreOperation, 0, len(dirty)+len(dirtyRows))
+
 	for cellKey, pc := range dirty {
 		// cellKey format: {routeKey}\x00{proxyName}
 		if idx := strings.IndexByte(cellKey, 0); idx >= 0 {
@@ -580,7 +585,7 @@ func (s *Smart) persistRouteTable() {
 				continue
 			}
 
-			store.AppendToGlobalQueue(smart.StoreOperation{
+			ops = append(ops, smart.StoreOperation{
 				Type:   smart.OpSaveRoute,
 				Group:  s.Name(),
 				Config: s.configName,
@@ -595,13 +600,17 @@ func (s *Smart) persistRouteTable() {
 		if err != nil {
 			continue
 		}
-		store.AppendToGlobalQueue(smart.StoreOperation{
+		ops = append(ops, smart.StoreOperation{
 			Type:   smart.OpSaveRouteMeta,
 			Group:  s.Name(),
 			Config: s.configName,
 			Target: routeKey,
 			Data:   data,
 		})
+	}
+
+	if len(ops) > 0 {
+		store.AppendToGlobalQueue(ops...)
 	}
 
 	log.Infoln("[Smart] Enqueued %d dirty route cells and %d rows for group [%s]", len(dirty), len(dirtyRows), s.Name())
