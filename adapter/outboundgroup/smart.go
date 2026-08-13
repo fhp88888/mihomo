@@ -412,6 +412,14 @@ func (s *Smart) ProxyAggregationSnapshot() smart.ProxyAggregation {
 	return s.proxyAgg
 }
 
+// NodeRankingSnapshot returns the "most used" proxy ranking for the REST API,
+// derived from the route table's per-proxy UseCount aggregation.  The result
+// keeps the legacy NodeRank shape so the /weights endpoint contract is
+// unchanged while its data now comes from the in-memory route table.
+func (s *Smart) NodeRankingSnapshot() smart.NodeRank {
+	return smart.BuildNodeRanking(s.routeTable.AggregateByProxy().Proxies)
+}
+
 // aggregateProxies recomputes the per-proxy aggregation from the current
 // route table and stores it for the REST API.
 func (s *Smart) aggregateProxies() {

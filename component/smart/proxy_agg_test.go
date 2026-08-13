@@ -141,3 +141,38 @@ func rowByKey(t *testing.T, snap TableSnapshot, key string) RowSnapshot {
 	t.Fatalf("row %q not found in snapshot (%d rows)", key, len(snap.Rows))
 	return RowSnapshot{}
 }
+
+func TestBuildNodeRanking(t *testing.T) {
+	proxies := []ProxyAggregate{
+		{Name: "p1", UseCount: 10},
+		{Name: "p2", UseCount: 5},
+		{Name: "p3", UseCount: 3},
+		{Name: "p4", UseCount: 1},
+		{Name: "p5", UseCount: 0}, // never used → omitted
+	}
+
+	rank := BuildNodeRanking(proxies)
+
+	if rank.LastUpdated <= 0 {
+		t.Fatalf("expected LastUpdated > 0, got %d", rank.LastUpdated)
+	}
+	if len(rank.Result) != 4 {
+		t.Fatalf("expected 4 used proxies (p5 omitted), got %d", len(rank.Result))
+	}
+
+	// Weight is normalized to the heaviest use (p1=10 → 100).
+	if rank.Result[0].Name != "p1" || rank.Result[0].Weight != 100 {
+		t.Fatalf("expected p1 weight 100, got %+v", rank.Result[0])
+	}
+	if rank.Result[1].Name != "p2" || rank.Result[1].Weight != 50 {
+		t.Fatalf("expected p2 weight 50, got %+v", rank.Result[1])
+	}
+
+	// 4 positive proxies: mostUsedBound=max(1,floor(4*.2))=1, occasionalBound=1+floor(4*.5)=3.
+	wantRanks := []string{RankMostUsed, RankOccasional, RankOccasional, RankRarelyUsed}
+	for i, want := range wantRanks {
+		if rank.Result[i].Rank != want {
+			t.Fatalf("rank[%d] = %q, want %q", i, rank.Result[i].Rank, want)
+		}
+	}
+}

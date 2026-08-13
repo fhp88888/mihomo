@@ -139,3 +139,50 @@ func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
 
 	return result
 }
+
+// BuildNodeRanking derives the legacy MostUsed / OccasionalUsed / RarelyUsed
+// ranking from a UseCount-sorted proxy aggregation (see AggregateByProxy).  It
+// preserves the NodeRank shape returned by the /weights REST API so the GUI
+// contract is unchanged.  Proxies that were never used (UseCount <= 0) are
+// omitted, mirroring the old behaviour where nodes without a positive weight
+// carried no rank.
+func BuildNodeRanking(proxies []ProxyAggregate) NodeRank {
+	items := make([]NodeRankItem, 0, len(proxies))
+
+	var maxUse int64
+	for _, p := range proxies {
+		if p.UseCount > maxUse {
+			maxUse = p.UseCount
+		}
+	}
+
+	for _, p := range proxies {
+		if p.UseCount <= 0 {
+			continue
+		}
+		weight := 0.0
+		if maxUse > 0 {
+			weight = math.Round(float64(p.UseCount)/float64(maxUse)*100*100) / 100
+		}
+		items = append(items, NodeRankItem{Name: p.Name, Weight: weight})
+	}
+
+	positive := len(items)
+	mostUsedBound := int(float64(positive) * 0.2)
+	if mostUsedBound < 1 {
+		mostUsedBound = 1
+	}
+	occasionalBound := mostUsedBound + int(float64(positive)*0.5)
+	for i := range items {
+		switch {
+		case i < mostUsedBound:
+			items[i].Rank = RankMostUsed
+		case i < occasionalBound:
+			items[i].Rank = RankOccasional
+		default:
+			items[i].Rank = RankRarelyUsed
+		}
+	}
+
+	return NodeRank{LastUpdated: time.Now().Unix(), Result: items}
+}
