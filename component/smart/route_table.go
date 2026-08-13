@@ -90,10 +90,9 @@ type RouteTable struct {
 	// LRU order: index 0 = least recently used
 	lruOrder []string
 	// proxyAttrs holds the per-proxy aggregation computed by AggregateByProxy.
-	// It backs the proxy-wise component of calculateScore: scores blend the
-	// per-target (cell) view with this cross-target view.  A missing proxy
-	// means "no aggregation yet" — calculateScore returns the unblended
-	// per-target score in that case.
+	// It backs discovery ordering (exploreOrder) and the REST aggregation
+	// snapshot.  It is NOT part of calculateScore, which uses only the
+	// per-target (cell) view.  A missing proxy means "no aggregation yet".
 	proxyAttrs map[string]ProxyAttributes
 }
 

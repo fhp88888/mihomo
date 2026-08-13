@@ -155,7 +155,7 @@ func (s *Smart) staggeredTCPFallback(ctx context.Context, metadata *C.Metadata, 
 		return nil, nil
 	}
 
-	winner, conn, connectTime, err := raceStaggered(ctx, key, ordered, nil,
+	winner, conn, _, err := raceStaggered(ctx, key, ordered, nil,
 		// Fallback dials go through dialTCP, which records a genuine dial
 		// failure as MarkFailed.
 		func(dialCtx context.Context, proxy C.Proxy) (C.Conn, int64, error) {
@@ -183,7 +183,7 @@ func (s *Smart) staggeredTCPFallback(ctx context.Context, metadata *C.Metadata, 
 	if conn == nil {
 		return nil, nil
 	}
-	return s.wrapTCPConn(conn, winner, metadata, connectTime), nil
+	return s.wrapTCPConn(conn, winner, metadata), nil
 }
 
 func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.WaitGroup,
@@ -367,7 +367,7 @@ func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Meta
 	s.routeTable.SetBestProxy(key, proxy.Name())
 	s.routeTable.SetTCPProbed(key)
 
-	return s.wrapTCPConn(conn, proxy, metadata, connectTime), nil
+	return s.wrapTCPConn(conn, proxy, metadata), nil
 }
 
 // discoverAndRoute performs pre-rank + concurrent discovery for a new or failed route.
@@ -435,7 +435,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	s.routeTable.SetBestProxy(key, proxy.Name())
 	s.routeTable.SetTCPProbed(key)
 
-	return s.wrapTCPConn(conn, proxy, metadata, connectTime), nil
+	return s.wrapTCPConn(conn, proxy, metadata), nil
 }
 
 func (s *Smart) exploreOrder(available []C.Proxy, proxies []C.Proxy, key string) []C.Proxy {
@@ -549,10 +549,10 @@ func median(vals []float64) float64 {
 	return (sorted[mid-1] + sorted[mid]) / 2
 }
 
-// wrapTCPConn wraps a TCP connection with close-callback to collect latency (TTFB), pkg_loss and speed.
-// connectTime is the dial duration in milliseconds, passed in so the close callback can
-// compute TTFB = connectTime + firstReadLatency (time from dial start to first byte).
-func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64) C.Conn {
+// wrapTCPConn wraps a TCP connection with close-callbacks that collect pkg_loss
+// and speed, and penalize RST / early-death failures.  Latency (dial connectTime)
+// is recorded at dial time by the callers, not here.
+func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Conn {
 	c.AppendToChains(s)
 
 	start := time.Now()
