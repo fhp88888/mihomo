@@ -27,6 +27,9 @@ import (
 const (
 	smartBestProxyFreshness = 5 * time.Second
 	smartTCPFallbackStagger = 200 * time.Millisecond
+	// smartBestExclusiveWindow is how long the current best proxy gets to win on
+	// its own before the fast-path hands off into the staggered race.
+	smartBestExclusiveWindow = 600 * time.Millisecond
 	// smartEarlyDeathLatencyLimit bounds firstReadLatency for a connection to
 	// be classified as "died before any data flowed". A connection that fails
 	// before the first byte within this window is very likely a dead proxy,
@@ -96,47 +99,31 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key str
 	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
 		for _, p := range proxies {
 			if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
-				log.Debugln("[Smart] tcpRoute key=%s FAST-PATH best=%s", key, bestName)
-				dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
-				conn, err := s.dialAndWrap(dialCtx, p, metadata, key)
-				dialCancel()
-				if err == nil {
-					log.Debugln("[Smart] tcpRoute key=%s FAST-PATH-OK best=%s", key, bestName)
-					return conn, nil
+				// Best-first race: best gets a smartBestExclusiveWindow
+				// head-start, then the rest ranked by score race at the normal
+				// stagger.  Whoever connects first wins — including a slow best.
+				// Losers are drained in the background via probeCoordinator.
+				ordered := s.rankCandidates(key, proxies, p)
+				log.Infoln("[Smart] tcpRoute key=%s BEST-RACE ranks=%v (best first)", key, namesOf(ordered))
+				conn, err := s.raceAndWrap(ctx, metadata, key, ordered,
+					smartBestExclusiveWindow, &s.probeCoordinator.wg)
+				if conn != nil || err != nil {
+					return conn, err
 				}
-				log.Infoln("[Smart] tcpRoute key=%s fast-best FAILED proxy=%s err=%v", key, bestName, err)
-				if tunnel.ShouldStopRetry(err) {
-					return nil, err
-				}
-				break
+				log.Infoln("[Smart] tcpRoute key=%s best-race-exhausted, falling to discovery", key)
+				return nil, nil
 			}
 		}
 	}
 
-	// Best proxy is stale, unavailable, or failed. Rank the remaining
-	// per-key proxies by score and race them with a short stagger.
-	log.Infoln("[Smart] tcpRoute key=%s fast-best-miss, trying staggered fallback", key)
-	names := make([]string, 0, len(proxies))
-	proxyMap := make(map[string]C.Proxy, len(proxies))
-	for _, p := range proxies {
-		if p.AliveForTestUrl(s.testUrl) {
-			names = append(names, p.Name())
-			proxyMap[p.Name()] = p
-		}
+	// Best proxy is stale, unavailable, or failed. Race the alive proxies by
+	// score with a short stagger.
+	ordered := s.rankCandidates(key, proxies, nil)
+	if len(ordered) == 0 {
+		return nil, nil
 	}
-	s.routeTable.RefreshScores(key, names)
-	ranked := s.routeTable.RankByScore(names, func(proxyName string) uint16 {
-		if p, ok := proxyMap[proxyName]; ok {
-			return p.LastDelayForTestUrl(s.testUrl)
-		}
-		return 0xffff
-	}, key)
-
-	log.Infoln("[Smart] tcpRoute key=%s STAGGERED-FALLBACK %s",
-		key, s.routeTable.DebugDumpScores(key))
-	log.Infoln("[Smart] tcpRoute key=%s STAGGERED-FALLBACK ranked: %v", key, ranked)
-
-	conn, err := s.staggeredTCPFallback(ctx, metadata, key, ranked, proxyMap)
+	log.Infoln("[Smart] tcpRoute key=%s STAGGERED-FALLBACK ranked: %v", key, namesOf(ordered))
+	conn, err := s.raceAndWrap(ctx, metadata, key, ordered, smartTCPFallbackStagger, nil)
 	if conn != nil || err != nil {
 		return conn, err
 	}
@@ -144,20 +131,56 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key str
 	return nil, nil
 }
 
-func (s *Smart) staggeredTCPFallback(ctx context.Context, metadata *C.Metadata, key string, ranked []string, proxyMap map[string]C.Proxy) (C.Conn, error) {
-	ordered := make([]C.Proxy, 0, len(ranked))
-	for _, name := range ranked {
-		if proxy, ok := proxyMap[name]; ok {
-			ordered = append(ordered, proxy)
+// rankCandidates filters proxies to alive ones (excluding best when given),
+// refreshes their scores, and returns the score-ranked order with best (if any)
+// anchored first.
+func (s *Smart) rankCandidates(key string, proxies []C.Proxy, best C.Proxy) []C.Proxy {
+	over := make([]string, 0, len(proxies))
+	proxyMap := make(map[string]C.Proxy, len(proxies))
+	for _, p := range proxies {
+		if best != nil && p.Name() == best.Name() {
+			continue
+		}
+		if p.AliveForTestUrl(s.testUrl) {
+			over = append(over, p.Name())
+			proxyMap[p.Name()] = p
 		}
 	}
-	if len(ordered) == 0 {
-		return nil, nil
+	if best != nil {
+		proxyMap[best.Name()] = best
 	}
 
-	winner, conn, _, err := raceStaggered(ctx, key, ordered, nil,
-		// Fallback dials go through dialTCP, which records a genuine dial
-		// failure as MarkFailed.
+	// Refresh with best included so its score stays current for the race, but
+	// rank only the non-best proxies — best is already anchored at the front.
+	refresh := over
+	if best != nil {
+		refresh = append(append([]string{}, over...), best.Name())
+	}
+	s.routeTable.RefreshScores(key, refresh)
+	ranked := s.routeTable.RankByScore(over, func(proxyName string) uint16 {
+		if p, ok := proxyMap[proxyName]; ok {
+			return p.LastDelayForTestUrl(s.testUrl)
+		}
+		return 0xffff
+	}, key)
+
+	if best != nil {
+		return append([]C.Proxy{best}, orderByNames(proxies, ranked)...)
+	}
+	return orderByNames(proxies, ranked)
+}
+
+// raceAndWrap runs a staggered race over ordered and wraps the winner.
+// firstStagger is the gap before the 2nd candidate (ordered[0] is dialed
+// immediately); later candidates follow at smartTCPFallbackStagger.  wg != nil
+// makes loser draining asynchronous so the caller returns the winner
+// immediately while late successful losers still sample latency in the
+// background.
+func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key string,
+	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup) (C.Conn, error) {
+	winner, conn, _, err := raceStaggered(ctx, key, ordered, wg, firstStagger,
+		// Race dials go through dialTCP, which records a genuine dial failure
+		// as MarkFailed.
 		func(dialCtx context.Context, proxy C.Proxy) (C.Conn, int64, error) {
 			return s.dialTCP(dialCtx, proxy, metadata, key)
 		},
@@ -167,7 +190,7 @@ func (s *Smart) staggeredTCPFallback(ctx context.Context, metadata *C.Metadata, 
 			s.routeTable.UpdateLatency(key, proxyName, connectTime)
 		},
 		// onFail: dialTCP already handles MarkFailed for genuine failures, so
-		// the fallback has nothing to add for failures.
+		// the race has nothing to add for failures.
 		nil,
 		// onWinner: promote the winner to best proxy and mark the route
 		// probed.  The winner's latency is already sampled via onConnect.
@@ -187,6 +210,7 @@ func (s *Smart) staggeredTCPFallback(ctx context.Context, metadata *C.Metadata, 
 }
 
 func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.WaitGroup,
+	firstStagger time.Duration,
 	dial func(context.Context, C.Proxy) (C.Conn, int64, error),
 	onConnect func(proxyName string, connectTime int64),
 	onFail func(proxy C.Proxy, err error),
@@ -213,6 +237,9 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 	results := make(chan dialResult, len(ordered))
 	var workers sync.WaitGroup
 	launched, received := 0, 0
+	// firstFailed: the first candidate (best) failed inside its head-start
+	// window — collapse it and dial the next candidate immediately.
+	firstFailed := false
 
 	launch := func(proxy C.Proxy) {
 		launched++
@@ -277,7 +304,7 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	if next < len(ordered) {
-		timer = time.NewTimer(smartTCPFallbackStagger)
+		timer = time.NewTimer(firstStagger)
 		timerC = timer.C
 	}
 	defer func() {
@@ -314,6 +341,23 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 			if tunnel.ShouldStopRetry(result.err) {
 				stopAndDrain()
 				return nil, nil, 0, result.err
+			}
+			// Collapse the head-start if the first candidate (best) failed
+			// early, so fallback starts immediately instead of at 600ms.
+			if !firstFailed && result.proxy == ordered[0] && next < len(ordered) {
+				firstFailed = true
+				if timer != nil {
+					if !timer.Stop() {
+						select { case <-timer.C: default: }
+					}
+				}
+				timerC = nil
+				launch(ordered[next])
+				next++
+				if next < len(ordered) {
+					timer = time.NewTimer(smartTCPFallbackStagger)
+					timerC = timer.C
+				}
 			}
 		case <-timerC:
 			launch(ordered[next])

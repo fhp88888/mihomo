@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/smart"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
 )
 
@@ -250,7 +253,7 @@ func routeFailedCount(t *testing.T, table *smart.RouteTable, key, proxy string) 
 	return 0
 }
 
-func TestStaggeredTCPFallback_FirstSuccessCancelsLosers(t *testing.T) {
+func TestRaceAndWrap_FirstSuccessCancelsLosers(t *testing.T) {
 	const key = "TARGET:example.com"
 	firstStarted := make(chan struct{})
 	secondStarted := make(chan struct{})
@@ -282,10 +285,8 @@ func TestStaggeredTCPFallback_FirstSuccessCancelsLosers(t *testing.T) {
 		err  error
 	}, 1)
 	go func() {
-		conn, err := s.staggeredTCPFallback(context.Background(), &C.Metadata{Host: "example.com"}, key,
-			[]string{first.Name(), second.Name(), third.Name()}, map[string]C.Proxy{
-				first.Name(): first, second.Name(): second, third.Name(): third,
-			})
+		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key,
+			[]C.Proxy{first, second, third}, smartTCPFallbackStagger, nil)
 		result <- struct {
 			conn C.Conn
 			err  error
@@ -332,7 +333,7 @@ func TestStaggeredTCPFallback_FirstSuccessCancelsLosers(t *testing.T) {
 	_ = got.conn.Close()
 }
 
-func TestStaggeredTCPFallback_ClosesLateSuccessfulLoser(t *testing.T) {
+func TestRaceAndWrap_ClosesLateSuccessfulLoser(t *testing.T) {
 	const key = "TARGET:example.com"
 	firstStarted := make(chan struct{})
 	firstCanceled := make(chan struct{})
@@ -355,8 +356,8 @@ func TestStaggeredTCPFallback_ClosesLateSuccessfulLoser(t *testing.T) {
 		err  error
 	}, 1)
 	go func() {
-		conn, err := s.staggeredTCPFallback(context.Background(), &C.Metadata{Host: "example.com"}, key,
-			[]string{first.Name(), second.Name()}, map[string]C.Proxy{first.Name(): first, second.Name(): second})
+		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key,
+			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil)
 		result <- struct {
 			conn C.Conn
 			err  error
@@ -414,7 +415,7 @@ func TestStaggeredTCPFallback_ClosesLateSuccessfulLoser(t *testing.T) {
 	_ = got.conn.Close()
 }
 
-func TestStaggeredTCPFallback_FatalErrorStopsScheduling(t *testing.T) {
+func TestRaceAndWrap_FatalErrorStopsScheduling(t *testing.T) {
 	const key = "TARGET:example.com"
 	secondStarted := make(chan struct{}, 1)
 	first := &stubProxy{name: "first", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
@@ -429,8 +430,8 @@ func TestStaggeredTCPFallback_FatalErrorStopsScheduling(t *testing.T) {
 	table.UpdateLatency(key, first.Name(), 10)
 	table.SetBestProxy(key, first.Name())
 	s := &Smart{testUrl: "test", routeTable: table}
-	_, err := s.staggeredTCPFallback(context.Background(), &C.Metadata{Host: "example.com"}, key,
-		[]string{first.Name(), second.Name()}, map[string]C.Proxy{first.Name(): first, second.Name(): second})
+	_, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key,
+		[]C.Proxy{first, second}, smartTCPFallbackStagger, nil)
 	if !errors.Is(err, resolver.ErrIPNotFound) || !tunnel.ShouldStopRetry(err) {
 		t.Fatalf("fatal error = %v, want ErrIPNotFound", err)
 	}
@@ -444,7 +445,7 @@ func TestStaggeredTCPFallback_FatalErrorStopsScheduling(t *testing.T) {
 	}
 }
 
-func TestStaggeredTCPFallback_ParentCancellationStopsScheduling(t *testing.T) {
+func TestRaceAndWrap_ParentCancellationStopsScheduling(t *testing.T) {
 	const key = "TARGET:example.com"
 	firstStarted := make(chan struct{})
 	firstCanceled := make(chan struct{})
@@ -467,8 +468,8 @@ func TestStaggeredTCPFallback_ParentCancellationStopsScheduling(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, err := s.staggeredTCPFallback(ctx, &C.Metadata{Host: "example.com"}, key,
-			[]string{first.Name(), second.Name()}, map[string]C.Proxy{first.Name(): first, second.Name(): second})
+		_, err := s.raceAndWrap(ctx, &C.Metadata{Host: "example.com"}, key,
+			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil)
 		result <- err
 	}()
 
@@ -958,5 +959,310 @@ func TestProbeBatch_KeepsLosersAliveThroughDiscover(t *testing.T) {
 	}
 	if loserLat != 42 {
 		t.Fatalf("loser latency = %dms, want 42ms (sampled via onConnect)", loserLat)
+	}
+}
+// =========================================================================
+// best-first race tests (serialTcpConn fast-path)
+// =========================================================================
+
+func newBestRaceSmart() (*Smart, *smart.RouteTable, *ProbeCoordinator) {
+	rt := smart.NewRouteTable(10)
+	pc := NewProbeCoordinator()
+	return &Smart{testUrl: "test", routeTable: rt, probeCoordinator: pc}, rt, pc
+}
+
+// bestProxy returns a stub proxy whose dial blocks until unblock is closed or
+// returns conn immediately when conn is non-nil.  firstCalled is closed on the
+// first dial.
+func blockingProxy(name string, unblock chan struct{}, conn *stubConn, firstCalled chan struct{}) *stubProxy {
+	var once sync.Once
+	return &stubProxy{name: name, dial: func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+		once.Do(func() { close(firstCalled) })
+		select {
+		case <-unblock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return conn, nil
+	}}
+}
+
+func TestBestFirstRace_BestWinsWithinWindow(t *testing.T) {
+	const key = "TARGET:example.com"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	bestStarted := make(chan struct{})
+	bestConn := &stubConn{}
+	best := &stubProxy{name: "best", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		close(bestStarted)
+		return bestConn, nil
+	}}
+	other := &stubProxy{name: "other", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		t.Error("other proxy should not be dialed when best wins immediately")
+		return nil, errors.New("unexpected other dial")
+	}}
+
+	rt.SetBestProxy(key, "best")
+
+	start := time.Now()
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, other})
+	if err != nil {
+		t.Fatalf("serialTcpConn error: %v", err)
+	}
+	if conn == nil {
+		t.Fatal("serialTcpConn returned nil connection")
+	}
+	elapsed := time.Since(start)
+	if elapsed > smartBestExclusiveWindow {
+		t.Fatalf("best win took %v, want within %v", elapsed, smartBestExclusiveWindow)
+	}
+	if bestConn.CloseCount() != 0 {
+		t.Fatalf("winner conn closed %d times", bestConn.CloseCount())
+	}
+	_ = conn.Close()
+}
+
+func TestBestFirstRace_StaleBestYieldsToFasterFallback(t *testing.T) {
+	const key = "TARGET:example.com"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	bestStarted := make(chan struct{})
+	bestUnblock := make(chan struct{})
+	best := blockingProxy("best", bestUnblock, &stubConn{}, bestStarted)
+
+	secondStarted := make(chan struct{})
+	second := &stubProxy{name: "second", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		close(secondStarted)
+		return &stubConn{}, nil
+	}}
+
+	rt.SetBestProxy(key, "best")
+
+	start := time.Now()
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, second})
+	if err != nil {
+		t.Fatalf("serialTcpConn error: %v", err)
+	}
+	if conn == nil {
+		t.Fatal("serialTcpConn returned nil connection")
+	}
+
+	// second must not be launched before the exclusive window elapses.
+	select {
+	case <-secondStarted:
+		if time.Since(start) < smartBestExclusiveWindow {
+			t.Fatal("second launched before exclusive window elapsed")
+		}
+	case <-time.After(2 * smartBestExclusiveWindow):
+		t.Fatal("second proxy never launched")
+	}
+
+	// second wins the race; best is unblocked later and drained as a loser.
+	bestUnblock <- struct{}{}
+	pc.wg.Wait()
+
+	got, _ := rt.GetBestProxy(key)
+	if got != "second" {
+		t.Fatalf("best = %q, want second", got)
+	}
+	_ = conn.Close()
+}
+
+func TestBestFirstRace_BestFailEarlyStartsFallbackImmediately(t *testing.T) {
+	const key = "TARGET:example.com"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	bestStarted := make(chan struct{})
+	best := &stubProxy{name: "best", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		close(bestStarted)
+		return nil, syscall.ECONNREFUSED
+	}}
+	secondStarted := make(chan struct{})
+	second := &stubProxy{name: "second", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		close(secondStarted)
+		return &stubConn{}, nil
+	}}
+
+	rt.SetBestProxy(key, "best")
+
+	start := time.Now()
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, second})
+	if err != nil {
+		t.Fatalf("serialTcpConn error: %v", err)
+	}
+	if conn == nil {
+		t.Fatal("serialTcpConn returned nil connection")
+	}
+
+	// best fails immediately → second must launch well before 600ms elapses.
+	select {
+	case <-secondStarted:
+		elapsed := time.Since(start)
+		if elapsed >= smartBestExclusiveWindow {
+			t.Fatalf("second launched after %v, want immediate (best failed early)", elapsed)
+		}
+	case <-time.After(smartBestExclusiveWindow):
+		t.Fatal("second proxy never launched after best failed early")
+	}
+
+	got, _ := rt.GetBestProxy(key)
+	if got != "second" {
+		t.Fatalf("best = %q, want second", got)
+	}
+	_ = conn.Close()
+}
+
+// =========================================================================
+// debug-log verification for the best-first race policy
+// =========================================================================
+
+// collectLogs subscribes to log events; waitForLog polls until a log with the
+// given prefix arrives or the deadline elapses.  waitAbsentLog polls for the
+// absence of a prefix (used to assert a proxy was never dialed).
+func collectLogs() (waitForLog func(prefix string, timeout time.Duration) bool, stop func()) {
+	sub := log.Subscribe()
+	var mu sync.Mutex
+	var logs []string
+	done := make(chan struct{})
+	go func() {
+		for ev := range sub {
+			mu.Lock()
+			logs = append(logs, ev.Payload)
+			mu.Unlock()
+		}
+		close(done)
+	}()
+	contains := func(prefix string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, l := range logs {
+			if strings.Contains(l, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	waitForLog = func(prefix string, timeout time.Duration) bool {
+		deadline := time.After(timeout)
+		for {
+			if contains(prefix) {
+				return true
+			}
+			select {
+			case <-deadline:
+				return false
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}
+	stop = func() { log.UnSubscribe(sub) }
+	return
+}
+
+// TestSmartPolicy_LogSequence_BestWinsWithinWindow verifies that when best
+// succeeds inside its exclusive window, the other proxies are never dialed.
+func TestSmartPolicy_LogSequence_BestWinsWithinWindow(t *testing.T) {
+	const key = "TARGET:example.com"
+	waitForLog, stop := collectLogs()
+	defer stop()
+
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	best := &stubProxy{name: "best", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return &stubConn{}, nil
+	}}
+	other := &stubProxy{name: "other", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		t.Error("other should not be dialed")
+		return nil, errors.New("unexpected")
+	}}
+	rt.SetBestProxy(key, "best")
+
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, other})
+	if err != nil || conn == nil {
+		t.Fatalf("serialTcpConn = (%v, %v), want conn", conn, err)
+	}
+	_ = conn.Close()
+
+	if !waitForLog("BEST-RACE ranks=[best", time.Second) {
+		t.Fatal("missing BEST-RACE log")
+	}
+	if !waitForLog("STAGGERED-OK proxy=best", time.Second) {
+		t.Fatal("best not marked winner")
+	}
+	if waitForLog("STAGGERED-TRY proxy=other", 200*time.Millisecond) {
+		t.Fatal("other dialed despite best winning")
+	}
+}
+
+// TestSmartPolicy_LogSequence_StaleBestFallsBackToRace verifies that when best
+// stays blocked past the window, the race launches the next proxy and the
+// winner is recorded.
+func TestSmartPolicy_LogSequence_StaleBestFallsBackToRace(t *testing.T) {
+	const key = "TARGET:example.com"
+	waitForLog, stop := collectLogs()
+	defer stop()
+
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	bestStarted := make(chan struct{})
+	bestUnblock := make(chan struct{})
+	best := blockingProxy("best", bestUnblock, &stubConn{}, bestStarted)
+	second := &stubProxy{name: "second", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return &stubConn{}, nil
+	}}
+	rt.SetBestProxy(key, "best")
+
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, second})
+	if err != nil || conn == nil {
+		t.Fatalf("serialTcpConn = (%v, %v), want conn", conn, err)
+	}
+	bestUnblock <- struct{}{}
+	pc.wg.Wait() // let the background drain settle
+	_ = conn.Close()
+
+	if !waitForLog("STAGGERED-TRY proxy=second", time.Second) {
+		t.Fatal("second never dialed in fallback race")
+	}
+	if !waitForLog("STAGGERED-OK proxy=second", time.Second) {
+		t.Fatal("second not marked winner")
+	}
+}
+
+// TestSmartPolicy_LogSequence_BestFailsEarlyStartsFallbackImmediately verifies
+// that a fast best failure launches the next proxy without waiting for the
+// full window, and best is later drained as a loser.
+func TestSmartPolicy_LogSequence_BestFailsEarlyStartsFallbackImmediately(t *testing.T) {
+	const key = "TARGET:example.com"
+	waitForLog, stop := collectLogs()
+	defer stop()
+
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	best := &stubProxy{name: "best", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return nil, syscall.ECONNREFUSED
+	}}
+	second := &stubProxy{name: "second", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return &stubConn{}, nil
+	}}
+	rt.SetBestProxy(key, "best")
+
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, second})
+	if err != nil || conn == nil {
+		t.Fatalf("serialTcpConn = (%v, %v), want conn", conn, err)
+	}
+	pc.wg.Wait()
+	_ = conn.Close()
+
+	if !waitForLog("STAGGERED-FAIL proxy=best", time.Second) {
+		t.Fatal("best failure not logged")
+	}
+	if !waitForLog("STAGGERED-OK proxy=second", time.Second) {
+		t.Fatal("second not marked winner")
 	}
 }
