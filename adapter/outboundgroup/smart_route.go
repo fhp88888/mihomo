@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"net"
 	"sort"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -104,7 +103,7 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key str
 				// Losers are drained in the background via probeCoordinator.
 				ordered := s.rankCandidates(key, proxies, p)
 				conn, err := s.raceAndWrap(ctx, metadata, key, ordered,
-					smartBestExclusiveWindow, &s.probeCoordinator.wg)
+					smartBestExclusiveWindow, &s.probeCoordinator.wg, "Best")
 				if conn != nil || err != nil {
 					return conn, err
 				}
@@ -119,8 +118,7 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key str
 	if len(ordered) == 0 {
 		return nil, nil
 	}
-	log.Debugln("[Smart] route key=%s known proxies attempt order: %v", key, namesOf(ordered))
-	conn, err := s.raceAndWrap(ctx, metadata, key, ordered, smartTCPFallbackStagger, nil)
+	conn, err := s.raceAndWrap(ctx, metadata, key, ordered, smartTCPFallbackStagger, nil, "Stagger")
 	if conn != nil || err != nil {
 		return conn, err
 	}
@@ -171,10 +169,10 @@ func (s *Smart) rankCandidates(key string, proxies []C.Proxy, best C.Proxy) []C.
 // immediately); later candidates follow at smartTCPFallbackStagger.  wg != nil
 // makes loser draining asynchronous so the caller returns the winner
 // immediately while late successful losers still sample latency in the
-// background.
+// background.  pathTag labels the routed log line: "Best" or "Stagger".
 func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key string,
-	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup) (C.Conn, error) {
-	winner, conn, _, err := raceStaggered(ctx, key, ordered, wg, firstStagger,
+	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, pathTag string) (C.Conn, error) {
+	winner, conn, _, err := raceStaggered(ctx, key, ordered, wg, firstStagger, pathTag,
 		// Race dials go through dialTCP, which records a genuine dial failure
 		// as MarkFailed.
 		func(dialCtx context.Context, proxy C.Proxy) (C.Conn, int64, error) {
@@ -206,7 +204,7 @@ func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key strin
 }
 
 func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.WaitGroup,
-	firstStagger time.Duration,
+	firstStagger time.Duration, pathTag string,
 	dial func(context.Context, C.Proxy) (C.Conn, int64, error),
 	onConnect func(proxyName string, connectTime int64),
 	onFail func(proxy C.Proxy, err error),
@@ -233,6 +231,10 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 	results := make(chan dialResult, len(ordered))
 	var workers sync.WaitGroup
 	launched, received := 0, 0
+	// successes counts successful results observed before the winner, so the
+	// routed log can tell whether the winner was the 1st, 2nd, … successful
+	// connection (not dial) on this path.
+	successes := 0
 	// firstFailed: the first candidate (best) failed inside its head-start
 	// window — collapse it and dial the next candidate immediately.
 	firstFailed := false
@@ -251,20 +253,14 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 
 	// drain consumes n results, closing successful connections and feeding
 	// onConnect.  It runs from the select-loop goroutine (sync drain) or the
-	// stopAndDrain background goroutine (async discovery drain).  Successful
-	// loser samples are aggregated and logged once per batch.
+	// stopAndDrain background goroutine (async discovery drain).
 	drain := func(n int) {
-		samples := make([]string, 0, n)
 		for i := 0; i < n; i++ {
 			result := <-results
 			if result.err == nil && result.conn != nil {
 				onConnect(result.proxy.Name(), result.connectTime)
-				samples = append(samples, fmt.Sprintf("%s=%dms", result.proxy.Name(), result.connectTime))
 				result.conn.Close()
 			}
-		}
-		if len(samples) > 0 {
-			log.Debugln("[Smart] route key=%s LOSER-SAMPLED %s", key, strings.Join(samples, " "))
 		}
 	}
 
@@ -313,7 +309,8 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 		case result := <-results:
 			received++
 			if result.err == nil {
-				log.Infoln("[Smart] route key=%s routed via %s (%dms)", key, result.proxy.Name(), result.connectTime)
+				successes++
+				log.Infoln("[Smart] route key=%s routed via %s (%dms, %s)", key, result.proxy.Name(), result.connectTime, successTag(pathTag, successes))
 				onConnect(result.proxy.Name(), result.connectTime)
 				if onWinner != nil {
 					onWinner(result.proxy, result.connectTime)
@@ -342,7 +339,10 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 				firstFailed = true
 				if timer != nil {
 					if !timer.Stop() {
-						select { case <-timer.C: default: }
+						select {
+						case <-timer.C:
+						default:
+						}
 					}
 				}
 				timerC = nil
@@ -556,6 +556,13 @@ func orderByNames(ps []C.Proxy, names []string) []C.Proxy {
 		}
 	}
 	return out
+}
+
+// successTag renders the per-path winner tag for the routed log: "Best" for
+// the best-first fast path, or "Discovery#N" / "Stagger#N" where N is the
+// winner's ordinal among successful connections on that path.
+func successTag(pathTag string, n int) string {
+	return fmt.Sprintf("%s#%d", pathTag, n)
 }
 
 func median(vals []float64) float64 {

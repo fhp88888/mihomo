@@ -185,7 +185,7 @@ func (pc *ProbeCoordinator) probeBatch(
 		var failMu sync.Mutex
 		var fatalErr error
 
-		winner, conn, connectTime, err := raceStaggered(ctx, key, batch, &pc.wg, smartTCPFallbackStagger,
+		winner, conn, connectTime, err := raceStaggered(ctx, key, batch, &pc.wg, smartTCPFallbackStagger, "Discovery",
 			// Discovery dials use the caller's raw dial (no MarkFailed inside —
 			// probeBatch classifies node-level vs fatal itself).
 			func(dialCtx context.Context, p C.Proxy) (C.Conn, int64, error) {

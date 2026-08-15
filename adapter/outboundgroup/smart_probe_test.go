@@ -286,7 +286,7 @@ func TestRaceAndWrap_FirstSuccessCancelsLosers(t *testing.T) {
 	}, 1)
 	go func() {
 		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key,
-			[]C.Proxy{first, second, third}, smartTCPFallbackStagger, nil)
+			[]C.Proxy{first, second, third}, smartTCPFallbackStagger, nil, "Stagger")
 		result <- struct {
 			conn C.Conn
 			err  error
@@ -357,7 +357,7 @@ func TestRaceAndWrap_ClosesLateSuccessfulLoser(t *testing.T) {
 	}, 1)
 	go func() {
 		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key,
-			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil)
+			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "Stagger")
 		result <- struct {
 			conn C.Conn
 			err  error
@@ -431,7 +431,7 @@ func TestRaceAndWrap_FatalErrorStopsScheduling(t *testing.T) {
 	table.SetBestProxy(key, first.Name())
 	s := &Smart{testUrl: "test", routeTable: table}
 	_, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key,
-		[]C.Proxy{first, second}, smartTCPFallbackStagger, nil)
+		[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "Stagger")
 	if !errors.Is(err, resolver.ErrIPNotFound) || !tunnel.ShouldStopRetry(err) {
 		t.Fatalf("fatal error = %v, want ErrIPNotFound", err)
 	}
@@ -469,7 +469,7 @@ func TestRaceAndWrap_ParentCancellationStopsScheduling(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		_, err := s.raceAndWrap(ctx, &C.Metadata{Host: "example.com"}, key,
-			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil)
+			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "Stagger")
 		result <- err
 	}()
 
