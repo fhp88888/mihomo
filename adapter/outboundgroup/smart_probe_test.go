@@ -1187,13 +1187,10 @@ func TestSmartPolicy_LogSequence_BestWinsWithinWindow(t *testing.T) {
 	}
 	_ = conn.Close()
 
-	if !waitForLog("BEST-RACE ranks=[best", time.Second) {
-		t.Fatal("missing BEST-RACE log")
-	}
-	if !waitForLog("STAGGERED-OK proxy=best", time.Second) {
+	if !waitForLog("routed via best", time.Second) {
 		t.Fatal("best not marked winner")
 	}
-	if waitForLog("STAGGERED-TRY proxy=other", 200*time.Millisecond) {
+	if waitForLog("routed via other", 200*time.Millisecond) {
 		t.Fatal("other dialed despite best winning")
 	}
 }
@@ -1225,11 +1222,8 @@ func TestSmartPolicy_LogSequence_StaleBestFallsBackToRace(t *testing.T) {
 	pc.wg.Wait() // let the background drain settle
 	_ = conn.Close()
 
-	if !waitForLog("STAGGERED-TRY proxy=second", time.Second) {
+	if !waitForLog("routed via second", time.Second) {
 		t.Fatal("second never dialed in fallback race")
-	}
-	if !waitForLog("STAGGERED-OK proxy=second", time.Second) {
-		t.Fatal("second not marked winner")
 	}
 }
 
@@ -1259,10 +1253,10 @@ func TestSmartPolicy_LogSequence_BestFailsEarlyStartsFallbackImmediately(t *test
 	pc.wg.Wait()
 	_ = conn.Close()
 
-	if !waitForLog("STAGGERED-FAIL proxy=best", time.Second) {
+	if !waitForLog("dial best failed", time.Second) {
 		t.Fatal("best failure not logged")
 	}
-	if !waitForLog("STAGGERED-OK proxy=second", time.Second) {
+	if !waitForLog("routed via second", time.Second) {
 		t.Fatal("second not marked winner")
 	}
 }

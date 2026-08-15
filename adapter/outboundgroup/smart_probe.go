@@ -171,11 +171,9 @@ func (pc *ProbeCoordinator) probeBatch(
 	for offset := 0; offset < n; {
 		// Take up to topK proxies from the current offset
 		batch := make([]C.Proxy, 0, topK)
-		batchNames := make([]string, 0, topK)
 		for i := offset; i < n && len(batch) < topK; i++ {
 			if p, ok := proxyMap[preRanked[i]]; ok {
 				batch = append(batch, p)
-				batchNames = append(batchNames, p.Name())
 			}
 		}
 		offset += len(batch)
@@ -183,8 +181,6 @@ func (pc *ProbeCoordinator) probeBatch(
 		if len(batch) == 0 {
 			break
 		}
-
-		log.Infoln("[Smart] probeBatch key=%s batch=%v", key, batchNames)
 
 		var failMu sync.Mutex
 		var fatalErr error
@@ -225,7 +221,6 @@ func (pc *ProbeCoordinator) probeBatch(
 		)
 
 		if err == nil && conn != nil {
-			log.Infoln("[Smart] probeBatch key=%s winner=%s connectTime=%dms", key, winner.Name(), connectTime)
 			return probeResult{proxy: winner, conn: conn, connectTime: connectTime}
 		}
 

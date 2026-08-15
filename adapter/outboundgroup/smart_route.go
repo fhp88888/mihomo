@@ -67,13 +67,10 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 	key := routeKey(metadata)
 	proxies := s.GetProxies(true)
 
-	log.Debugln("[Smart] tcpRoute ENTER key=%s host=%s proxies=%d", key, metadata.Host, len(proxies))
-
 	// If manually selected, use that proxy directly
 	if s.selected != "" {
 		for _, p := range proxies {
 			if p.Name() == s.selected {
-				log.Debugln("[Smart] tcpRoute key=%s MANUAL-SELECT proxy=%s", key, s.selected)
 				dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
 				defer dialCancel()
 				return s.dialAndWrap(dialCtx, p, metadata, key)
@@ -88,6 +85,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 		if conn != nil || err != nil {
 			return conn, err
 		}
+		log.Debugln("[Smart] route key=%s known proxies all failed, running full discovery", key)
 	}
 
 	// Fallback, Cold start, 4% re-discover, or all serial fallbacks exhausted:
@@ -104,13 +102,11 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key str
 				// stagger.  Whoever connects first wins — including a slow best.
 				// Losers are drained in the background via probeCoordinator.
 				ordered := s.rankCandidates(key, proxies, p)
-				log.Infoln("[Smart] tcpRoute key=%s BEST-RACE ranks=%v (best first)", key, namesOf(ordered))
 				conn, err := s.raceAndWrap(ctx, metadata, key, ordered,
 					smartBestExclusiveWindow, &s.probeCoordinator.wg)
 				if conn != nil || err != nil {
 					return conn, err
 				}
-				log.Infoln("[Smart] tcpRoute key=%s best-race-exhausted, falling to discovery", key)
 				return nil, nil
 			}
 		}
@@ -122,12 +118,11 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key str
 	if len(ordered) == 0 {
 		return nil, nil
 	}
-	log.Infoln("[Smart] tcpRoute key=%s STAGGERED-FALLBACK ranked: %v", key, namesOf(ordered))
+	log.Debugln("[Smart] route key=%s known proxies attempt order: %v", key, namesOf(ordered))
 	conn, err := s.raceAndWrap(ctx, metadata, key, ordered, smartTCPFallbackStagger, nil)
 	if conn != nil || err != nil {
 		return conn, err
 	}
-	log.Infoln("[Smart] tcpRoute key=%s staggered-fallback-exhausted, falling to discovery", key)
 	return nil, nil
 }
 
@@ -244,7 +239,6 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 	launch := func(proxy C.Proxy) {
 		launched++
 		workers.Add(1)
-		log.Debugln("[Smart] tcpRoute key=%s STAGGERED-TRY proxy=%s", key, proxy.Name())
 		go func() {
 			defer workers.Done()
 			dialCtx, dialCancel := context.WithTimeout(raceCtx, C.DefaultTCPTimeout)
@@ -269,7 +263,7 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 			}
 		}
 		if len(samples) > 0 {
-			log.Debugln("[Smart] tcpRoute key=%s LOSER-SAMPLED %s", key, strings.Join(samples, " "))
+			log.Debugln("[Smart] route key=%s LOSER-SAMPLED %s", key, strings.Join(samples, " "))
 		}
 	}
 
@@ -318,7 +312,7 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 		case result := <-results:
 			received++
 			if result.err == nil {
-				log.Infoln("[Smart] tcpRoute key=%s STAGGERED-OK proxy=%s", key, result.proxy.Name())
+				log.Infoln("[Smart] route key=%s routed via %s (%dms)", key, result.proxy.Name(), result.connectTime)
 				onConnect(result.proxy.Name(), result.connectTime)
 				if onWinner != nil {
 					onWinner(result.proxy, result.connectTime)
@@ -334,7 +328,6 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 				stopAndDrain()
 				return result.proxy, result.conn, result.connectTime, nil
 			}
-			log.Debugln("[Smart] tcpRoute key=%s STAGGERED-FAIL proxy=%s err=%v", key, result.proxy.Name(), result.err)
 			if onFail != nil {
 				onFail(result.proxy, result.err)
 			}
@@ -386,7 +379,7 @@ func (s *Smart) dialTCP(ctx context.Context, proxy C.Proxy, metadata *C.Metadata
 	}
 
 	if err != nil {
-		log.Debugln("[Smart] dialAndWrap key=%s proxy=%s FAIL connectTime=%dms err=%v",
+		log.Debugln("[Smart] route key=%s dial %s failed after %dms: %v",
 			key, proxy.Name(), connectTime, err)
 		if !tunnel.ShouldStopRetry(err) && !errors.Is(err, context.Canceled) {
 			s.routeTable.MarkFailed(key, proxy.Name(), 1.0)
@@ -425,7 +418,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	}
 
 	if len(available) == 0 {
-		log.Infoln("[Smart] discoverAndRoute key=%s NO-ALIVE-PROXIES (total=%d)", key, len(proxies))
+		log.Infoln("[Smart] route key=%s no usable proxies (total=%d)", key, len(proxies))
 		return nil, errors.New("no alive proxies available")
 	}
 
@@ -436,18 +429,10 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	// proxy first.  Proxies with no aggregation samples yet (e.g. a quality
 	// node that rarely wins and thus is never sampled) are kept in the
 	// candidate pool with a neutral score so they still get discovered.
-	names := namesOf(available)
 	ordered := s.exploreOrder(available, proxies, key)
 
-	log.Infoln("[Smart] discoverAndRoute key=%s EXPLORE-ORDER %v", key, namesOf(ordered))
-
-	// Refresh scores and dump them for decision traceability
-	s.routeTable.RefreshScores(key, names)
-	log.Infoln("[Smart] discoverAndRoute key=%s SCORES %s",
-		key, s.routeTable.DebugDumpScores(key))
-
 	// Concurrent discovery through probe coordinator
-	proxy, conn, connectTime, err := s.probeCoordinator.Discover(
+	proxy, conn, _, err := s.probeCoordinator.Discover(
 		ctx, key, available, metadata, namesOf(ordered),
 		func(ctx context.Context, p C.Proxy, m *C.Metadata, start time.Time) (C.Conn, int64, error) {
 			dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
@@ -460,17 +445,9 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	)
 
 	if err != nil {
-		log.Infoln("[Smart] discoverAndRoute key=%s DISCOVERY-FAILED err=%v", key, err)
+		log.Infoln("[Smart] route key=%s discovery failed: %v", key, err)
 		return nil, err
 	}
-
-	log.Infoln("[Smart] discoverAndRoute key=%s DISCOVERY-WINNER proxy=%s connectTime=%dms",
-		key, proxy.Name(), connectTime)
-
-	// Refresh scores again with winner latency, then dump final score state
-	s.routeTable.RefreshScores(key, names)
-	log.Infoln("[Smart] discoverAndRoute key=%s POST-DISCOVERY %s",
-		key, s.routeTable.DebugDumpScores(key))
 
 	// Note: probeBatch already wrote the winner's connectTime to the route table
 	// (smart_probe.go:189). Do NOT write it again here — that would double-count
@@ -630,8 +607,6 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 			info := tracker.Info()
 			maxUpload := info.MaxUploadRate.Load()
 			maxDownload := info.MaxDownloadRate.Load()
-			upTotal := info.UploadTotal.Load()
-			downTotal := info.DownloadTotal.Load()
 			speed := float64(maxUpload)
 			if maxDownload > maxUpload {
 				speed = float64(maxDownload)
@@ -644,26 +619,13 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 			// Always update when TCP stats are available — even 0% loss
 			// drives the EMA back toward 0, preventing stale loss from
 			// accumulating indefinitely.
-			var lossRate float64
 			if trackerConn, ok := tracker.(net.Conn); ok {
 				stats := tcpstats.GetTCPStats(trackerConn)
 				if stats != nil {
-					lossRate = stats.LossRate()
+					lossRate := stats.LossRate()
 					s.routeTable.UpdatePkgLoss(key, proxy.Name(), lossRate)
 				}
 			}
-
-			log.Debugln("[Smart] Close key=%s proxy=%s firstReadLat=%dms maxUp=%d maxDown=%d spd=%.0f loss=%.3f upTotal=%d downTotal=%d",
-				key, proxy.Name(), firstRead, maxUpload, maxDownload, speed, lossRate, upTotal, downTotal)
-		} else {
-			log.Debugln("[Smart] Close key=%s proxy=%s NO-TRACKER firstReadLat=%dms",
-				key, proxy.Name(), firstRead)
-		}
-
-		// Log connection close error for debugging
-		if readErr != nil && readErr != io.EOF {
-			log.Debugln("[Smart] Connection closed with error for [%s] via [%s]: %v",
-				key, proxy.Name(), readErr)
 		}
 
 		// check for TCP RST or early death and mark-failed if necessary
