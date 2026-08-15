@@ -112,22 +112,6 @@ var CdnASNs = map[string]bool{
 	"8452":   true, // Infospace
 }
 
-// AsnOf extracts the numeric ASN from a DstIPASN value.
-//
-// DstIPASN holds either "ASN orgname" (e.g. "13335 Cloudflare"), "0" (ASN
-// lookup failed — see getASNCode), or "" (never resolved).  It returns the
-// numeric part on success and "0" when no usable ASN is available, so callers
-// can branch on asn == "0" without distinguishing the empty/failed cases.
-func AsnOf(dstIPASN string) string {
-	if dstIPASN == "" || dstIPASN == "unknown" {
-		return "0"
-	}
-	if idx := strings.IndexByte(dstIPASN, ' '); idx >= 0 {
-		return dstIPASN[:idx]
-	}
-	return dstIPASN
-}
-
 type (
 	Store struct{}
 

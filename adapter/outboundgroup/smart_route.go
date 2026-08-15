@@ -46,12 +46,13 @@ const (
 )
 
 // routeKey returns the route table key for a connection's metadata.
-// Format: "ASN:<number>" when ASN is available and valid,
-// otherwise "TARGET:<effective-target>".
+// Format: "ASN:<number> <org>" (e.g. "ASN:13335 Cloudflare") when ASN is
+// available and valid, otherwise "TARGET:<effective-target>".  The org name is
+// kept in the key so the route table stores and surfaces the full "13335
+// Cloudflare" identity, not just the numeric ASN.
 func routeKey(metadata *C.Metadata) string {
-	asn := smart.AsnOf(metadata.DstIPASN)
-	if asn != "0" {
-		return "ASN:" + asn
+	if dst := metadata.DstIPASN; dst != "0" && dst != "" && dst != "unknown" {
+		return "ASN:" + dst
 	}
 
 	target := metadata.SmartTarget

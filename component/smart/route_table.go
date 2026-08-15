@@ -92,7 +92,8 @@ type TableSnapshot struct {
 }
 
 // RouteTable is a concurrent-safe in-memory routing table.
-// Each row is keyed by ASN:<number> or TARGET:<name>.
+// Each row is keyed by "ASN:<number> <org>" (e.g. "ASN:13335 Cloudflare")
+// or "TARGET:<name>".
 // Rows are LRU-evicted when the table exceeds maxRows.
 type RouteTable struct {
 	mu      sync.RWMutex

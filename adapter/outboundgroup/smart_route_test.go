@@ -159,7 +159,7 @@ func TestCheckResetByPeer(t *testing.T) {
 }
 
 // TestRouteKey verifies the route table key selection rules:
-//   - ASN available and valid: "ASN:<number>"
+//   - ASN available and valid: "ASN:<number> <org>" (e.g. "ASN:2497 KDDI")
 //   - ASN lookup failed ("0" or "unknown"): "TARGET:<effective-target>"
 func TestRouteKey(t *testing.T) {
 	mkMeta := func(host string, dstIP string, asn string) *C.Metadata {
@@ -175,12 +175,14 @@ func TestRouteKey(t *testing.T) {
 		}
 	}
 
-	t.Run("regular ASN uses ASN only", func(t *testing.T) {
+	t.Run("regular ASN keeps org name in key", func(t *testing.T) {
 		// A non-CDN ASN (e.g. a residential ISP) shares one row across all
-		// targets in that ASN — the domain is not part of the key.
+		// targets in that ASN — the domain is not part of the key, but the
+		// org name is stored with the ASN so the route table surfaces the
+		// full "2497 KDDI" identity.
 		m := mkMeta("www.example.com", "1.2.3.4", "2497 "+"KDDI")
-		if got := routeKey(m); got != "ASN:2497" {
-			t.Fatalf("routeKey = %q, want %q", got, "ASN:2497")
+		if got := routeKey(m); got != "ASN:2497 KDDI" {
+			t.Fatalf("routeKey = %q, want %q", got, "ASN:2497 KDDI")
 		}
 	})
 
@@ -200,7 +202,7 @@ func TestRouteKey(t *testing.T) {
 
 	t.Run("legacy unknown sentinel also becomes TARGET", func(t *testing.T) {
 		// rules/common/ipasn.go still writes "unknown" when the ASN rule
-		// matches nothing; AsnOf treats it the same as "0".
+		// matches nothing; routeKey treats it the same as "0".
 		m := mkMeta("www.example.com", "1.2.3.4", "unknown")
 		if got := routeKey(m); got != "TARGET:www.example.com" {
 			t.Fatalf("routeKey = %q, want %q", got, "TARGET:www.example.com")
@@ -209,10 +211,10 @@ func TestRouteKey(t *testing.T) {
 
 	t.Run("cdn ASN is not special-cased", func(t *testing.T) {
 		// 13335 = Cloudflare, listed in CdnASNs. The CDN key form is gone, so
-		// Cloudflare targets key by ASN alone like any other ASN.
+		// Cloudflare targets key by ASN+org like any other ASN.
 		m := mkMeta("www.cloudflare.com", "1.2.3.4", "13335 Cloudflare")
-		if got := routeKey(m); got != "ASN:13335" {
-			t.Fatalf("routeKey = %q, want %q", got, "ASN:13335")
+		if got := routeKey(m); got != "ASN:13335 Cloudflare" {
+			t.Fatalf("routeKey = %q, want %q", got, "ASN:13335 Cloudflare")
 		}
 	})
 
