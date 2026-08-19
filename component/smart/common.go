@@ -210,7 +210,7 @@ func GetEffectiveTarget(host string, dstIP string) string {
 	compute := func() string {
 		parts := strings.Split(h, ".")
 		reg, err := publicsuffix.EffectiveTLDPlusOne(h)
-		if err != nil || reg == "" || reg == h || !(h == reg || strings.HasSuffix(h, "."+reg)) {
+		if err != nil || reg == "" || reg == h || !strings.HasSuffix(h, "."+reg) {
 			if len(parts) >= 2 {
 				reg = strings.Join(parts[len(parts)-2:], ".")
 			} else {
@@ -422,6 +422,24 @@ func InitQueue() {
 	replaceGlobalQueue(emptyQueue)
 }
 
+// mergeOperations flattens the given operation slices into one, deduplicating
+// by formatOperationKey with later slices overriding earlier ones.
+func mergeOperations(slices ...[]StoreOperation) []StoreOperation {
+	opMap := make(map[string]StoreOperation)
+	for _, ops := range slices {
+		for i := range ops {
+			if key := formatOperationKey(&ops[i]); key != "" {
+				opMap[key] = ops[i]
+			}
+		}
+	}
+	out := make([]StoreOperation, 0, len(opMap))
+	for _, op := range opMap {
+		out = append(out, op)
+	}
+	return out
+}
+
 func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 	if len(operations) == 0 {
 		return
@@ -431,26 +449,7 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 	var snapshot []StoreOperation
 
 	globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
-		opMap := make(map[string]StoreOperation, len(old)+len(operations))
-
-		for i := range old {
-			key := formatOperationKey(&old[i])
-			if key != "" {
-				opMap[key] = old[i]
-			}
-		}
-
-		for i := range operations {
-			key := formatOperationKey(&operations[i])
-			if key != "" {
-				opMap[key] = operations[i]
-			}
-		}
-
-		newQueue := make([]StoreOperation, 0, len(opMap))
-		for _, op := range opMap {
-			newQueue = append(newQueue, op)
-		}
+		newQueue := mergeOperations(old, operations)
 
 		threshold := GetBatchSaveThreshold()
 		if len(newQueue) >= threshold {
@@ -475,24 +474,7 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 			// Merge old snapshot first, then current queue, so that newer
 			// values in the current queue override older snapshot values.
 			globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
-				opMap := make(map[string]StoreOperation, len(snapshot)+len(old))
-				for i := range snapshot {
-					key := formatOperationKey(&snapshot[i])
-					if key != "" {
-						opMap[key] = snapshot[i]
-					}
-				}
-				for i := range old {
-					key := formatOperationKey(&old[i])
-					if key != "" {
-						opMap[key] = old[i]
-					}
-				}
-				newQueue := make([]StoreOperation, 0, len(opMap))
-				for _, op := range opMap {
-					newQueue = append(newQueue, op)
-				}
-				return newQueue
+				return mergeOperations(snapshot, old)
 			})
 		} else {
 			log.Debugln("[SmartStore] Queue datas saved, operations: [%d]", len(snapshot))
@@ -549,27 +531,11 @@ func removeFromGlobalQueue(shouldRemove func(StoreOperation) bool) {
 }
 
 func filterQueueByConfig(config string) {
-	updateGlobalQueue(func(currentQueue []StoreOperation) []StoreOperation {
-		newQueue := make([]StoreOperation, 0, len(currentQueue))
-		for _, op := range currentQueue {
-			if op.Config != config {
-				newQueue = append(newQueue, op)
-			}
-		}
-		return newQueue
-	})
+	removeFromGlobalQueue(func(op StoreOperation) bool { return op.Config == config })
 }
 
 func filterQueueByGroup(group, config string) {
-	updateGlobalQueue(func(currentQueue []StoreOperation) []StoreOperation {
-		newQueue := make([]StoreOperation, 0, len(currentQueue))
-		for _, op := range currentQueue {
-			if !(op.Group == group && op.Config == config) {
-				newQueue = append(newQueue, op)
-			}
-		}
-		return newQueue
-	})
+	removeFromGlobalQueue(func(op StoreOperation) bool { return op.Group == group && op.Config == config })
 }
 
 func removeNodesFromQueue(group, config string, nodes []string) {

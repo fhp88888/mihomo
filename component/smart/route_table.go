@@ -24,17 +24,15 @@ const MaxDomainsPerNormalASRow = 20
 // ASN, so its row gets a larger domain table to avoid thrashing the LRU.
 const MaxDomainsPerCDNASRow = 100
 
-// minConnSizeForSpeedKB is the minimum EMA connection size (kB) a domain must
-// reach before its speed samples are trusted in calculateScore.  Connections
-// smaller than 32kB transfer too little data for a reliable throughput
-// reading, so their speed term is skipped.
-const minConnSizeForSpeedKB = 32.0
+// minConnSizeForSpeedKB gates the speed term in calculateScore: smaller
+// connections transfer too little data for a reliable throughput reading.
+const minConnSizeForSpeedKB = 16.0
 
-// connSizeUnknown is passed to calculateScore when no domain connSize is
-// available (restore, cross-row aggregation, debug display).  It is large
-// enough to always include the speed component, matching the pre-domain-aware
-// behaviour.
+// connSizeUnknown stands in for connSize when none is known (restore,
+// aggregation, debug); it is large enough to always include the speed term.
 const connSizeUnknown = 1e18
+
+const maxFailedCount  = 10.0
 
 // ProxyAttributes holds tracked connection quality metrics.
 type ProxyAttributes struct {
@@ -102,15 +100,13 @@ type proxyCell struct {
 	Dirty            bool // true when cell has unsaved changes
 }
 
-// hasSample returns true when any metric has been sampled at least once.
 func (c *proxyCell) hasSample() bool {
 	return c.HasLatencySample || c.HasPkgLossSample || c.HasSpeedSample || c.HasJitterSample
 }
 
-// hasData returns true when the cell has any quality data: at least one metric
-// sample OR a failure count.  A proxy that has only failed (no successful
-// sample yet) must still be scored with the 0.8^n failure penalty, not treated
-// as a blank cell and handed a neutral health-check score.
+// hasData is true when the cell has any sample or a failure count, so a proxy
+// that has only failed is still scored with the failure penalty rather than a
+// neutral health-check score.
 func (c *proxyCell) hasData() bool {
 	return c.hasSample() || c.FailedCount > 0
 }
@@ -190,10 +186,8 @@ func (rt *RouteTable) getOrCreateRow(key string) *rowEntry {
 		return row
 	}
 
-	// Evict if at capacity.  Prefer the least-recently-used row with no
-	// unpersisted changes so we don't silently discard dirty metrics before the
-	// periodic flush.  If every row is dirty, fall back to evicting the LRU row
-	// anyway — unbounded growth is worse than dropping a dirty row.
+	// Evict the least-recently-used row, preferring one with no unpersisted
+	// changes so dirty metrics aren't dropped before the periodic flush.
 	if len(rt.rows) >= rt.maxRows && len(rt.lruOrder) > 0 {
 		evictIdx := -1
 		for i, k := range rt.lruOrder {
@@ -222,33 +216,30 @@ func (rt *RouteTable) getOrCreateRow(key string) *rowEntry {
 	return row
 }
 
-// touchLRU moves key to the end of the LRU list (most recently used).
-// Must be called with mu held.
-func (rt *RouteTable) touchLRU(key string) {
-	for i, k := range rt.lruOrder {
+// moveToBack moves key to the end of list, returning the new slice.
+func moveToBack(list []string, key string) []string {
+	for i, k := range list {
 		if k == key {
-			rt.lruOrder = append(rt.lruOrder[:i], rt.lruOrder[i+1:]...)
-			rt.lruOrder = append(rt.lruOrder, key)
-			return
+			return append(append(list[:i], list[i+1:]...), key)
 		}
 	}
+	return list
 }
 
-// maxDomainsForRow returns the per-row domain-table capacity for a row,
-// depending on whether the row fronts a CDN ASN (larger table) or a normal
-// ASN / TARGET (smaller table).  CDN ASNs are listed in CdnASNs (common.go).
-// Route keys are "ASN:<number> <org>" or "TARGET:<name>"; only the former can
-// be a CDN ASN, and its ASN number is the token between "ASN:" and the first
-// space.
+// touchLRU moves key to the most-recently-used end of the LRU list.
+// Must be called with mu held.
+func (rt *RouteTable) touchLRU(key string) {
+	rt.lruOrder = moveToBack(rt.lruOrder, key)
+}
+
+// maxDomainsForRow returns the per-row domain-table capacity.  CDN ASNs (see
+// CdnASNs) get a larger table because one ASN fronts many distinct sites.
 func maxDomainsForRow(key string) int {
 	rest, ok := strings.CutPrefix(key, "ASN:")
 	if !ok {
 		return MaxDomainsPerNormalASRow
 	}
-	asn := rest
-	if i := strings.IndexByte(rest, ' '); i >= 0 {
-		asn = rest[:i]
-	}
+	asn, _, _ := strings.Cut(rest, " ")
 	if CdnASNs[asn] {
 		return MaxDomainsPerCDNASRow
 	}
@@ -283,13 +274,7 @@ func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domai
 // touchDomainLRU moves domain to the most-recently-used end of the row's
 // domainOrder.  Must be called with mu held.
 func (rt *RouteTable) touchDomainLRU(row *rowEntry, domain string) {
-	for i, d := range row.domainOrder {
-		if d == domain {
-			row.domainOrder = append(row.domainOrder[:i], row.domainOrder[i+1:]...)
-			row.domainOrder = append(row.domainOrder, domain)
-			return
-		}
-	}
+	row.domainOrder = moveToBack(row.domainOrder, domain)
 }
 
 // GetBestProxy returns the current best proxy for a route key's domain.
@@ -338,50 +323,42 @@ func (rt *RouteTable) IsTCPProbed(key, domain string) bool {
 	return ok && cell.tcpProbed
 }
 
-// SetBestProxy sets the best proxy for a route key's domain.
-func (rt *RouteTable) SetBestProxy(key, domain, proxy string) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+// setDomainState updates a domain's routing state.  Caller holds mu.
+func (rt *RouteTable) setDomainState(key, domain, proxy string, setBest, tcpProbed bool) {
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateDomainCell(row, domain)
-	cell.bestProxy = proxy
+	if setBest {
+		cell.bestProxy = proxy
+	}
+	cell.tcpProbed = tcpProbed
 	cell.lastUsed = time.Now().Unix()
 	row.lastUsed = time.Now().Unix()
 	row.rowDirty = true
 	rt.touchDomainLRU(row, domain)
 	rt.touchLRU(key)
+}
+
+// SetBestProxy sets the best proxy for a route key's domain.
+func (rt *RouteTable) SetBestProxy(key, domain, proxy string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.setDomainState(key, domain, proxy, true, false)
 }
 
 // SetTCPProbed marks a route key's domain as having completed TCP discovery.
 func (rt *RouteTable) SetTCPProbed(key, domain string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	row := rt.getOrCreateRow(key)
-	cell := rt.getOrCreateDomainCell(row, domain)
-	cell.tcpProbed = true
-	cell.lastUsed = time.Now().Unix()
-	row.lastUsed = time.Now().Unix()
-	row.rowDirty = true
-	rt.touchDomainLRU(row, domain)
-	rt.touchLRU(key)
+	rt.setDomainState(key, domain, "", false, true)
 }
 
-// SetBestProxyAndTCPProbed atomically promotes proxy to the domain's best and
-// marks it TCP-probed under a single lock.  Callers must not do SetBestProxy +
-// SetTCPProbed as two separate acquisitions: a MarkFailed interleaving between
-// them would leave tcpProbed=true with bestProxy="" (an inconsistent state).
+// SetBestProxyAndTCPProbed sets the domain's best proxy and TCP-probed flag
+// atomically, so a MarkFailed interleaving cannot leave bestProxy empty with
+// tcpProbed set.
 func (rt *RouteTable) SetBestProxyAndTCPProbed(key, domain, proxy string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	row := rt.getOrCreateRow(key)
-	cell := rt.getOrCreateDomainCell(row, domain)
-	cell.bestProxy = proxy
-	cell.tcpProbed = true
-	cell.lastUsed = time.Now().Unix()
-	row.lastUsed = time.Now().Unix()
-	row.rowDirty = true
-	rt.touchDomainLRU(row, domain)
-	rt.touchLRU(key)
+	rt.setDomainState(key, domain, proxy, true, true)
 }
 
 // getOrCreateCell returns the proxy cell for a row, creating it if needed.
@@ -395,7 +372,7 @@ func (rt *RouteTable) getOrCreateCell(row *rowEntry, proxy string) *proxyCell {
 	return cell
 }
 
-// applyEMA applies exponential moving average with 1/4 weight for the new sample.
+// applyEMA applies an exponential moving average weighted 3:1 toward the old value.
 func applyEMA(old, new float64, hasSample bool) float64 {
 	if !hasSample {
 		return new
@@ -404,10 +381,7 @@ func applyEMA(old, new float64, hasSample bool) float64 {
 }
 
 func applyEMAInt64(old, new int64, hasSample bool) int64 {
-	if !hasSample {
-		return new
-	}
-	return int64(float64(old)*3.0/4.0 + float64(new)/4.0)
+	return int64(applyEMA(float64(old), float64(new), hasSample))
 }
 
 func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount float64, jitter float64, connSizeKB float64) float64 {
@@ -499,11 +473,8 @@ func (rt *RouteTable) UpdateSpeed(key, proxy string, speed float64) {
 	rt.touchLRU(key)
 }
 
-// UpdateConnSize updates the EMA connection size (kB) for a domain within a
-// route row.  The domain is the connection's effective target (see
-// GetEffectiveTarget).  Each row keeps at most maxDomainsForRow(key) domains in
-// an LRU (20 for a normal ASN/TARGET row, 100 for a CDN ASN row): when full,
-// the least-recently-used domain is evicted.
+// UpdateConnSize updates the EMA connection size (kB) for a domain, evicting
+// the least-recently-used domain when the row's LRU is full.
 func (rt *RouteTable) UpdateConnSize(key, domain string, sizeKB float64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -514,10 +485,6 @@ func (rt *RouteTable) UpdateConnSize(key, domain string, sizeKB float64) {
 
 	cell.connSize = applyEMA(cell.connSize, sizeKB, cell.hasConnSizeSample)
 	cell.hasConnSizeSample = true
-	// connSize is now part of the persisted domain state, so mark the row dirty
-	// so the next periodic flush writes the updated EMA.  Without this a
-	// steady-state row whose best/tcpProbed never changes would never re-persist
-	// its evolving connSize.
 	row.rowDirty = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
@@ -537,21 +504,22 @@ func (rt *RouteTable) IncrementUseCount(key, proxy string) {
 	rt.touchLRU(key)
 }
 
-// PreRankLatency sorts proxies by latency, preferring data from the given key's
-// row when available.  When key is non-empty only the matching row is consulted;
-// proxies without a sample in that row fall back to healthCheckLatency.  This
-// prevents a positive-feedback loop where the winner of the first target's
-// probe biases all subsequent probes via cross-row aggregation.
-//
-// When key is empty the old cross-row mean behaviour is preserved (used by
-// Unwrap when no metadata is available).
-//
-// Sort is stable — equal latencies preserve input order.
+// PreRankLatency sorts proxies by latency.  When key is non-empty only that
+// row's samples are used (falling back to healthCheckLatency), preventing the
+// first target's winner from biasing later probes via cross-row aggregation.
+// key == "" preserves the legacy cross-row mean.  Sort is stable.
 func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(string) uint16, key string) []string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
 	meanLatency := make(map[string]float64, len(proxies))
+
+	fallbackLatency := func(proxy string) float64 {
+		if healthCheckLatency != nil {
+			return float64(healthCheckLatency(proxy))
+		}
+		return 1e9
+	}
 
 	if key != "" {
 		// Per-key: only use the specific row's data
@@ -565,18 +533,10 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 					continue
 				}
 			}
-			// Fall back to health check
-			if healthCheckLatency != nil {
-				meanLatency[proxy] = float64(healthCheckLatency(proxy))
-			} else {
-				meanLatency[proxy] = 1e9
-			}
+			meanLatency[proxy] = fallbackLatency(proxy)
 		}
-		// When no proxy has per-key data, all latencies come from the
-		// health-check fallback.  On localhost this means every proxy
-		// ties at ~0 ms, so stable-sort would always put the same five
-		// proxies in the first probe batch.  Shuffle to give every proxy
-		// a fair chance on each new target.
+		// With no per-key data every proxy ties at the health-check fallback
+		// (~0 ms on localhost), so shuffle to give each a fair first-batch slot.
 		if !hasKeyData {
 			result := make([]string, len(proxies))
 			copy(result, proxies)
@@ -609,10 +569,8 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 		for proxy, sc := range stats {
 			if sc.count > 0 {
 				meanLatency[proxy] = float64(sc.sum) / float64(sc.count)
-			} else if healthCheckLatency != nil {
-				meanLatency[proxy] = float64(healthCheckLatency(proxy))
 			} else {
-				meanLatency[proxy] = 1e9
+				meanLatency[proxy] = fallbackLatency(proxy)
 			}
 		}
 	}
@@ -700,23 +658,9 @@ func (rt *RouteTable) ProxyFailedCount(key, proxy string) float64 {
 	return cell.FailedCount
 }
 
-// MarkFailed increments the failedCount for the given (key, proxy) pair, and
-// clears bestProxy/tcpProbed on the given domain if that domain points at the
-// failed proxy.  Consecutive failures degrade the score via calculateScore's
-// 0.8^n penalty.
-//
-// The clearing is domain-scoped, not proxy-wide: a failure observed on one
-// domain (e.g. a target-level RST) should not force every other domain that
-// independently chose this proxy to re-discover.  The proxy-wide FailedCount
-// penalty already degrades the proxy's score across all domains, so other
-// domains naturally deprioritize it without a forced re-discovery.  Proxies
-// removed from the provider are still cleared everywhere via RemoveProxy.
-//
-// TODO: When failedCount exceeds a threshold (e.g. consecutive failures ≥
-// maxFailedTimes), consider also calling store.UpdateHostStatus(...) to
-// persist a TTL-based block via the HostStatus failure tracking system
-// (see stats.go).  That gives cross-restart memory and binary exclusion
-// while the score penalty handles in-memory gradual degradation.
+// MarkFailed penalizes a proxy and, when the given domain's best points at it,
+// clears that domain's best/tcpProbed so it re-discovers.  Clearing is
+// domain-scoped: the proxy-wide FailedCount already deprioritizes it elsewhere.
 func (rt *RouteTable) MarkFailed(key, proxy, domain string, penalty float64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -725,7 +669,7 @@ func (rt *RouteTable) MarkFailed(key, proxy, domain string, penalty float64) {
 		return
 	}
 	cell := rt.getOrCreateCell(row, proxy)
-	cell.FailedCount = math.Min(cell.FailedCount+penalty, 10.0)
+	cell.FailedCount = math.Min(cell.FailedCount+penalty, maxFailedCount)
 	cell.Dirty = true
 
 	if domain == "" {

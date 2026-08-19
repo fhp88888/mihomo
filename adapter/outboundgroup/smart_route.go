@@ -26,27 +26,25 @@ import (
 const (
 	smartBestProxyFreshness = 5 * time.Second
 	smartTCPFallbackStagger = 200 * time.Millisecond
-	// smartBestExclusiveWindow is how long the current best proxy gets to win on
-	// its own before the fast-path hands off into the staggered race.
+	// smartBestExclusiveWindow is how long the current best proxy races alone
+	// before the staggered fallback joins in.
 	smartBestExclusiveWindow = 600 * time.Millisecond
-	// smartEarlyDeathLatencyLimit bounds firstReadLatency for a connection to
-	// be classified as "died before any data flowed". A connection that fails
-	// before the first byte within this window is very likely a dead proxy,
-	// not a target-level rejection that simply took longer to surface.
+	// smartEarlyDeathLatencyLimit: a connection that fails before its first
+	// byte within this window is treated as a dead proxy, not a slow target.
 	smartEarlyDeathLatencyLimit = 5 * time.Second
 	// exploreBatch is the number of top-quality candidates dialed first in a
-	// discovery wave.  When the candidate set is larger than this, the
-	// quality-best candidates are shuffled before dialing so we don't always
+	// discovery wave; beyond it the top tier is shuffled so we don't always
 	// dial the same proxy first.
 	exploreBatch = 16
-	// highLossThreshold is the aggregated pkg-loss EMA above which a proxy is
-	// treated as low-quality for discovery ordering (deferred to the end).
+	// highLossThreshold is the pkg-loss EMA above which a proxy is deferred to
+	// the end of discovery.
 	highLossThreshold = 0.1
+	// rediscoverEvery is the fast-path skip rate: 1 in N requests re-discovers.
+	rediscoverEvery = 25
 )
 
-// routeKey returns the route table key for a connection's metadata.
-// Format: "ASN:<number> <org>" (e.g. "ASN:13335 Cloudflare") when ASN is
-// available and valid, otherwise "TARGET:<effective-target>".  
+// routeKey returns the route table key for a connection's metadata:
+// "ASN:<number> <org>" when ASN is available, otherwise "TARGET:<effective-target>".
 func routeKey(metadata *C.Metadata) string {
 	if dst := metadata.DstIPASN; dst != "0" && dst != "" && dst != "unknown" {
 		return "ASN:" + dst
@@ -80,9 +78,9 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 		}
 	}
 
-	// Fast path: known route with TCP-probed best proxy.
-	// 4% of requests intentionally skip the fast path to trigger re-discovery
-	if s.routeTable.IsTCPProbed(key, domain) && rand.Intn(100)%25 != 0 {
+	// Fast path: known route with TCP-probed best proxy.  Skip it for 1 in
+	// rediscoverEvery requests so routes are periodically re-discovered.
+	if s.routeTable.IsTCPProbed(key, domain) && rand.Intn(rediscoverEvery) != 0 {
 		conn, err := s.serialTcpConn(ctx, metadata, key, domain, proxies)
 		if conn != nil || err != nil {
 			return conn, err
@@ -161,9 +159,9 @@ func (s *Smart) rankCandidates(key, domain string, proxies []C.Proxy, best C.Pro
 	}, key, domain)
 
 	if best != nil {
-		return append([]C.Proxy{best}, orderByNames(proxies, ranked)...)
+		return append([]C.Proxy{best}, orderByNamesFrom(ranked, proxyMap)...)
 	}
-	return orderByNames(proxies, ranked)
+	return orderByNamesFrom(ranked, proxyMap)
 }
 
 // raceAndWrap runs a staggered race over ordered and wraps the winner.
@@ -217,11 +215,8 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 
 	raceCtx, cancelRace := context.WithCancel(ctx)
 
-	// keepLosersAlive: 只对 discovery 异步路径（wg != nil）的 winner 分支放开。
-	// 置位后 deferred cancelRace 被跳过，让在途 loser 拨号跑到各自的 2s 超时，
-	// 由后台 drain goroutine 采集真实 connectTime 并更新 EMA（onConnect →
-	// UpdateLatency）。fallback 同步路径（wg == nil）及 ShouldStopRetry /
-	// ctx.Done 返回路径保持立刻取消，避免调用方被最慢的 loser 阻塞。
+	// keepLosersAlive lets the async discovery path finish in-flight loser dials
+	// so their connectTime is sampled (see stopAndDrain).
 	keepLosersAlive := false
 	defer func() {
 		if !keepLosersAlive {
@@ -463,14 +458,7 @@ func (s *Smart) exploreOrder(available []C.Proxy, proxies []C.Proxy, key string)
 	attrs := s.routeTable.ProxyAttrsSnapshot()
 	if len(attrs) == 0 {
 		names := namesOf(available)
-		preRanked := s.routeTable.PreRankLatency(names, func(proxyName string) uint16 {
-			for _, p := range proxies {
-				if p.Name() == proxyName {
-					return p.LastDelayForTestUrl(s.testUrl)
-				}
-			}
-			return 0xffff
-		}, key)
+		preRanked := s.routeTable.PreRankLatency(names, s.lastDelayOf(proxies), key)
 		return orderByNames(available, preRanked)
 	}
 
@@ -564,6 +552,32 @@ func orderByNames(ps []C.Proxy, names []string) []C.Proxy {
 	return out
 }
 
+// lastDelayOf returns a health-check latency lookup over proxies, returning
+// 0xffff for names not in the set.
+func (s *Smart) lastDelayOf(proxies []C.Proxy) func(string) uint16 {
+	byName := make(map[string]C.Proxy, len(proxies))
+	for _, p := range proxies {
+		byName[p.Name()] = p
+	}
+	return func(name string) uint16 {
+		if p, ok := byName[name]; ok {
+			return p.LastDelayForTestUrl(s.testUrl)
+		}
+		return 0xffff
+	}
+}
+
+// orderByNamesFrom reorders names using a prebuilt name→proxy map.
+func orderByNamesFrom(names []string, byName map[string]C.Proxy) []C.Proxy {
+	out := make([]C.Proxy, 0, len(names))
+	for _, name := range names {
+		if p, ok := byName[name]; ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // successTag renders the per-path winner tag for the routed log: "Best" for
 // the best-first fast path, or "Discovery#N" / "Stagger#N" where N is the
 // winner's ordinal among successful connections on that path.
@@ -637,7 +651,6 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 			if metadata.Host != "" {
 				connSize := float64(info.DownloadTotal.Load()+info.UploadTotal.Load()) / 1024.0
 				if connSize > 0 {
-					domain := smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
 					s.routeTable.UpdateConnSize(key, domain, connSize)
 				}
 			}
@@ -748,31 +761,11 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	}
 
 	// Rank remaining by score
-	names := make([]string, len(udpProxies))
-	for i, p := range udpProxies {
-		names[i] = p.Name()
-	}
+	names := namesOf(udpProxies)
 	s.routeTable.RefreshScores(key, names)
-	ranked := s.routeTable.RankByScore(names, func(proxyName string) uint16 {
-		for _, p := range proxies {
-			if p.Name() == proxyName {
-				return p.LastDelayForTestUrl(s.testUrl)
-			}
-		}
-		return 0xffff
-	}, key, domain)
+	ranked := s.routeTable.RankByScore(names, s.lastDelayOf(proxies), key, domain)
 
-	// Build ordered list by score rank
-	ordered := make([]C.Proxy, 0, len(ranked))
-	proxyMap := make(map[string]C.Proxy, len(udpProxies))
-	for _, p := range udpProxies {
-		proxyMap[p.Name()] = p
-	}
-	for _, name := range ranked {
-		if p, ok := proxyMap[name]; ok {
-			ordered = append(ordered, p)
-		}
-	}
+	ordered := orderByNames(udpProxies, ranked)
 
 	// Serial try
 	var lastErr error

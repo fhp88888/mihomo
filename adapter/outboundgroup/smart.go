@@ -30,10 +30,6 @@ const (
 	cleanupInterval = 120 * time.Minute
 )
 
-var (
-	smartCleanupOnce sync.Once
-)
-
 type SmartOption struct {
 	PolicyPriority string  `group:"policy-priority,omitempty"`
 	UseLightGBM    bool    `group:"uselightgbm,omitempty"`
@@ -206,9 +202,6 @@ func (s *Smart) GetConfigFilename() string {
 func (s *Smart) InitSmart() {
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
-	smartCleanupOnce.Do(func() {
-		s.startTimedTask(5*time.Minute, cleanupInterval, "Global orphaned groups Clean up", s.cleanupOrphanedGroups, true)
-	})
 	// try load ASN database for any smart group that needs it
 	if s.preferASN {
 		if err := geodata.InitASN(); err != nil {
@@ -292,14 +285,7 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 		return proxies[0]
 	}
 	s.routeTable.RefreshScores(key, names)
-	ranked := s.routeTable.RankByScore(names, func(proxyName string) uint16 {
-		for _, p := range proxies {
-			if p.Name() == proxyName {
-				return p.LastDelayForTestUrl(s.testUrl)
-			}
-		}
-		return 0xffff
-	}, key, domain)
+	ranked := s.routeTable.RankByScore(names, s.lastDelayOf(proxies), key, domain)
 
 	for _, name := range ranked {
 		for _, p := range proxies {
@@ -518,21 +504,6 @@ func (s *Smart) startTimedTask(initialDelay, interval time.Duration, taskName st
 			}
 		}
 	}()
-}
-
-func (s *Smart) cleanupOrphanedGroups() {
-	allProxies := tunnel.Proxies()
-	existingSmartGroups := make(map[string]bool)
-
-	for name, proxy := range allProxies {
-		if proxy.Type() == C.Smart {
-			existingSmartGroups[name] = true
-		}
-	}
-
-	// Route table is in-memory only — no orphaned DB groups to clean.
-	// Keep this for future extensibility.
-	_ = existingSmartGroups
 }
 
 func (s *Smart) cleanupOrphanedNodeCache() {
