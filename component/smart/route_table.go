@@ -252,7 +252,7 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 	return int64(float64(old)*3.0/4.0 + float64(new)/4.0)
 }
 
-func calculateScoreAtom(latency int64, speed float64, pkgLoss float64, failedCount float64, jitter float64) float64 {
+func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount float64, jitter float64) float64 {
 	score := 0.0
 	if latency > 0 {
 		score = 100.0 / (math.Max(float64(latency), 100.0) +
@@ -270,10 +270,6 @@ func calculateScoreAtom(latency int64, speed float64, pkgLoss float64, failedCou
 	return score
 }
 
-func (rt *RouteTable) calculateScore(proxy string, latency int64, speed, pkgLoss, failedCount, jitter float64) float64 {
-	return calculateScoreAtom(latency, speed, pkgLoss, failedCount, jitter)
-}
-
 // RefreshScores updates non-EMA scores for existing proxy samples in a route row.
 func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 	rt.mu.Lock()
@@ -287,7 +283,7 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 		if !ok || !cell.hasSample() {
 			continue
 		}
-		cell.Score = rt.calculateScore(proxy, cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
+		cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
 	}
 }
 
@@ -462,14 +458,14 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 				if cell.Score > 0 {
 					scores[proxy] = cell.Score
 				} else {
-					scores[proxy] = rt.calculateScore(proxy, cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
+					scores[proxy] = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
 				}
 				continue
 			}
 		}
 		if healthCheckLatency != nil {
 			if hc := healthCheckLatency(proxy); hc != 0 && hc != 0xffff {
-				scores[proxy] = rt.calculateScore(proxy, int64(hc), 0, 0, 0, 0)
+				scores[proxy] = calculateScore(int64(hc), 0, 0, 0, 0)
 			} else {
 				scores[proxy] = 0
 			}
@@ -632,7 +628,7 @@ func (rt *RouteTable) RestoreRow(key, proxy string, pc PersistedCell) {
 		cell.HasPkgLossSample = pc.PkgLoss > 0
 		cell.HasSpeedSample = pc.Speed > 0
 	}
-	cell.Score = rt.calculateScore(proxy, cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
+	cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
 	cell.Dirty = false
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
@@ -816,8 +812,8 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 			loss:         cell.PkgLoss,
 			jitter:       cell.Jitter,
 			speed:        cell.Speed,
-			latencyScore: rt.calculateScore(cell.Name, cell.Latency, 0, 0, cell.FailedCount, cell.Jitter),
-			speedScore:   rt.calculateScore(cell.Name, 0, cell.Speed, 0, cell.FailedCount, cell.Jitter),
+			latencyScore: calculateScore(cell.Latency, 0, 0, cell.FailedCount, cell.Jitter),
+			speedScore:   calculateScore(0, cell.Speed, 0, cell.FailedCount, cell.Jitter),
 			score:        cell.Score,
 		})
 	}

@@ -88,9 +88,9 @@ func TestAggregateByProxyEmpty(t *testing.T) {
 	}
 }
 
-// TestAggregateFeedsBlendedScore verifies that the aggregation pushes back into
-// the route table and the proxy-wise component of the score picks it up.
-func TestAggregateFeedsBlendedScore(t *testing.T) {
+// TestAggregateDoesNotBlendScore verifies that the aggregation pushes back into
+// proxyAttrs for discovery ordering, but does NOT blend into per-target scores.
+func TestAggregateDoesNotBlendScore(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:100|example.com"
 
@@ -107,7 +107,7 @@ func TestAggregateFeedsBlendedScore(t *testing.T) {
 	rt.RefreshScores(key, []string{"p1"})
 	snap := rt.Snapshot("test")
 	pre := rowByKey(t, snap, key).Proxies["p1"].Attributes.Score
-	atom := calculateScoreAtom(150, 0, 0, 0, 0)
+	atom := calculateScore(150, 0, 0, 0, 0)
 	if math.Abs(pre-atom) > 0.000001 {
 		t.Fatalf("expected pre-aggregation score atom=%.6f, got %.6f", atom, pre)
 	}

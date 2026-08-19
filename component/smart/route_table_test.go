@@ -169,7 +169,7 @@ func TestIncrementUseCount(t *testing.T) {
 	}
 }
 
-func TestCalculateScoreAtom(t *testing.T) {
+func TestCalculateScore(t *testing.T) {
 	cases := []struct {
 		latency     int64
 		speed       float64
@@ -201,46 +201,10 @@ func TestCalculateScoreAtom(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		got := calculateScoreAtom(tc.latency, tc.speed, 0, tc.failedCount, tc.jitter)
+		got := calculateScore(tc.latency, tc.speed, 0, tc.failedCount, tc.jitter)
 		if math.Abs(got-tc.expect) > 0.000001 {
 			t.Fatalf("latency=%d speed=%.0f fail=%.1f jitter=%.1f: expected score %.6f, got %.6f", tc.latency, tc.speed, tc.failedCount, tc.jitter, tc.expect, got)
 		}
-	}
-}
-
-func TestCalculateScoreBlend(t *testing.T) {
-	rt := NewRouteTable(100)
-
-	// Target-wise: latency=100 -> atom = 100/110.
-	// Proxy-wise absent -> raw per-target score, unblended = atom.
-	atom := calculateScoreAtom(100, 0, 0, 0, 0)
-	got := rt.calculateScore("proxy-a", 100, 0, 0, 0, 0)
-	if math.Abs(got-atom) > 0.000001 {
-		t.Fatalf("expected unblended score %.6f (atom), got %.6f", atom, got)
-	}
-
-	// Proxy-wise present: latency keeps its raw per-target value (not blended).
-	rt.proxyAttrs["proxy-a"] = ProxyAttributes{Latency: 200}
-	got = rt.calculateScore("proxy-a", 100, 0, 0, 0, 0)
-	if math.Abs(got-atom) > 0.000001 {
-		t.Fatalf("expected latency-unblended score %.6f (atom), got %.6f", atom, got)
-	}
-
-	// Proxy-wise degradation applies a floor to the blended penalties: speed
-	// takes the min, pkg-loss/failed-count/jitter take the max across
-	// target and proxy-wise values.
-	rt.proxyAttrs["proxy-a"] = ProxyAttributes{Speed: 100, PkgLoss: 0.2, FailedCount: 2, Jitter: 30}
-	got = rt.calculateScore("proxy-a", 100, 1048576, 0.05, 0, 0)
-	want := calculateScoreAtom(100, math.Min(1048576, 100), math.Max(0.05, 0.2), math.Max(0, 2), math.Max(0, 30))
-	if math.Abs(got-want) > 0.000001 {
-		t.Fatalf("expected worst-case-blended score %.6f, got %.6f", want, got)
-	}
-
-	// Proxy-wise lookup MISS: proxy-b is not in the aggregation table even
-	// though proxy-a is.  A missing entry returns the raw per-target score.
-	got = rt.calculateScore("proxy-b", 100, 0, 0, 0, 0)
-	if math.Abs(got-atom) > 0.000001 {
-		t.Fatalf("expected miss score %.6f (atom), got %.6f", atom, got)
 	}
 }
 
