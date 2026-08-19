@@ -206,10 +206,34 @@ func TestCalculateScore(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		got := calculateScore(tc.latency, tc.speed, 0, tc.failedCount, tc.jitter)
+		got := calculateScore(tc.latency, tc.speed, 0, tc.failedCount, tc.jitter, connSizeUnknown)
 		if math.Abs(got-tc.expect) > 0.000001 {
 			t.Fatalf("latency=%d speed=%.0f fail=%.1f jitter=%.1f: expected score %.6f, got %.6f", tc.latency, tc.speed, tc.failedCount, tc.jitter, tc.expect, got)
 		}
+	}
+}
+
+func TestCalculateScoreSkipsSpeedForSmallConnSize(t *testing.T) {
+	// For a domain whose connections are smaller than 1MB, the speed term must
+	// be skipped, leaving only the latency (+penalty) components.
+	latencyOnly := 100.0 / (100.0 + 10.0) // latency=100, jitter=0 -> 100/110
+	withSpeed := latencyOnly + math.Log1p(10485760.0/1024.0/1024.0/0.5)
+
+	// connSize below the 1MB threshold: speed skipped.
+	if got := calculateScore(100, 10485760, 0, 0, 0, 1023.0); math.Abs(got-latencyOnly) > 0.000001 {
+		t.Fatalf("small connSize: expected %.6f (speed skipped), got %.6f", latencyOnly, got)
+	}
+	// connSize exactly at the threshold (1MB): speed included.
+	if got := calculateScore(100, 10485760, 0, 0, 0, 1024.0); math.Abs(got-withSpeed) > 0.000001 {
+		t.Fatalf("connSize at threshold: expected %.6f (speed included), got %.6f", withSpeed, got)
+	}
+	// connSize above the threshold: speed included.
+	if got := calculateScore(100, 10485760, 0, 0, 0, 1025.0); math.Abs(got-withSpeed) > 0.000001 {
+		t.Fatalf("large connSize: expected %.6f (speed included), got %.6f", withSpeed, got)
+	}
+	// connSize unknown sentinel: speed included (domain-less callers).
+	if got := calculateScore(100, 10485760, 0, 0, 0, connSizeUnknown); math.Abs(got-withSpeed) > 0.000001 {
+		t.Fatalf("connSize unknown: expected %.6f (speed included), got %.6f", withSpeed, got)
 	}
 }
 
@@ -250,16 +274,46 @@ func TestRankByScore(t *testing.T) {
 	rt.UpdateLatency(key, "proxy-b", 50)
 	rt.UpdateLatency(key, "proxy-c", 200)
 	rt.UpdateSpeed(key, "proxy-c", 10485760)
+	// Give the domain a large connSize so the speed component is not skipped.
+	rt.UpdateConnSize(key, testDomain, 2048)
 	rt.RefreshScores(key, []string{"proxy-a", "proxy-b", "proxy-c"})
 
 	proxies := []string{"proxy-a", "proxy-c", "proxy-b"}
-	ranked := rt.RankByScore(proxies, nil, key)
+	ranked := rt.RankByScore(proxies, nil, key, testDomain)
 	// proxy-c=3.54 (200ms+10MiBps), proxy-a=1.0 (100ms), proxy-b=1.0 (50ms clamped to max 100)
 	expected := []string{"proxy-c", "proxy-a", "proxy-b"}
 	for i := range expected {
 		if ranked[i] != expected[i] {
 			t.Fatalf("ranked[%d]: expected %s, got %s", i, expected[i], ranked[i])
 		}
+	}
+}
+
+func TestRankByScoreSkipsSpeedForSmallConnSize(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// proxy-a: fast latency (100ms), no speed.
+	// proxy-c: slow latency (200ms) but huge speed — normally boosted above
+	// proxy-a when the speed term counts.
+	rt.UpdateLatency(key, "proxy-a", 100)
+	rt.UpdateLatency(key, "proxy-c", 200)
+	rt.UpdateSpeed(key, "proxy-c", 10485760)
+
+	// Small connSize (< 1MB): speed is skipped, so proxy-a (faster latency)
+	// ranks above proxy-c.
+	rt.UpdateConnSize(key, "small.example.com", 100)
+	ranked := rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "small.example.com")
+	if ranked[0] != "proxy-a" {
+		t.Fatalf("small connSize: expected proxy-a first (speed skipped), got %v", ranked)
+	}
+
+	// Large connSize (>= 1MB): speed is included, so proxy-c's throughput
+	// pushes it above proxy-a.
+	rt.UpdateConnSize(key, "large.example.com", 2048)
+	ranked = rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "large.example.com")
+	if ranked[0] != "proxy-c" {
+		t.Fatalf("large connSize: expected proxy-c first (speed included), got %v", ranked)
 	}
 }
 
@@ -273,7 +327,7 @@ func TestRankByScoreStableSort(t *testing.T) {
 	rt.RefreshScores(key, []string{"proxy-a", "proxy-b", "proxy-c"})
 
 	proxies := []string{"proxy-c", "proxy-a", "proxy-b"}
-	ranked := rt.RankByScore(proxies, nil, key)
+	ranked := rt.RankByScore(proxies, nil, key, testDomain)
 	for i := range proxies {
 		if ranked[i] != proxies[i] {
 			t.Fatalf("stable sort broken at [%d]: expected %s, got %s", i, proxies[i], ranked[i])
@@ -302,7 +356,7 @@ func TestRankByScoreWithHealthCheckFallback(t *testing.T) {
 	}
 
 	proxies := []string{"proxy-zero", "proxy-a", "proxy-max", "proxy-b"}
-	ranked := rt.RankByScore(proxies, healthCheck, key)
+	ranked := rt.RankByScore(proxies, healthCheck, key, testDomain)
 	// proxy-a=1.0 (has sample, lat=100), proxy-b=1.0 (hc lat=50 clamped to max 100), proxy-zero=0, proxy-max=0
 	expected := []string{"proxy-a", "proxy-b", "proxy-zero", "proxy-max"}
 	for i := range expected {
@@ -521,7 +575,7 @@ func TestConcurrentSafety(t *testing.T) {
 			rt.IsTCPProbed(key, testDomain)
 			rt.PreRankLatency([]string{"proxy-a", "proxy-b"}, nil, "")
 			rt.RefreshScores(key, []string{"proxy-a", "proxy-b"})
-			rt.RankByScore([]string{"proxy-a", "proxy-b"}, nil, key)
+			rt.RankByScore([]string{"proxy-a", "proxy-b"}, nil, key, testDomain)
 			rt.GetBestProxyIfFresh(key, testDomain, time.Second)
 			rt.Snapshot("test")
 		}(i)

@@ -117,7 +117,7 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key, do
 				// head-start, then the rest ranked by score race at the normal
 				// stagger.  Whoever connects first wins — including a slow best.
 				// Losers are drained in the background via probeCoordinator.
-				ordered := s.rankCandidates(key, proxies, p)
+				ordered := s.rankCandidates(key, domain, proxies, p)
 				conn, err := s.raceAndWrap(ctx, metadata, key, domain, ordered,
 					smartBestExclusiveWindow, &s.probeCoordinator.wg, "Best")
 				if conn != nil || err != nil {
@@ -130,7 +130,7 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key, do
 
 	// Best proxy is stale, unavailable, or failed. Race the alive proxies by
 	// score with a short stagger.
-	ordered := s.rankCandidates(key, proxies, nil)
+	ordered := s.rankCandidates(key, domain, proxies, nil)
 	if len(ordered) == 0 {
 		return nil, nil
 	}
@@ -144,7 +144,7 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key, do
 // rankCandidates filters proxies to alive ones (excluding best when given),
 // refreshes their scores, and returns the score-ranked order with best (if any)
 // anchored first.
-func (s *Smart) rankCandidates(key string, proxies []C.Proxy, best C.Proxy) []C.Proxy {
+func (s *Smart) rankCandidates(key, domain string, proxies []C.Proxy, best C.Proxy) []C.Proxy {
 	over := make([]string, 0, len(proxies))
 	proxyMap := make(map[string]C.Proxy, len(proxies))
 	for _, p := range proxies {
@@ -172,7 +172,7 @@ func (s *Smart) rankCandidates(key string, proxies []C.Proxy, best C.Proxy) []C.
 			return p.LastDelayForTestUrl(s.testUrl)
 		}
 		return 0xffff
-	}, key)
+	}, key, domain)
 
 	if best != nil {
 		return append([]C.Proxy{best}, orderByNames(proxies, ranked)...)
@@ -769,7 +769,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 			}
 		}
 		return 0xffff
-	}, key)
+	}, key, domain)
 
 	// Build ordered list by score rank
 	ordered := make([]C.Proxy, 0, len(ranked))

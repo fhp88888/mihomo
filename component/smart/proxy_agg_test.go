@@ -107,7 +107,7 @@ func TestAggregateDoesNotBlendScore(t *testing.T) {
 	rt.RefreshScores(key, []string{"p1"})
 	snap := rt.Snapshot("test")
 	pre := rowByKey(t, snap, key).Proxies["p1"].Attributes.Score
-	atom := calculateScore(150, 0, 0, 0, 0)
+	atom := calculateScore(150, 0, 0, 0, 0, connSizeUnknown)
 	if math.Abs(pre-atom) > 0.000001 {
 		t.Fatalf("expected pre-aggregation score atom=%.6f, got %.6f", atom, pre)
 	}

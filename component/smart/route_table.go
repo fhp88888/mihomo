@@ -18,6 +18,18 @@ const DefaultMaxRows = 5000
 // tracks at most this many distinct effective domains by connection size.
 const MaxDomainsPerRow = 20
 
+// minConnSizeForSpeedKB is the minimum EMA connection size (kB) a domain must
+// reach before its speed samples are trusted in calculateScore.  Connections
+// smaller than 1MB transfer too little data for a reliable throughput reading,
+// so their speed term is skipped.
+const minConnSizeForSpeedKB = 1024.0
+
+// connSizeUnknown is passed to calculateScore when no domain connSize is
+// available (restore, cross-row aggregation, debug display).  It is large
+// enough to always include the speed component, matching the pre-domain-aware
+// behaviour.
+const connSizeUnknown = 1e18
+
 // ProxyAttributes holds tracked connection quality metrics.
 type ProxyAttributes struct {
 	PkgLoss     float64 `json:"pkg_loss"`
@@ -342,13 +354,13 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 	return int64(float64(old)*3.0/4.0 + float64(new)/4.0)
 }
 
-func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount float64, jitter float64) float64 {
+func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount float64, jitter float64, connSizeKB float64) float64 {
 	score := 0.0
 	if latency > 0 {
 		score = 100.0 / (math.Max(float64(latency), 100.0) +
 			math.Max(jitter, 10.0))
 	}
-	if speed > 0 {
+	if speed > 0 && connSizeKB >= minConnSizeForSpeedKB {
 		// 500kb/s is a sensitive threshold to define what is good download speed or not.
 		// so divided by 0.5
 		score += math.Log1p(speed / 1024.0 / 1024.0 / 0.5)
@@ -373,7 +385,7 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 		if !ok || !cell.hasSample() {
 			continue
 		}
-		cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
+		cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeUnknown)
 	}
 }
 
@@ -554,26 +566,32 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 }
 
 // RankByScore sorts proxies by score descending, falling back to latency-derived scores.
-func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(string) uint16, key string) []string {
+func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(string) uint16, key, domain string) []string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
 	scores := make(map[string]float64, len(proxies))
 	row, rowOK := rt.rows[key]
+
+	// Per-domain connSize gates the speed component.  A domain without a cell
+	// yet has connSize 0, which also skips the speed term.
+	var connSizeKB float64
+	if rowOK {
+		if dc, ok := row.domainTable[domain]; ok {
+			connSizeKB = dc.connSize
+		}
+	}
+
 	for _, proxy := range proxies {
 		if rowOK {
 			if cell, ok := row.proxies[proxy]; ok && cell.hasSample() {
-				if cell.Score > 0 {
-					scores[proxy] = cell.Score
-				} else {
-					scores[proxy] = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
-				}
+				scores[proxy] = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeKB)
 				continue
 			}
 		}
 		if healthCheckLatency != nil {
 			if hc := healthCheckLatency(proxy); hc != 0 && hc != 0xffff {
-				scores[proxy] = calculateScore(int64(hc), 0, 0, 0, 0)
+				scores[proxy] = calculateScore(int64(hc), 0, 0, 0, 0, connSizeKB)
 			} else {
 				scores[proxy] = 0
 			}
@@ -747,7 +765,7 @@ func (rt *RouteTable) RestoreRow(key, proxy string, pc PersistedCell) {
 		cell.HasPkgLossSample = pc.PkgLoss > 0
 		cell.HasSpeedSample = pc.Speed > 0
 	}
-	cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
+	cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeUnknown)
 	cell.Dirty = false
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
@@ -993,8 +1011,8 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 			loss:         cell.PkgLoss,
 			jitter:       cell.Jitter,
 			speed:        cell.Speed,
-			latencyScore: calculateScore(cell.Latency, 0, 0, cell.FailedCount, cell.Jitter),
-			speedScore:   calculateScore(0, cell.Speed, 0, cell.FailedCount, cell.Jitter),
+			latencyScore: calculateScore(cell.Latency, 0, 0, cell.FailedCount, cell.Jitter, connSizeUnknown),
+			speedScore:   calculateScore(0, cell.Speed, 0, cell.FailedCount, cell.Jitter, connSizeUnknown),
 			score:        cell.Score,
 		})
 	}
