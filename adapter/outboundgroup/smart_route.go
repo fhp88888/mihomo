@@ -15,6 +15,7 @@ import (
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/smart"
 	"github.com/metacubex/mihomo/component/smart/tcpstats"
 	C "github.com/metacubex/mihomo/constant"
@@ -172,7 +173,7 @@ func (s *Smart) rankCandidates(key, domain string, proxies []C.Proxy, best C.Pro
 // background.  pathTag labels the routed log line: "Best" or "Stagger".
 func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, domain string,
 	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, pathTag string) (C.Conn, error) {
-	winner, conn, _, err := raceStaggered(ctx, key, ordered, wg, firstStagger, pathTag,
+	winner, conn, connectTime, err := raceStaggered(ctx, key, ordered, wg, firstStagger, pathTag,
 		// Race dials go through dialTCP, which records a genuine dial failure
 		// as MarkFailed.
 		func(dialCtx context.Context, proxy C.Proxy) (C.Conn, int64, error) {
@@ -199,7 +200,7 @@ func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, doma
 	if conn == nil {
 		return nil, nil
 	}
-	return s.wrapTCPConn(conn, winner, metadata), nil
+	return s.wrapTCPConn(conn, winner, metadata, connectTime), nil
 }
 
 func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.WaitGroup,
@@ -368,8 +369,9 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 
 // dialTCP dials a known proxy and records a genuine dial failure.
 func (s *Smart) dialTCP(ctx context.Context, proxy C.Proxy, metadata *C.Metadata, key string) (C.Conn, int64, error) {
+	dialCtx, timer := dialer.WithConnTimer(ctx)
 	start := time.Now()
-	conn, err := proxy.DialContext(ctx, metadata)
+	conn, err := proxy.DialContext(dialCtx, metadata)
 	connectTime := time.Since(start).Milliseconds()
 	if connectTime < 1 {
 		connectTime = 1
@@ -381,9 +383,16 @@ func (s *Smart) dialTCP(ctx context.Context, proxy C.Proxy, metadata *C.Metadata
 		if !tunnel.ShouldStopRetry(err) && !errors.Is(err, context.Canceled) {
 			s.routeTable.MarkFailed(key, proxy.Name(), routeDomain(metadata), 1.0)
 		}
+		return nil, connectTime, err
 	}
 
-	return conn, connectTime, err
+	// Carry the raw TCP-connect-to-proxy-server duration on the connection so
+	// wrapTCPConn can log it alongside latency and TTFB.
+	if conn != nil {
+		conn = &tcpTimingConn{Conn: conn, tcpConnectTime: timer.Duration()}
+	}
+
+	return conn, connectTime, nil
 }
 
 // dialAndWrap dials a known proxy and wraps the connection for metrics collection.
@@ -400,7 +409,7 @@ func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Meta
 	s.routeTable.IncrementUseCount(key, proxy.Name())
 	s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
 
-	return s.wrapTCPConn(conn, proxy, metadata), nil
+	return s.wrapTCPConn(conn, proxy, metadata, connectTime), nil
 }
 
 // discoverAndRoute performs pre-rank + concurrent discovery for a new or failed route.
@@ -428,13 +437,17 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key,
 	ordered := s.exploreOrder(available, proxies, key)
 
 	// Concurrent discovery through probe coordinator
-	proxy, conn, _, err := s.probeCoordinator.Discover(
+	proxy, conn, connectTime, err := s.probeCoordinator.Discover(
 		ctx, key, available, metadata, namesOf(ordered),
 		func(ctx context.Context, p C.Proxy, m *C.Metadata, start time.Time) (C.Conn, int64, error) {
-			dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
+			dialCtx, timer := dialer.WithConnTimer(ctx)
+			dialCtx, dialCancel := context.WithTimeout(dialCtx, C.DefaultTCPTimeout)
 			conn, err := p.DialContext(dialCtx, m)
 			dialCancel()
 			elapsed := time.Since(start).Milliseconds()
+			if conn != nil && err == nil {
+				conn = &tcpTimingConn{Conn: conn, tcpConnectTime: timer.Duration()}
+			}
 			return conn, elapsed, err
 		},
 		s.routeTable,
@@ -451,7 +464,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key,
 	s.routeTable.IncrementUseCount(key, proxy.Name())
 	s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
 
-	return s.wrapTCPConn(conn, proxy, metadata), nil
+	return s.wrapTCPConn(conn, proxy, metadata, connectTime), nil
 }
 
 func (s *Smart) exploreOrder(available []C.Proxy, proxies []C.Proxy, key string) []C.Proxy {
@@ -598,10 +611,34 @@ func median(vals []float64) float64 {
 	return (sorted[mid-1] + sorted[mid]) / 2
 }
 
+// tcpTimingConn carries the raw TCP-connect-to-proxy-server duration measured by
+// the dialer on the returned connection, so wrapTCPConn can log it alongside the
+// full dial latency and TTFB without threading it through the race plumbing.
+type tcpTimingConn struct {
+	C.Conn
+	tcpConnectTime time.Duration
+}
+
+func (t *tcpTimingConn) TCPConnectTime() time.Duration { return t.tcpConnectTime }
+
+// Upstream exposes the wrapped connection so common.Cast (and thus N.NeedHandshake)
+// can still unwrap through this wrapper to the underlying conn.
+func (t *tcpTimingConn) Upstream() any { return t.Conn }
+
 // wrapTCPConn wraps a TCP connection with close-callbacks that collect pkg_loss
 // and speed, and penalize RST / early-death failures.  Latency (dial connectTime)
 // is recorded at dial time by the callers, not here.
-func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Conn {
+func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64) C.Conn {
+	key := routeKey(metadata)
+	domain := routeDomain(metadata)
+
+	// The raw TCP-connect-to-proxy-server duration is attached to the connection
+	// by dialTCP / the discovery singleDial; surface it for the establishment log.
+	var tcpConnectTime time.Duration
+	if tc, ok := c.(interface{ TCPConnectTime() time.Duration }); ok {
+		tcpConnectTime = tc.TCPConnectTime()
+	}
+
 	c.AppendToChains(s)
 
 	start := time.Now()
@@ -617,16 +654,16 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 	}
 
 	c = callback.NewFirstReadCallBackConn(c, func(err error) {
-		firstReadLatency.Store(time.Since(start).Milliseconds())
+		ttfb := time.Since(start).Milliseconds()
+		firstReadLatency.Store(ttfb)
 		if err != nil {
 			firstReadErr.Store(err)
 		}
+		log.Infoln("[Smart] established key=%s target=%s proxy=%s latency=%dms tcp_connect=%dms ttfb=%dms",
+			key, domain, proxy.Name(), connectTime, tcpConnectTime.Milliseconds(), ttfb)
 	})
 
 	return callback.NewCloseCallbackConn(c, func() {
-		key := routeKey(metadata)
-		domain := routeDomain(metadata)
-
 		firstRead := firstReadLatency.Load()
 		readErr := firstReadErr.Load()
 

@@ -22,7 +22,7 @@ const MaxDomainsPerNormalASRow = 20
 // MaxDomainsPerCDNASRow caps the per-row domain table (LRU) for a CDN ASN row.
 // A CDN ASN (see CdnASNs in common.go) fronts many distinct sites behind one
 // ASN, so its row gets a larger domain table to avoid thrashing the LRU.
-const MaxDomainsPerCDNASRow = 100
+const MaxDomainsPerCDNASRow = 200
 
 // minConnSizeForSpeedKB gates the speed term in calculateScore: smaller
 // connections transfer too little data for a reliable throughput reading.
