@@ -976,16 +976,16 @@ func TestDomainTableLRUEviction(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	// Fill the domain table to capacity.
-	for i := 0; i < MaxDomainsPerRow; i++ {
+	// Fill the domain table to capacity (normal ASN row).
+	for i := 0; i < MaxDomainsPerNormalASRow; i++ {
 		rt.SetBestProxy(key, fmt.Sprintf("domain-%d.example.com", i), "proxy-a")
 	}
 
 	rt.mu.RLock()
 	count := len(rt.rows[key].domainTable)
 	rt.mu.RUnlock()
-	if count != MaxDomainsPerRow {
-		t.Fatalf("expected %d domains, got %d", MaxDomainsPerRow, count)
+	if count != MaxDomainsPerNormalASRow {
+		t.Fatalf("expected %d domains, got %d", MaxDomainsPerNormalASRow, count)
 	}
 
 	// The first domain (least recently used) should be evicted on overflow.
@@ -1003,8 +1003,56 @@ func TestDomainTableLRUEviction(t *testing.T) {
 	if !overflowPresent {
 		t.Fatal("overflow domain should be present")
 	}
-	if count != MaxDomainsPerRow {
-		t.Fatalf("expected %d domains after overflow, got %d", MaxDomainsPerRow, count)
+	if count != MaxDomainsPerNormalASRow {
+		t.Fatalf("expected %d domains after overflow, got %d", MaxDomainsPerNormalASRow, count)
+	}
+}
+
+func TestDomainTableCDNASLargerCapacity(t *testing.T) {
+	rt := NewRouteTable(100)
+
+	// A CDN ASN row (Cloudflare) gets MaxDomainsPerCDNASRow, not the smaller
+	// normal-ASN limit.
+	cdnKey := "ASN:13335 Cloudflare"
+	for i := 0; i < MaxDomainsPerCDNASRow; i++ {
+		rt.SetBestProxy(cdnKey, fmt.Sprintf("site-%d.example.com", i), "proxy-a")
+	}
+	rt.mu.RLock()
+	cdnCount := len(rt.rows[cdnKey].domainTable)
+	rt.mu.RUnlock()
+	if cdnCount != MaxDomainsPerCDNASRow {
+		t.Fatalf("CDN ASN row expected %d domains, got %d", MaxDomainsPerCDNASRow, cdnCount)
+	}
+
+	// A normal ASN row still caps at MaxDomainsPerNormalASRow.
+	normalKey := "ASN:64512"
+	for i := 0; i < MaxDomainsPerCDNASRow; i++ {
+		rt.SetBestProxy(normalKey, fmt.Sprintf("site-%d.example.com", i), "proxy-a")
+	}
+	rt.mu.RLock()
+	normalCount := len(rt.rows[normalKey].domainTable)
+	rt.mu.RUnlock()
+	if normalCount != MaxDomainsPerNormalASRow {
+		t.Fatalf("normal ASN row expected %d domains, got %d", MaxDomainsPerNormalASRow, normalCount)
+	}
+}
+
+func TestMaxDomainsForRow(t *testing.T) {
+	cases := []struct {
+		key  string
+		want int
+	}{
+		{"ASN:13335 Cloudflare", MaxDomainsPerCDNASRow},
+		{"ASN:13335", MaxDomainsPerCDNASRow},
+		{"ASN:64512 Foo Corp", MaxDomainsPerNormalASRow},
+		{"ASN:64512", MaxDomainsPerNormalASRow},
+		{"TARGET:example.com", MaxDomainsPerNormalASRow},
+		{"", MaxDomainsPerNormalASRow},
+	}
+	for _, tc := range cases {
+		if got := maxDomainsForRow(tc.key); got != tc.want {
+			t.Fatalf("maxDomainsForRow(%q) = %d, want %d", tc.key, got, tc.want)
+		}
 	}
 }
 

@@ -12,11 +12,17 @@ import (
 	"github.com/metacubex/mihomo/log"
 )
 
-const DefaultMaxRows = 5000
+const DefaultMaxRows = 200
 
-// MaxDomainsPerRow caps the per-row domain table (LRU). Each CDN/ASN row
-// tracks at most this many distinct effective domains by connection size.
-const MaxDomainsPerRow = 20
+// MaxDomainsPerNormalASRow caps the per-row domain table (LRU) for a normal
+// ASN or TARGET row: each tracks at most this many distinct effective domains
+// by connection size.
+const MaxDomainsPerNormalASRow = 20
+
+// MaxDomainsPerCDNASRow caps the per-row domain table (LRU) for a CDN ASN row.
+// A CDN ASN (see CdnASNs in common.go) fronts many distinct sites behind one
+// ASN, so its row gets a larger domain table to avoid thrashing the LRU.
+const MaxDomainsPerCDNASRow = 100
 
 // minConnSizeForSpeedKB is the minimum EMA connection size (kB) a domain must
 // reach before its speed samples are trusted in calculateScore.  Connections
@@ -54,9 +60,9 @@ type rowEntry struct {
 	proxies  map[string]*proxyCell
 	// domainTable records per-domain routing state and connection sizes (kB)
 	// observed under this CDN/ASN row, keyed by the connection's effective
-	// target (see GetEffectiveTarget).  Bounded to MaxDomainsPerRow entries via
-	// LRU.  All domains in a row share the same set of proxyCell metrics; only
-	// the best proxy selection (bestProxy/tcpProbed) is per-domain.
+	// target (see GetEffectiveTarget).  Bounded to maxDomainsForRow(key) entries
+	// via LRU.  All domains in a row share the same set of proxyCell metrics;
+	// only the best proxy selection (bestProxy/tcpProbed) is per-domain.
 	domainTable map[string]*domainCell
 	// domainOrder is the LRU order of domainTable keys: index 0 is the least
 	// recently used and is evicted first when the table is full.
@@ -220,6 +226,27 @@ func (rt *RouteTable) touchLRU(key string) {
 	}
 }
 
+// maxDomainsForRow returns the per-row domain-table capacity for a row,
+// depending on whether the row fronts a CDN ASN (larger table) or a normal
+// ASN / TARGET (smaller table).  CDN ASNs are listed in CdnASNs (common.go).
+// Route keys are "ASN:<number> <org>" or "TARGET:<name>"; only the former can
+// be a CDN ASN, and its ASN number is the token between "ASN:" and the first
+// space.
+func maxDomainsForRow(key string) int {
+	rest, ok := strings.CutPrefix(key, "ASN:")
+	if !ok {
+		return MaxDomainsPerNormalASRow
+	}
+	asn := rest
+	if i := strings.IndexByte(rest, ' '); i >= 0 {
+		asn = rest[:i]
+	}
+	if CdnASNs[asn] {
+		return MaxDomainsPerCDNASRow
+	}
+	return MaxDomainsPerNormalASRow
+}
+
 // getOrCreateDomainCell returns the domain cell for a row, creating it if
 // needed and handling the domain-table LRU eviction.  Must be called with mu
 // held.  When the table is full the least-recently-used domain (domainOrder[0])
@@ -229,8 +256,10 @@ func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domai
 		return cell
 	}
 
+	capacity := maxDomainsForRow(row.key)
+
 	// Evict the least-recently-used domain when at capacity.
-	if len(row.domainTable) >= MaxDomainsPerRow && len(row.domainOrder) > 0 {
+	if len(row.domainTable) >= capacity && len(row.domainOrder) > 0 {
 		evictKey := row.domainOrder[0]
 		row.domainOrder = row.domainOrder[1:]
 		delete(row.domainTable, evictKey)
@@ -239,7 +268,7 @@ func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domai
 	cell := &domainCell{domainName: domain}
 	row.domainTable[domain] = cell
 	row.domainOrder = append(row.domainOrder, domain)
-	log.Debugln("[smart] LRU create domain key=%s domain=%s size=%d capacity=%d", row.key, domain, len(row.domainTable), MaxDomainsPerRow)
+	log.Debugln("[smart] LRU create domain key=%s domain=%s size=%d capacity=%d", row.key, domain, len(row.domainTable), capacity)
 	return cell
 }
 
@@ -446,8 +475,9 @@ func (rt *RouteTable) UpdateSpeed(key, proxy string, speed float64) {
 
 // UpdateConnSize updates the EMA connection size (kB) for a domain within a
 // route row.  The domain is the connection's effective target (see
-// GetEffectiveTarget).  Each row keeps at most MaxDomainsPerRow domains in an
-// LRU: when full, the least-recently-used domain is evicted.
+// GetEffectiveTarget).  Each row keeps at most maxDomainsForRow(key) domains in
+// an LRU (20 for a normal ASN/TARGET row, 100 for a CDN ASN row): when full,
+// the least-recently-used domain is evicted.
 func (rt *RouteTable) UpdateConnSize(key, domain string, sizeKB float64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
