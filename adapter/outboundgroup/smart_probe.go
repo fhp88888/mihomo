@@ -213,7 +213,7 @@ func (pc *ProbeCoordinator) probeBatch(
 				if errors.Is(dialErr, context.Canceled) {
 					return // Don't penalize proxy for cancellation
 				}
-				rt.MarkFailed(key, p.Name(), 1.0)
+				rt.MarkFailed(key, p.Name(), routeDomain(metadata), 1.0)
 			},
 			// onWinner: probeBatch does its own winner bookkeeping via the
 			// returned winner, so nothing to do here.

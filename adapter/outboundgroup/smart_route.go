@@ -46,33 +46,19 @@ const (
 
 // routeKey returns the route table key for a connection's metadata.
 // Format: "ASN:<number> <org>" (e.g. "ASN:13335 Cloudflare") when ASN is
-// available and valid, otherwise "TARGET:<effective-target>".  The org name is
-// kept in the key so the route table stores and surfaces the full "13335
-// Cloudflare" identity, not just the numeric ASN.
+// available and valid, otherwise "TARGET:<effective-target>".  
 func routeKey(metadata *C.Metadata) string {
 	if dst := metadata.DstIPASN; dst != "0" && dst != "" && dst != "unknown" {
 		return "ASN:" + dst
 	}
 
-	target := metadata.SmartTarget
-	if target == "" {
-		target = smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
+	target := smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
+	if metadata.SmartTarget == "" {
 		metadata.SmartTarget = target
 	}
 	return "TARGET:" + target
 }
 
-// routeDomain returns the per-domain key within a route row: the connection's
-// effective target (see smart.GetEffectiveTarget).  This indexes the row's
-// domainTable to key per-domain best proxy selection and connection-size
-// tracking, so both paths must agree on it.
-//
-// It deliberately does NOT reuse metadata.SmartTarget: the rule engine may have
-// pre-populated SmartTarget with a rule descriptor (e.g. "DomainSuffix
-// [example.com]") rather than the effective target.  Using GetEffectiveTarget
-// here keeps the routing-state domain key identical to the conn-size bucket
-// written in wrapTCPConn's close callback (UpdateConnSize), so a domain's best
-// and its conn-size sample land in the same domainCell.
 func routeDomain(metadata *C.Metadata) string {
 	return smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
 }
@@ -206,8 +192,7 @@ func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, doma
 		// probed.  The winner's latency is already sampled via onConnect.
 		func(proxy C.Proxy, connectTime int64) {
 			s.routeTable.IncrementUseCount(key, proxy.Name())
-			s.routeTable.SetBestProxy(key, domain, proxy.Name())
-			s.routeTable.SetTCPProbed(key, domain)
+			s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
 		},
 	)
 	if err != nil {
@@ -399,7 +384,7 @@ func (s *Smart) dialTCP(ctx context.Context, proxy C.Proxy, metadata *C.Metadata
 		log.Debugln("[Smart] route key=%s dial %s failed after %dms: %v",
 			key, proxy.Name(), connectTime, err)
 		if !tunnel.ShouldStopRetry(err) && !errors.Is(err, context.Canceled) {
-			s.routeTable.MarkFailed(key, proxy.Name(), 1.0)
+			s.routeTable.MarkFailed(key, proxy.Name(), routeDomain(metadata), 1.0)
 		}
 	}
 
@@ -418,8 +403,7 @@ func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Meta
 	// by connection lifetime and is not available for losers.
 	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
 	s.routeTable.IncrementUseCount(key, proxy.Name())
-	s.routeTable.SetBestProxy(key, domain, proxy.Name())
-	s.routeTable.SetTCPProbed(key, domain)
+	s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
 
 	return s.wrapTCPConn(conn, proxy, metadata), nil
 }
@@ -470,8 +454,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key,
 	// (smart_probe.go:189). Do NOT write it again here — that would double-count
 	// the sample.
 	s.routeTable.IncrementUseCount(key, proxy.Name())
-	s.routeTable.SetBestProxy(key, domain, proxy.Name())
-	s.routeTable.SetTCPProbed(key, domain)
+	s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
 
 	return s.wrapTCPConn(conn, proxy, metadata), nil
 }
@@ -510,10 +493,17 @@ func (s *Smart) exploreOrder(available []C.Proxy, proxies []C.Proxy, key string)
 		if ok {
 			score = a.Score
 		}
+		deferred := ok && (a.FailedCount > 0 || a.PkgLoss > highLossThreshold)
+		// A proxy that has only failed for this key has no sample, so it is
+		// absent from the UseCount-weighted attrs aggregation — defer it from
+		// the row's own FailedCount so it isn't re-dialed in the top tier.
+		if !deferred && s.routeTable.ProxyFailedCount(key, p.Name()) > 0 {
+			deferred = true
+		}
 		cands = append(cands, cand{
 			proxy:    p,
 			score:    score,
-			deferred: ok && (a.FailedCount > 0 || a.PkgLoss > highLossThreshold),
+			deferred: deferred,
 		})
 	}
 
@@ -621,6 +611,7 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 
 	return callback.NewCloseCallbackConn(c, func() {
 		key := routeKey(metadata)
+		domain := routeDomain(metadata)
 
 		firstRead := firstReadLatency.Load()
 		readErr := firstReadErr.Load()
@@ -665,23 +656,23 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 		}
 
 		// check for TCP RST or early death and mark-failed if necessary
-		s.checkResetByPeer(key, proxy.Name(), readErr)
-		s.checkEarlyDeath(key, proxy.Name(), readErr, firstRead, tracker)
+		s.checkResetByPeer(key, domain, proxy.Name(), readErr)
+		s.checkEarlyDeath(key, domain, proxy.Name(), readErr, firstRead, tracker)
 	})
 }
 
 // checkResetByPeer penalizes a proxy when a connection was aborted with a TCP RST
-func (s *Smart) checkResetByPeer(key, proxyName string, readErr error) {
+func (s *Smart) checkResetByPeer(key, domain, proxyName string, readErr error) {
 	if readErr == nil || !errors.Is(readErr, syscall.ECONNRESET) {
 		return
 	}
-	s.routeTable.MarkFailed(key, proxyName, 0.4)
+	s.routeTable.MarkFailed(key, proxyName, domain, 0.4)
 	log.Debugln("[Smart] RST mark-failed key=%s proxy=%s err=%v", key, proxyName, readErr)
 }
 
 // checkEarlyDeath penalizes a proxy when a connection failed before its first
 // byte ever arrived and never completed a bidirectional flow.
-func (s *Smart) checkEarlyDeath(key, proxyName string, readErr error, firstReadLatencyMs int64, tracker statistic.Tracker) {
+func (s *Smart) checkEarlyDeath(key, domain, proxyName string, readErr error, firstReadLatencyMs int64, tracker statistic.Tracker) {
 	if readErr == nil || readErr == io.EOF {
 		return
 	}
@@ -698,7 +689,7 @@ func (s *Smart) checkEarlyDeath(key, proxyName string, readErr error, firstReadL
 			return
 		}
 	}
-	s.routeTable.MarkFailed(key, proxyName, 0.8)
+	s.routeTable.MarkFailed(key, proxyName, domain, 0.8)
 	log.Debugln("[Smart] EARLY-DEATH mark-failed key=%s proxy=%s firstReadLat=%dms err=%v",
 		key, proxyName, firstReadLatencyMs, readErr)
 }
@@ -750,7 +741,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 				if tunnel.ShouldStopRetry(err) {
 					return nil, err
 				}
-				s.routeTable.MarkFailed(key, bestName, 1.0)
+				s.routeTable.MarkFailed(key, bestName, domain, 1.0)
 				break
 			}
 		}

@@ -626,7 +626,7 @@ func TestProbeBatch_NodeLevelError_MarksFailingProxy(t *testing.T) {
 
 	_ = pc.probeBatch(
 		context.Background(), "TARGET:example.com",
-		proxies, &C.Metadata{}, []string{"p1", "p2"},
+		proxies, &C.Metadata{Host: "example.com"}, []string{"p1", "p2"},
 		singleDial, rt,
 	)
 

@@ -366,6 +366,59 @@ func TestRankByScoreWithHealthCheckFallback(t *testing.T) {
 	}
 }
 
+func TestRankByScoreFailedOnlyProxyRanksLast(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// proxy-a has a latency sample; proxy-b has only failures (no sample).
+	rt.UpdateLatency(key, "proxy-a", 100)
+	rt.MarkFailed(key, "proxy-b", testDomain, 3.0)
+
+	// A healthy-looking fallback latency must NOT rescue the failed-only proxy:
+	// its failure penalty must be applied (score 0) so it ranks last.
+	healthCheck := func(name string) uint16 { return 50 }
+
+	ranked := rt.RankByScore([]string{"proxy-b", "proxy-a"}, healthCheck, key, testDomain)
+	if ranked[0] != "proxy-a" {
+		t.Fatalf("failed-only proxy ranked before sampled proxy: got %v", ranked)
+	}
+}
+
+func TestProxyFailedCount(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	if got := rt.ProxyFailedCount(key, "proxy-a"); got != 0 {
+		t.Fatalf("ProxyFailedCount on absent proxy = %v, want 0", got)
+	}
+
+	// MarkFailed only records on an existing row (a proxy that failed was
+	// being used, so its row already exists). Create it first.
+	rt.UpdateLatency(key, "proxy-a", 100)
+	rt.MarkFailed(key, "proxy-a", testDomain, 0.4)
+	rt.MarkFailed(key, "proxy-a", testDomain, 0.8)
+	if got := rt.ProxyFailedCount(key, "proxy-a"); math.Abs(got-1.2) > 0.001 {
+		t.Fatalf("ProxyFailedCount = %v, want 1.2", got)
+	}
+	if got := rt.ProxyFailedCount("ASN:other", "proxy-a"); got != 0 {
+		t.Fatalf("ProxyFailedCount on other key = %v, want 0", got)
+	}
+}
+
+func TestSetBestProxyAndTCPProbed(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	rt.SetBestProxyAndTCPProbed(key, testDomain, "proxy-a")
+
+	if best, ok := rt.GetBestProxy(key, testDomain); !ok || best != "proxy-a" {
+		t.Fatalf("best = %q, %v; want proxy-a, true", best, ok)
+	}
+	if !rt.IsTCPProbed(key, testDomain) {
+		t.Fatal("tcpProbed should be true after SetBestProxyAndTCPProbed")
+	}
+}
+
 func TestSnapshotIncludesScore(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
@@ -549,7 +602,7 @@ func TestMarkFailed(t *testing.T) {
 	rt.UpdateLatency("ASN:1", "proxy-a", 42)
 	rt.SetBestProxy("ASN:1", testDomain, "proxy-a")
 
-	rt.MarkFailed("ASN:1", "proxy-a", 1.0)
+	rt.MarkFailed("ASN:1", "proxy-a", testDomain, 1.0)
 
 	// Best proxy should be cleared
 	if bp, _ := rt.GetBestProxy("ASN:1", testDomain); bp != "" {
@@ -838,7 +891,7 @@ func TestRowMetaDirtyTracking(t *testing.T) {
 	}
 
 	// MarkFailed clears the routing state and re-marks the row dirty.
-	rt.MarkFailed(key, "proxy-a", 1.0)
+	rt.MarkFailed(key, "proxy-a", testDomain, 1.0)
 	snap = rt.SnapshotAndClearDirtyRows()
 	if len(snap) != 1 {
 		t.Fatalf("expected 1 dirty row after MarkFailed, got %d", len(snap))
@@ -940,8 +993,9 @@ func TestPerDomainBestIndependent(t *testing.T) {
 		t.Fatalf("site-b best = %q, want proxy-b", best)
 	}
 
-	// Marking proxy-a failed must only clear site-a, leaving site-b intact.
-	rt.MarkFailed(key, "proxy-a", 1.0)
+	// Marking proxy-a failed on site-a must only clear site-a, leaving site-b
+	// (which still points at proxy-a) intact.
+	rt.MarkFailed(key, "proxy-a", "site-a.example.com", 1.0)
 	if _, ok := rt.GetBestProxy(key, "site-a.example.com"); ok {
 		t.Fatal("site-a best should be cleared after proxy-a fails")
 	}
@@ -950,7 +1004,7 @@ func TestPerDomainBestIndependent(t *testing.T) {
 	}
 }
 
-func TestMarkFailedClearsAllDomains(t *testing.T) {
+func TestMarkFailedClearsOnlyFailingDomain(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:13335"
 
@@ -959,16 +1013,26 @@ func TestMarkFailedClearsAllDomains(t *testing.T) {
 	rt.SetBestProxy(key, "site-b.example.com", "proxy-a")
 	rt.SetBestProxy(key, "site-c.example.com", "proxy-b")
 
-	rt.MarkFailed(key, "proxy-a", 1.0)
+	// A failure on site-a must clear only site-a.  site-b still points at
+	// proxy-a (it did not observe the failure), and site-c is untouched.
+	rt.MarkFailed(key, "proxy-a", "site-a.example.com", 1.0)
 
 	if _, ok := rt.GetBestProxy(key, "site-a.example.com"); ok {
 		t.Fatal("site-a should be cleared")
 	}
-	if _, ok := rt.GetBestProxy(key, "site-b.example.com"); ok {
-		t.Fatal("site-b should be cleared")
+	if best, _ := rt.GetBestProxy(key, "site-b.example.com"); best != "proxy-a" {
+		t.Fatalf("site-b best = %q, want proxy-a (only site-a failed)", best)
 	}
 	if best, _ := rt.GetBestProxy(key, "site-c.example.com"); best != "proxy-b" {
 		t.Fatalf("site-c best = %q, want proxy-b", best)
+	}
+
+	// The failure penalty is still proxy-wide: failedCount on proxy-a advances.
+	rt.mu.RLock()
+	fc := rt.rows[key].proxies["proxy-a"].FailedCount
+	rt.mu.RUnlock()
+	if fc != 1.0 {
+		t.Fatalf("proxy-a failedCount = %v, want 1.0", fc)
 	}
 }
 

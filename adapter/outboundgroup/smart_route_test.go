@@ -48,7 +48,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 
 	t.Run("early death marks failed", func(t *testing.T) {
 		s, before := setup()
-		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, nil)
+		s.checkEarlyDeath(key, "example.com", proxyName, errors.New("connection reset by peer"), 100, nil)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.8 {
 			t.Fatalf("FailedCount = %v, want %v", got, before+0.8)
 		}
@@ -56,7 +56,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 
 	t.Run("EOF is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.checkEarlyDeath(key, proxyName, io.EOF, 100, nil)
+		s.checkEarlyDeath(key, "example.com", proxyName, io.EOF, 100, nil)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
@@ -67,7 +67,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 		// RST is the primary signal handled by checkResetByPeer (0.4); early
 		// death must not add its 0.8 on top.
 		err := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
-		s.checkEarlyDeath(key, proxyName, err, 100, nil)
+		s.checkEarlyDeath(key, "example.com", proxyName, err, 100, nil)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
@@ -75,7 +75,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 
 	t.Run("nil error is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.checkEarlyDeath(key, proxyName, nil, 100, nil)
+		s.checkEarlyDeath(key, "example.com", proxyName, nil, 100, nil)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
@@ -85,7 +85,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 		s, before := setup()
 		// A full request/response exchange (both upload and download) means the
 		// connection survived its first byte — not an early death.
-		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 512))
+		s.checkEarlyDeath(key, "example.com", proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 512))
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
@@ -95,7 +95,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 		s, before := setup()
 		// Only upload flowed, no download — the response never arrived, so the
 		// connection died before completing the exchange.
-		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 0))
+		s.checkEarlyDeath(key, "example.com", proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 0))
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.8 {
 			t.Fatalf("FailedCount = %v, want %v", got, before+0.8)
 		}
@@ -104,7 +104,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 	t.Run("slow failure is ignored", func(t *testing.T) {
 		s, before := setup()
 		slow := smartEarlyDeathLatencyLimit.Milliseconds() + 1000
-		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), slow, nil)
+		s.checkEarlyDeath(key, "example.com", proxyName, errors.New("connection reset by peer"), slow, nil)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
@@ -126,7 +126,7 @@ func TestCheckResetByPeer(t *testing.T) {
 		s, before := setup()
 		// Realistic error chain: *net.OpError wrapping *os.SyscallError wrapping syscall.ECONNRESET.
 		err := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
-		s.checkResetByPeer(key, proxyName, err)
+		s.checkResetByPeer(key, "example.com", proxyName, err)
 		// RST carries a lighter 0.4 penalty, not the full early-death 0.8.
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.4 {
 			t.Fatalf("FailedCount = %v, want %v", got, before+0.4)
@@ -135,7 +135,7 @@ func TestCheckResetByPeer(t *testing.T) {
 
 	t.Run("non-reset error is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.checkResetByPeer(key, proxyName, errors.New("connection closed"))
+		s.checkResetByPeer(key, "example.com", proxyName, errors.New("connection closed"))
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
@@ -143,7 +143,7 @@ func TestCheckResetByPeer(t *testing.T) {
 
 	t.Run("EOF is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.checkResetByPeer(key, proxyName, io.EOF)
+		s.checkResetByPeer(key, "example.com", proxyName, io.EOF)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
@@ -151,7 +151,7 @@ func TestCheckResetByPeer(t *testing.T) {
 
 	t.Run("nil error is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.checkResetByPeer(key, proxyName, nil)
+		s.checkResetByPeer(key, "example.com", proxyName, nil)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
@@ -206,6 +206,22 @@ func TestRouteKey(t *testing.T) {
 		m := mkMeta("www.example.com", "1.2.3.4", "unknown")
 		if got := routeKey(m); got != "TARGET:www.example.com" {
 			t.Fatalf("routeKey = %q, want %q", got, "TARGET:www.example.com")
+		}
+	})
+
+	t.Run("rule descriptor SmartTarget still keys by effective target", func(t *testing.T) {
+		// The tunnel pre-populates SmartTarget with a rule descriptor (e.g.
+		// "DomainSuffix [example.com]"). routeKey must key the row by the
+		// effective target, not the descriptor, so the same site reached via
+		// different rules shares one row.
+		m := mkMeta("www.example.com", "1.2.3.4", "0")
+		m.SmartTarget = "DomainSuffix [example.com]"
+		if got := routeKey(m); got != "TARGET:www.example.com" {
+			t.Fatalf("routeKey = %q, want %q", got, "TARGET:www.example.com")
+		}
+		// The descriptor must be preserved (not overwritten) — it feeds stats.
+		if m.SmartTarget != "DomainSuffix [example.com]" {
+			t.Fatalf("SmartTarget = %q, want rule descriptor preserved", m.SmartTarget)
 		}
 	})
 

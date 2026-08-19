@@ -264,7 +264,12 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 	if metadata.SmartTarget == "" {
 		metadata.SmartTarget = smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
 	}
-	s.getASNCode(metadata)
+	// NOTE: do NOT call getASNCode here.  Unwrap runs inside tunnel.match
+	// under configMux.RLock; getASNCode may perform a blocking DNS resolution
+	// (up to DefaultDNSTimeout) when preferASN is on and the host is unresolved,
+	// which would stall config reloads.  ASN is resolved in DialContext /
+	// ListenPacketContext (outside the lock) instead, so here the fast path
+	// simply keys by TARGET until ASN is known.
 
 	key := routeKey(metadata)
 	domain := routeDomain(metadata)

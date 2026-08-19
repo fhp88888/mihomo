@@ -107,6 +107,14 @@ func (c *proxyCell) hasSample() bool {
 	return c.HasLatencySample || c.HasPkgLossSample || c.HasSpeedSample || c.HasJitterSample
 }
 
+// hasData returns true when the cell has any quality data: at least one metric
+// sample OR a failure count.  A proxy that has only failed (no successful
+// sample yet) must still be scored with the 0.8^n failure penalty, not treated
+// as a blank cell and handed a neutral health-check score.
+func (c *proxyCell) hasData() bool {
+	return c.hasSample() || c.FailedCount > 0
+}
+
 // hasDirtyCell returns true when any cell in the row has unsaved changes.
 // Must be called with mu held.
 func hasDirtyCell(row *rowEntry) bool {
@@ -358,6 +366,24 @@ func (rt *RouteTable) SetTCPProbed(key, domain string) {
 	rt.touchLRU(key)
 }
 
+// SetBestProxyAndTCPProbed atomically promotes proxy to the domain's best and
+// marks it TCP-probed under a single lock.  Callers must not do SetBestProxy +
+// SetTCPProbed as two separate acquisitions: a MarkFailed interleaving between
+// them would leave tcpProbed=true with bestProxy="" (an inconsistent state).
+func (rt *RouteTable) SetBestProxyAndTCPProbed(key, domain, proxy string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row := rt.getOrCreateRow(key)
+	cell := rt.getOrCreateDomainCell(row, domain)
+	cell.bestProxy = proxy
+	cell.tcpProbed = true
+	cell.lastUsed = time.Now().Unix()
+	row.lastUsed = time.Now().Unix()
+	row.rowDirty = true
+	rt.touchDomainLRU(row, domain)
+	rt.touchLRU(key)
+}
+
 // getOrCreateCell returns the proxy cell for a row, creating it if needed.
 // Must be called with mu held.
 func (rt *RouteTable) getOrCreateCell(row *rowEntry, proxy string) *proxyCell {
@@ -412,7 +438,7 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 	}
 	for _, proxy := range proxies {
 		cell, ok := row.proxies[proxy]
-		if !ok || !cell.hasSample() {
+		if !ok || !cell.hasData() {
 			continue
 		}
 		cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeUnknown)
@@ -620,7 +646,7 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 
 	for _, proxy := range proxies {
 		if rowOK {
-			if cell, ok := row.proxies[proxy]; ok && cell.hasSample() {
+			if cell, ok := row.proxies[proxy]; ok && cell.hasData() {
 				scores[proxy] = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeKB)
 				continue
 			}
@@ -655,17 +681,43 @@ func (rt *RouteTable) TouchRow(key string) {
 	rt.touchLRU(key)
 }
 
+// ProxyFailedCount returns the failedCount recorded for a proxy within a
+// specific route key's row, or 0 when the row or proxy has no record.  It backs
+// discovery ordering (exploreOrder) so a proxy that has only failed for this
+// key — and thus has no sample and is absent from the UseCount-weighted
+// proxyAttrs aggregation — is still deferred to the end of the probe batch.
+func (rt *RouteTable) ProxyFailedCount(key, proxy string) float64 {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return 0
+	}
+	cell, ok := row.proxies[proxy]
+	if !ok {
+		return 0
+	}
+	return cell.FailedCount
+}
+
 // MarkFailed increments the failedCount for the given (key, proxy) pair, and
-// clears bestProxy/tcpProbed on every domain in the row that points at the
+// clears bestProxy/tcpProbed on the given domain if that domain points at the
 // failed proxy.  Consecutive failures degrade the score via calculateScore's
 // 0.8^n penalty.
+//
+// The clearing is domain-scoped, not proxy-wide: a failure observed on one
+// domain (e.g. a target-level RST) should not force every other domain that
+// independently chose this proxy to re-discover.  The proxy-wide FailedCount
+// penalty already degrades the proxy's score across all domains, so other
+// domains naturally deprioritize it without a forced re-discovery.  Proxies
+// removed from the provider are still cleared everywhere via RemoveProxy.
 //
 // TODO: When failedCount exceeds a threshold (e.g. consecutive failures ≥
 // maxFailedTimes), consider also calling store.UpdateHostStatus(...) to
 // persist a TTL-based block via the HostStatus failure tracking system
 // (see stats.go).  That gives cross-restart memory and binary exclusion
 // while the score penalty handles in-memory gradual degradation.
-func (rt *RouteTable) MarkFailed(key, proxy string, penalty float64) {
+func (rt *RouteTable) MarkFailed(key, proxy, domain string, penalty float64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row, ok := rt.rows[key]
@@ -676,20 +728,16 @@ func (rt *RouteTable) MarkFailed(key, proxy string, penalty float64) {
 	cell.FailedCount = math.Min(cell.FailedCount+penalty, 10.0)
 	cell.Dirty = true
 
-	// A proxy failure is a proxy-level signal: clear every domain that points at
-	// the failed proxy so none keeps routing to it, and reset their tcpProbed so
-	// they re-discover.  Domains pointing at other proxies are untouched.
-	changed := false
-	for _, dc := range row.domainTable {
-		if dc.bestProxy == proxy {
-			dc.bestProxy = ""
-			dc.tcpProbed = false
-			changed = true
-		}
+	if domain == "" {
+		return
 	}
-	if changed {
-		row.rowDirty = true
+	dc, ok := row.domainTable[domain]
+	if !ok || dc.bestProxy != proxy {
+		return
 	}
+	dc.bestProxy = ""
+	dc.tcpProbed = false
+	row.rowDirty = true
 }
 
 // DecayFailedCounts reduces every cell's FailedCount by 0.1 (floor 0) across all
