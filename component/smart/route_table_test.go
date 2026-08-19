@@ -182,10 +182,10 @@ func TestCalculateScore(t *testing.T) {
 		jitter      float64
 		expect      float64
 	}{
-		// latency-only: score = 100 / (max(latency, 100) + max(jitter, 10)).
+		// latency-only: score = 100 / (max(latency, 50) + max(jitter, 10)).
 		// jitter=0 still applies the 10ms floor to the denominator.
 		{latency: 100, speed: 0, failedCount: 0, jitter: 0, expect: 100.0 / (100.0 + 10.0)}, // 100/110
-		{latency: 50, speed: 0, failedCount: 0, jitter: 0, expect: 100.0 / (100.0 + 10.0)},  // max(50,100)=100
+		{latency: 50, speed: 0, failedCount: 0, jitter: 0, expect: 100.0 / (50.0 + 10.0)},   // max(50,50)=50
 		{latency: 200, speed: 0, failedCount: 0, jitter: 0, expect: 100.0 / (200.0 + 10.0)}, // 100/210
 		// speed contributes log1p(speed / 0.5MBps)
 		{latency: 100, speed: 10485760, failedCount: 0, jitter: 0, expect: 100.0/(100.0+10.0) + math.Log1p(20)},
@@ -194,7 +194,7 @@ func TestCalculateScore(t *testing.T) {
 		// failedCount penalty: 0.8^n multiplier
 		{latency: 100, speed: 0, failedCount: 1, jitter: 0, expect: 100.0 / (100.0 + 10.0) * 0.8},
 		{latency: 100, speed: 0, failedCount: 3, jitter: 0, expect: 100.0 / (100.0 + 10.0) * math.Pow(0.8, 3)},
-		// jitter inflates the latency denominator: 100 / (max(latency,100) + max(jitter,10))
+		// jitter inflates the latency denominator: 100 / (max(latency,50) + max(jitter,10))
 		{latency: 100, speed: 0, failedCount: 0, jitter: 10, expect: 100.0 / (100.0 + 10.0)},   // max(10,10)=10
 		{latency: 100, speed: 0, failedCount: 0, jitter: 5, expect: 100.0 / (100.0 + 10.0)},    // max(5,10)=10, same floor
 		{latency: 100, speed: 0, failedCount: 0, jitter: 50, expect: 100.0 / (100.0 + 50.0)},   // 100/150
@@ -214,21 +214,21 @@ func TestCalculateScore(t *testing.T) {
 }
 
 func TestCalculateScoreSkipsSpeedForSmallConnSize(t *testing.T) {
-	// For a domain whose connections are smaller than 1MB, the speed term must
+	// For a domain whose connections are smaller than 32kB, the speed term must
 	// be skipped, leaving only the latency (+penalty) components.
 	latencyOnly := 100.0 / (100.0 + 10.0) // latency=100, jitter=0 -> 100/110
 	withSpeed := latencyOnly + math.Log1p(10485760.0/1024.0/1024.0/0.5)
 
-	// connSize below the 1MB threshold: speed skipped.
-	if got := calculateScore(100, 10485760, 0, 0, 0, 1023.0); math.Abs(got-latencyOnly) > 0.000001 {
+	// connSize below the 32kB threshold: speed skipped.
+	if got := calculateScore(100, 10485760, 0, 0, 0, 31.0); math.Abs(got-latencyOnly) > 0.000001 {
 		t.Fatalf("small connSize: expected %.6f (speed skipped), got %.6f", latencyOnly, got)
 	}
-	// connSize exactly at the threshold (1MB): speed included.
-	if got := calculateScore(100, 10485760, 0, 0, 0, 1024.0); math.Abs(got-withSpeed) > 0.000001 {
+	// connSize exactly at the threshold (32kB): speed included.
+	if got := calculateScore(100, 10485760, 0, 0, 0, 32.0); math.Abs(got-withSpeed) > 0.000001 {
 		t.Fatalf("connSize at threshold: expected %.6f (speed included), got %.6f", withSpeed, got)
 	}
 	// connSize above the threshold: speed included.
-	if got := calculateScore(100, 10485760, 0, 0, 0, 1025.0); math.Abs(got-withSpeed) > 0.000001 {
+	if got := calculateScore(100, 10485760, 0, 0, 0, 33.0); math.Abs(got-withSpeed) > 0.000001 {
 		t.Fatalf("large connSize: expected %.6f (speed included), got %.6f", withSpeed, got)
 	}
 	// connSize unknown sentinel: speed included (domain-less callers).
@@ -248,7 +248,7 @@ func TestRefreshScoresStoresNonEMA(t *testing.T) {
 	snap := rt.Snapshot("test")
 	got := snap.Rows[0].Proxies[proxy].Attributes.Score
 	rec := snap.Rows[0].Proxies[proxy]
-	atom := 100.0/(math.Max(float64(rec.Attributes.Latency), 100.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
+	atom := 100.0/(math.Max(float64(rec.Attributes.Latency), 50.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
 	expected := atom // no per-proxy aggregation -> raw unblended score
 	if math.Abs(got-expected) > 0.000001 {
 		t.Fatalf("expected initial score %.6f, got %.6f", expected, got)
@@ -259,7 +259,7 @@ func TestRefreshScoresStoresNonEMA(t *testing.T) {
 	rt.RefreshScores(key, []string{proxy})
 	snap = rt.Snapshot("test")
 	rec = snap.Rows[0].Proxies[proxy]
-	atom = 100.0/(math.Max(float64(rec.Attributes.Latency), 100.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
+	atom = 100.0/(math.Max(float64(rec.Attributes.Latency), 50.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
 	expected = atom
 	if math.Abs(rec.Attributes.Score-expected) > 0.000001 {
 		t.Fatalf("expected score from current latency/speed %.6f, got %.6f", expected, rec.Attributes.Score)
@@ -280,8 +280,8 @@ func TestRankByScore(t *testing.T) {
 
 	proxies := []string{"proxy-a", "proxy-c", "proxy-b"}
 	ranked := rt.RankByScore(proxies, nil, key, testDomain)
-	// proxy-c=3.54 (200ms+10MiBps), proxy-a=1.0 (100ms), proxy-b=1.0 (50ms clamped to max 100)
-	expected := []string{"proxy-c", "proxy-a", "proxy-b"}
+	// proxy-c=3.52 (200ms+10MiBps), proxy-b=1.67 (50ms), proxy-a=0.91 (100ms)
+	expected := []string{"proxy-c", "proxy-b", "proxy-a"}
 	for i := range expected {
 		if ranked[i] != expected[i] {
 			t.Fatalf("ranked[%d]: expected %s, got %s", i, expected[i], ranked[i])
@@ -300,15 +300,15 @@ func TestRankByScoreSkipsSpeedForSmallConnSize(t *testing.T) {
 	rt.UpdateLatency(key, "proxy-c", 200)
 	rt.UpdateSpeed(key, "proxy-c", 10485760)
 
-	// Small connSize (< 1MB): speed is skipped, so proxy-a (faster latency)
+	// Small connSize (< 32kB): speed is skipped, so proxy-a (faster latency)
 	// ranks above proxy-c.
-	rt.UpdateConnSize(key, "small.example.com", 100)
+	rt.UpdateConnSize(key, "small.example.com", 10)
 	ranked := rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "small.example.com")
 	if ranked[0] != "proxy-a" {
 		t.Fatalf("small connSize: expected proxy-a first (speed skipped), got %v", ranked)
 	}
 
-	// Large connSize (>= 1MB): speed is included, so proxy-c's throughput
+	// Large connSize (>= 32kB): speed is included, so proxy-c's throughput
 	// pushes it above proxy-a.
 	rt.UpdateConnSize(key, "large.example.com", 2048)
 	ranked = rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "large.example.com")
@@ -357,8 +357,8 @@ func TestRankByScoreWithHealthCheckFallback(t *testing.T) {
 
 	proxies := []string{"proxy-zero", "proxy-a", "proxy-max", "proxy-b"}
 	ranked := rt.RankByScore(proxies, healthCheck, key, testDomain)
-	// proxy-a=1.0 (has sample, lat=100), proxy-b=1.0 (hc lat=50 clamped to max 100), proxy-zero=0, proxy-max=0
-	expected := []string{"proxy-a", "proxy-b", "proxy-zero", "proxy-max"}
+	// proxy-b=1.67 (hc lat=50), proxy-a=0.91 (has sample, lat=100), proxy-zero=0, proxy-max=0
+	expected := []string{"proxy-b", "proxy-a", "proxy-zero", "proxy-max"}
 	for i := range expected {
 		if ranked[i] != expected[i] {
 			t.Fatalf("ranked[%d]: expected %s, got %s", i, expected[i], ranked[i])
@@ -377,7 +377,7 @@ func TestSnapshotIncludesScore(t *testing.T) {
 	snap := rt.Snapshot("test")
 	got := snap.Rows[0].Proxies[proxy].Attributes.Score
 	rec := snap.Rows[0].Proxies[proxy]
-	atom := 100.0/(math.Max(float64(rec.Attributes.Latency), 100.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
+	atom := 100.0/(math.Max(float64(rec.Attributes.Latency), 50.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
 	expected := atom // no per-proxy aggregation -> raw unblended score
 	if math.Abs(got-expected) > 0.000001 {
 		t.Fatalf("expected snapshot score %.6f, got %.6f", expected, got)
@@ -1040,5 +1040,47 @@ func TestRestoreRowMetaLegacyASNDropped(t *testing.T) {
 	}
 	if rt.IsTCPProbed(key, "example.com") {
 		t.Fatal("legacy ASN tcpProbed should be dropped")
+	}
+}
+
+func TestRestoreRowMetaConnSizeRoundtrip(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// UpdateConnSize alone must mark the row dirty so the connSize EMA is
+	// persisted.  (Regression guard: connSize used to be silently dropped
+	// because UpdateConnSize never set rowDirty.)
+	rt.UpdateConnSize(key, testDomain, 2048)
+
+	snap := rt.SnapshotAndClearDirtyRows()
+	if len(snap) != 1 {
+		t.Fatalf("expected 1 dirty row after UpdateConnSize, got %d", len(snap))
+	}
+	pd, ok := snap[key].Domains[testDomain]
+	if !ok {
+		t.Fatalf("snapshot missing domain %q", testDomain)
+	}
+	if pd.ConnSize != 2048 {
+		t.Fatalf("ConnSize = %v, want 2048", pd.ConnSize)
+	}
+	if !pd.HasConnSizeSample {
+		t.Fatal("HasConnSizeSample should be true")
+	}
+
+	// Restore into a fresh table and verify connSize is brought back.
+	rt2 := NewRouteTable(100)
+	rt2.RestoreRowMeta(key, snap[key])
+
+	rt2.mu.RLock()
+	cell := rt2.rows[key].domainTable[testDomain]
+	gotConnSize := cell.connSize
+	gotHas := cell.hasConnSizeSample
+	rt2.mu.RUnlock()
+
+	if gotConnSize != 2048 {
+		t.Fatalf("restored connSize = %v, want 2048", gotConnSize)
+	}
+	if !gotHas {
+		t.Fatal("restored hasConnSizeSample should be true")
 	}
 }

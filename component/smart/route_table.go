@@ -20,9 +20,9 @@ const MaxDomainsPerRow = 20
 
 // minConnSizeForSpeedKB is the minimum EMA connection size (kB) a domain must
 // reach before its speed samples are trusted in calculateScore.  Connections
-// smaller than 1MB transfer too little data for a reliable throughput reading,
-// so their speed term is skipped.
-const minConnSizeForSpeedKB = 1024.0
+// smaller than 32kB transfer too little data for a reliable throughput
+// reading, so their speed term is skipped.
+const minConnSizeForSpeedKB = 32.0
 
 // connSizeUnknown is passed to calculateScore when no domain connSize is
 // available (restore, cross-row aggregation, debug display).  It is large
@@ -239,6 +239,7 @@ func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domai
 	cell := &domainCell{domainName: domain}
 	row.domainTable[domain] = cell
 	row.domainOrder = append(row.domainOrder, domain)
+	log.Debugln("[smart] LRU create domain key=%s domain=%s size=%d capacity=%d", row.key, domain, len(row.domainTable), MaxDomainsPerRow)
 	return cell
 }
 
@@ -357,7 +358,7 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount float64, jitter float64, connSizeKB float64) float64 {
 	score := 0.0
 	if latency > 0 {
-		score = 100.0 / (math.Max(float64(latency), 100.0) +
+		score = 100.0 / (math.Max(float64(latency), 50.0) +
 			math.Max(jitter, 10.0))
 	}
 	if speed > 0 && connSizeKB >= minConnSizeForSpeedKB {
@@ -457,6 +458,11 @@ func (rt *RouteTable) UpdateConnSize(key, domain string, sizeKB float64) {
 
 	cell.connSize = applyEMA(cell.connSize, sizeKB, cell.hasConnSizeSample)
 	cell.hasConnSizeSample = true
+	// connSize is now part of the persisted domain state, so mark the row dirty
+	// so the next periodic flush writes the updated EMA.  Without this a
+	// steady-state row whose best/tcpProbed never changes would never re-persist
+	// its evolving connSize.
+	row.rowDirty = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
 }
@@ -772,10 +778,13 @@ func (rt *RouteTable) RestoreRow(key, proxy string, pc PersistedCell) {
 }
 
 // PersistedDomain is the JSON-serializable form of a domainCell's routing
-// state (bestProxy, tcpProbed).
+// state (bestProxy, tcpProbed) plus its connection-size EMA so the connSize
+// gating in calculateScore survives a restart.
 type PersistedDomain struct {
-	BestProxy string `json:"best_proxy"`
-	TCPProbed bool   `json:"tcp_probed"`
+	BestProxy         string  `json:"best_proxy"`
+	TCPProbed         bool    `json:"tcp_probed"`
+	ConnSize          float64 `json:"conn_size"`
+	HasConnSizeSample bool    `json:"has_conn_size_sample"`
 }
 
 // PersistedRow is the JSON-serializable form of a rowEntry's routing state:
@@ -807,6 +816,8 @@ func (rt *RouteTable) RestoreRowMeta(key string, pr PersistedRow) {
 			cell := rt.getOrCreateDomainCell(row, domain)
 			cell.bestProxy = pd.BestProxy
 			cell.tcpProbed = pd.TCPProbed
+			cell.connSize = pd.ConnSize
+			cell.hasConnSizeSample = pd.HasConnSizeSample
 			cell.lastUsed = now
 		}
 	} else if pr.BestProxy != "" {
@@ -839,8 +850,10 @@ func (rt *RouteTable) SnapshotAndClearDirtyRows() map[string]PersistedRow {
 			domains := make(map[string]PersistedDomain, len(row.domainTable))
 			for domain, cell := range row.domainTable {
 				domains[domain] = PersistedDomain{
-					BestProxy: cell.bestProxy,
-					TCPProbed: cell.tcpProbed,
+					BestProxy:         cell.bestProxy,
+					TCPProbed:         cell.tcpProbed,
+					ConnSize:          cell.connSize,
+					HasConnSizeSample: cell.hasConnSizeSample,
 				}
 			}
 			snapshot[key] = PersistedRow{Domains: domains}
