@@ -49,8 +49,8 @@ func TestCheckEarlyDeath(t *testing.T) {
 	t.Run("early death marks failed", func(t *testing.T) {
 		s, before := setup()
 		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.6 {
-			t.Fatalf("FailedCount = %v, want %v", got, before+0.6)
+		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.8 {
+			t.Fatalf("FailedCount = %v, want %v", got, before+0.8)
 		}
 	})
 
@@ -64,8 +64,8 @@ func TestCheckEarlyDeath(t *testing.T) {
 
 	t.Run("RST is left to checkResetByPeer", func(t *testing.T) {
 		s, before := setup()
-		// RST is the primary signal handled by checkResetByPeer (0.3); early
-		// death must not add its 1.0 on top.
+		// RST is the primary signal handled by checkResetByPeer (0.4); early
+		// death must not add its 0.8 on top.
 		err := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
 		s.checkEarlyDeath(key, proxyName, err, 100, nil)
 		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
@@ -96,8 +96,8 @@ func TestCheckEarlyDeath(t *testing.T) {
 		// Only upload flowed, no download — the response never arrived, so the
 		// connection died before completing the exchange.
 		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 0))
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.6 {
-			t.Fatalf("FailedCount = %v, want %v", got, before+0.6)
+		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.8 {
+			t.Fatalf("FailedCount = %v, want %v", got, before+0.8)
 		}
 	})
 
@@ -127,9 +127,9 @@ func TestCheckResetByPeer(t *testing.T) {
 		// Realistic error chain: *net.OpError wrapping *os.SyscallError wrapping syscall.ECONNRESET.
 		err := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
 		s.checkResetByPeer(key, proxyName, err)
-		// RST carries a lighter 0.2 penalty, not the full 1.0.
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.2 {
-			t.Fatalf("FailedCount = %v, want %v", got, before+0.2)
+		// RST carries a lighter 0.4 penalty, not the full early-death 0.8.
+		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.4 {
+			t.Fatalf("FailedCount = %v, want %v", got, before+0.4)
 		}
 	})
 
@@ -226,6 +226,30 @@ func TestRouteKey(t *testing.T) {
 			t.Fatalf("routeKey = %q, want %q", got, "TARGET:1.2.3.4")
 		}
 	})
+}
+
+// TestRouteDomain verifies that the per-domain key is the effective target,
+// not the rule descriptor the tunnel pre-populates into metadata.SmartTarget.
+// This must match the conn-size bucket written by wrapTCPConn's close callback
+// so routing state and conn-size land in the same domainCell.
+func TestRouteDomain(t *testing.T) {
+	ip, err := netip.ParseAddr("1.2.3.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rule-matched traffic: SmartTarget is a rule descriptor, but the domain
+	// key must still be the effective target.
+	m := &C.Metadata{Host: "www.example.com", DstIP: ip, SmartTarget: "DomainSuffix [example.com]"}
+	if got := routeDomain(m); got != "www.example.com" {
+		t.Fatalf("routeDomain = %q, want %q", got, "www.example.com")
+	}
+
+	// IP-only traffic falls back to the IP.
+	m = &C.Metadata{Host: "", DstIP: ip, SmartTarget: ""}
+	if got := routeDomain(m); got != "1.2.3.4" {
+		t.Fatalf("routeDomain(ip-only) = %q, want %q", got, "1.2.3.4")
+	}
 }
 
 // =========================================================================

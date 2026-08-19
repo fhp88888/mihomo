@@ -267,7 +267,8 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 	s.getASNCode(metadata)
 
 	key := routeKey(metadata)
-	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
+	domain := routeDomain(metadata)
+	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, domain, smartBestProxyFreshness); ok {
 		for _, p := range proxies {
 			if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
 				return p

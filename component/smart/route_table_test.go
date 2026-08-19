@@ -1,11 +1,16 @@
 package smart
 
 import (
+	"fmt"
 	"math"
 	"sync"
 	"testing"
 	"time"
 )
+
+// testDomain is the per-domain key used by tests that exercise the
+// domain-aware best/tcpProbed routing state.
+const testDomain = "example.com"
 
 func TestNewRouteTable(t *testing.T) {
 	rt := NewRouteTable(100)
@@ -22,12 +27,12 @@ func TestSetAndGetBestProxy(t *testing.T) {
 	key := "ASN:64512"
 
 	// Initially no best proxy
-	if _, ok := rt.GetBestProxy(key); ok {
+	if _, ok := rt.GetBestProxy(key, testDomain); ok {
 		t.Fatal("expected no best proxy for new key")
 	}
 
-	rt.SetBestProxy(key, "proxy-a")
-	name, ok := rt.GetBestProxy(key)
+	rt.SetBestProxy(key, testDomain, "proxy-a")
+	name, ok := rt.GetBestProxy(key, testDomain)
 	if !ok {
 		t.Fatal("expected best proxy after set")
 	}
@@ -40,12 +45,12 @@ func TestTCPProbed(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	if rt.IsTCPProbed(key) {
+	if rt.IsTCPProbed(key, testDomain) {
 		t.Fatal("expected false for new key")
 	}
 
-	rt.SetTCPProbed(key)
-	if !rt.IsTCPProbed(key) {
+	rt.SetTCPProbed(key, testDomain)
+	if !rt.IsTCPProbed(key, testDomain) {
 		t.Fatal("expected true after SetTCPProbed")
 	}
 }
@@ -328,18 +333,18 @@ func TestSnapshotIncludesScore(t *testing.T) {
 func TestGetBestProxyIfFresh(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
-	rt.SetBestProxy(key, "proxy-a")
+	rt.SetBestProxy(key, testDomain, "proxy-a")
 
-	name, ok := rt.GetBestProxyIfFresh(key, 20*time.Second)
+	name, ok := rt.GetBestProxyIfFresh(key, testDomain, 20*time.Second)
 	if !ok || name != "proxy-a" {
 		t.Fatalf("expected fresh proxy-a, got %s ok=%v", name, ok)
 	}
 
 	rt.mu.Lock()
-	rt.rows[key].lastUsed = time.Now().Add(-21 * time.Second).Unix()
+	rt.rows[key].domainTable[testDomain].lastUsed = time.Now().Add(-21 * time.Second).Unix()
 	rt.mu.Unlock()
 
-	if name, ok := rt.GetBestProxyIfFresh(key, 20*time.Second); ok {
+	if name, ok := rt.GetBestProxyIfFresh(key, testDomain, 20*time.Second); ok {
 		t.Fatalf("expected stale best proxy to be unavailable, got %s", name)
 	}
 }
@@ -415,9 +420,9 @@ func TestPreRankWithHealthCheckFallback(t *testing.T) {
 func TestLRUEviction(t *testing.T) {
 	rt := NewRouteTable(3) // small max for testing
 
-	rt.SetBestProxy("ASN:1", "p1")
-	rt.SetBestProxy("ASN:2", "p2")
-	rt.SetBestProxy("ASN:3", "p3")
+	rt.SetBestProxy("ASN:1", testDomain, "p1")
+	rt.SetBestProxy("ASN:2", testDomain, "p2")
+	rt.SetBestProxy("ASN:3", testDomain, "p3")
 
 	snap := rt.Snapshot("test")
 	if snap.RowCount != 3 {
@@ -429,7 +434,7 @@ func TestLRUEviction(t *testing.T) {
 	rt.TouchRow("ASN:2")
 
 	// Add a 4th row, should evict ASN:3 (least recently used)
-	rt.SetBestProxy("ASN:4", "p4")
+	rt.SetBestProxy("ASN:4", testDomain, "p4")
 
 	snap = rt.Snapshot("test")
 	if snap.RowCount != 3 {
@@ -437,13 +442,13 @@ func TestLRUEviction(t *testing.T) {
 	}
 
 	// ASN:3 should be gone
-	if _, ok := rt.GetBestProxy("ASN:3"); ok {
+	if _, ok := rt.GetBestProxy("ASN:3", testDomain); ok {
 		t.Fatal("ASN:3 should have been evicted")
 	}
 
 	// ASN:1, ASN:2, ASN:4 should remain
 	for _, k := range []string{"ASN:1", "ASN:2", "ASN:4"} {
-		if _, ok := rt.GetBestProxy(k); !ok {
+		if _, ok := rt.GetBestProxy(k, testDomain); !ok {
 			t.Fatalf("%s should still be in table", k)
 		}
 	}
@@ -467,7 +472,7 @@ func TestRemoveProxy(t *testing.T) {
 	rt := NewRouteTable(100)
 	rt.UpdateLatency("ASN:1", "proxy-a", 42)
 	rt.UpdateLatency("ASN:1", "proxy-b", 30)
-	rt.SetBestProxy("ASN:1", "proxy-a")
+	rt.SetBestProxy("ASN:1", testDomain, "proxy-a")
 
 	rt.RemoveProxy("proxy-a")
 
@@ -480,7 +485,7 @@ func TestRemoveProxy(t *testing.T) {
 		t.Fatal("proxy-b should remain")
 	}
 	// best proxy should be cleared since it was removed
-	if bp, _ := rt.GetBestProxy("ASN:1"); bp != "" {
+	if bp, _ := rt.GetBestProxy("ASN:1", testDomain); bp != "" {
 		t.Fatalf("best proxy should be empty after removal, got %s", bp)
 	}
 }
@@ -488,12 +493,12 @@ func TestRemoveProxy(t *testing.T) {
 func TestMarkFailed(t *testing.T) {
 	rt := NewRouteTable(100)
 	rt.UpdateLatency("ASN:1", "proxy-a", 42)
-	rt.SetBestProxy("ASN:1", "proxy-a")
+	rt.SetBestProxy("ASN:1", testDomain, "proxy-a")
 
 	rt.MarkFailed("ASN:1", "proxy-a", 1.0)
 
 	// Best proxy should be cleared
-	if bp, _ := rt.GetBestProxy("ASN:1"); bp != "" {
+	if bp, _ := rt.GetBestProxy("ASN:1", testDomain); bp != "" {
 		t.Fatalf("best proxy should be empty after mark-failed, got %s", bp)
 	}
 }
@@ -511,13 +516,13 @@ func TestConcurrentSafety(t *testing.T) {
 			rt.UpdatePkgLoss(key, "proxy-a", 0.01)
 			rt.UpdateSpeed(key, "proxy-a", 1000)
 			rt.IncrementUseCount(key, "proxy-a")
-			rt.SetBestProxy(key, "proxy-a")
-			rt.GetBestProxy(key)
-			rt.IsTCPProbed(key)
+			rt.SetBestProxy(key, testDomain, "proxy-a")
+			rt.GetBestProxy(key, testDomain)
+			rt.IsTCPProbed(key, testDomain)
 			rt.PreRankLatency([]string{"proxy-a", "proxy-b"}, nil, "")
 			rt.RefreshScores(key, []string{"proxy-a", "proxy-b"})
 			rt.RankByScore([]string{"proxy-a", "proxy-b"}, nil, key)
-			rt.GetBestProxyIfFresh(key, time.Second)
+			rt.GetBestProxyIfFresh(key, testDomain, time.Second)
 			rt.Snapshot("test")
 		}(i)
 	}
@@ -528,9 +533,9 @@ func TestConcurrentSafety(t *testing.T) {
 
 func TestSnapshotRowOrder(t *testing.T) {
 	rt := NewRouteTable(100)
-	rt.SetBestProxy("ASN:1", "p1")
-	rt.SetBestProxy("ASN:3", "p3")
-	rt.SetBestProxy("ASN:2", "p2")
+	rt.SetBestProxy("ASN:1", testDomain, "p1")
+	rt.SetBestProxy("ASN:3", testDomain, "p3")
+	rt.SetBestProxy("ASN:2", testDomain, "p2")
 	time.Sleep(time.Second) // ensure distinct timestamp
 	rt.TouchRow("ASN:2")    // make ASN:2 most recent
 
@@ -751,9 +756,9 @@ func TestRowMetaDirtyTracking(t *testing.T) {
 		t.Fatalf("expected no dirty rows on fresh table, got %d", len(snap))
 	}
 
-	// SetBestProxy marks the row dirty and snapshots the best proxy.
-	rt.SetBestProxy(key, "proxy-a")
-	rt.SetTCPProbed(key)
+	// SetBestProxy marks the row dirty and snapshots the per-domain best proxy.
+	rt.SetBestProxy(key, testDomain, "proxy-a")
+	rt.SetTCPProbed(key, testDomain)
 	snap := rt.SnapshotAndClearDirtyRows()
 	if len(snap) != 1 {
 		t.Fatalf("expected 1 dirty row, got %d", len(snap))
@@ -762,10 +767,14 @@ func TestRowMetaDirtyTracking(t *testing.T) {
 	if !ok {
 		t.Fatalf("dirty snapshot missing key %q", key)
 	}
-	if pr.BestProxy != "proxy-a" {
-		t.Fatalf("BestProxy = %q, want %q", pr.BestProxy, "proxy-a")
+	pd, ok := pr.Domains[testDomain]
+	if !ok {
+		t.Fatalf("dirty snapshot missing domain %q", testDomain)
 	}
-	if !pr.TCPProbed {
+	if pd.BestProxy != "proxy-a" {
+		t.Fatalf("BestProxy = %q, want %q", pd.BestProxy, "proxy-a")
+	}
+	if !pd.TCPProbed {
 		t.Fatal("TCPProbed should be true")
 	}
 
@@ -781,10 +790,14 @@ func TestRowMetaDirtyTracking(t *testing.T) {
 		t.Fatalf("expected 1 dirty row after MarkFailed, got %d", len(snap))
 	}
 	pr = snap[key]
-	if pr.BestProxy != "" {
-		t.Fatalf("BestProxy should be cleared by MarkFailed, got %q", pr.BestProxy)
+	pd, ok = pr.Domains[testDomain]
+	if !ok {
+		t.Fatalf("dirty snapshot missing domain %q after MarkFailed", testDomain)
 	}
-	if pr.TCPProbed {
+	if pd.BestProxy != "" {
+		t.Fatalf("BestProxy should be cleared by MarkFailed, got %q", pd.BestProxy)
+	}
+	if pd.TCPProbed {
 		t.Fatal("TCPProbed should be cleared by MarkFailed")
 	}
 }
@@ -794,23 +807,27 @@ func TestRestoreRowMetaRoundtrip(t *testing.T) {
 	key := "ASN:64512"
 
 	// A fresh restore must be clean and immediately serve the fast path.
-	rt.RestoreRowMeta(key, PersistedRow{BestProxy: "proxy-a", TCPProbed: true})
+	rt.RestoreRowMeta(key, PersistedRow{Domains: map[string]PersistedDomain{
+		testDomain: {BestProxy: "proxy-a", TCPProbed: true},
+	}})
 	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
 		t.Fatalf("restored row should be clean, got %d dirty", len(snap))
 	}
-	if best, ok := rt.GetBestProxy(key); !ok || best != "proxy-a" {
+	if best, ok := rt.GetBestProxy(key, testDomain); !ok || best != "proxy-a" {
 		t.Fatalf("GetBestProxy = %q, %v; want proxy-a, true", best, ok)
 	}
-	if !rt.IsTCPProbed(key) {
+	if !rt.IsTCPProbed(key, testDomain) {
 		t.Fatal("IsTCPProbed should be true after restore")
 	}
 
 	// Restoring again with different state updates in place and stays clean.
-	rt.RestoreRowMeta(key, PersistedRow{BestProxy: "proxy-b", TCPProbed: false})
-	if best, ok := rt.GetBestProxy(key); !ok || best != "proxy-b" {
+	rt.RestoreRowMeta(key, PersistedRow{Domains: map[string]PersistedDomain{
+		testDomain: {BestProxy: "proxy-b", TCPProbed: false},
+	}})
+	if best, ok := rt.GetBestProxy(key, testDomain); !ok || best != "proxy-b" {
 		t.Fatalf("GetBestProxy after second restore = %q, %v; want proxy-b, true", best, ok)
 	}
-	if rt.IsTCPProbed(key) {
+	if rt.IsTCPProbed(key, testDomain) {
 		t.Fatal("IsTCPProbed should be false after second restore")
 	}
 	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
@@ -828,8 +845,8 @@ func TestRowMetaRemoveProxyClearsBest(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	rt.SetBestProxy(key, "proxy-a")
-	rt.SetTCPProbed(key)
+	rt.SetBestProxy(key, testDomain, "proxy-a")
+	rt.SetTCPProbed(key, testDomain)
 
 	rt.RemoveProxy("proxy-a")
 	snap := rt.SnapshotAndClearDirtyRows()
@@ -837,18 +854,137 @@ func TestRowMetaRemoveProxyClearsBest(t *testing.T) {
 		t.Fatalf("expected 1 dirty row after RemoveProxy, got %d", len(snap))
 	}
 	pr := snap[key]
-	if pr.BestProxy != "" {
-		t.Fatalf("BestProxy should be cleared by RemoveProxy, got %q", pr.BestProxy)
+	pd := pr.Domains[testDomain]
+	if pd.BestProxy != "" {
+		t.Fatalf("BestProxy should be cleared by RemoveProxy, got %q", pd.BestProxy)
 	}
-	if pr.TCPProbed {
+	if pd.TCPProbed {
 		t.Fatal("TCPProbed should be cleared by RemoveProxy")
 	}
 
 	// Removing a proxy that was never best must not mark the row dirty.
-	rt.SetBestProxy(key, "proxy-b")
+	rt.SetBestProxy(key, testDomain, "proxy-b")
 	rt.SnapshotAndClearDirtyRows()
 	rt.RemoveProxy("proxy-c")
 	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
 		t.Fatalf("RemoveProxy of non-best proxy marked row dirty")
+	}
+}
+
+func TestPerDomainBestIndependent(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:13335"
+
+	// Two domains under the same ASN row keep independent best proxies.
+	rt.SetBestProxy(key, "site-a.example.com", "proxy-a")
+	rt.SetBestProxy(key, "site-b.example.com", "proxy-b")
+
+	if best, _ := rt.GetBestProxy(key, "site-a.example.com"); best != "proxy-a" {
+		t.Fatalf("site-a best = %q, want proxy-a", best)
+	}
+	if best, _ := rt.GetBestProxy(key, "site-b.example.com"); best != "proxy-b" {
+		t.Fatalf("site-b best = %q, want proxy-b", best)
+	}
+
+	// Marking proxy-a failed must only clear site-a, leaving site-b intact.
+	rt.MarkFailed(key, "proxy-a", 1.0)
+	if _, ok := rt.GetBestProxy(key, "site-a.example.com"); ok {
+		t.Fatal("site-a best should be cleared after proxy-a fails")
+	}
+	if best, _ := rt.GetBestProxy(key, "site-b.example.com"); best != "proxy-b" {
+		t.Fatalf("site-b best = %q after proxy-a failure, want proxy-b", best)
+	}
+}
+
+func TestMarkFailedClearsAllDomains(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:13335"
+
+	// Two domains point at proxy-a, one at proxy-b.
+	rt.SetBestProxy(key, "site-a.example.com", "proxy-a")
+	rt.SetBestProxy(key, "site-b.example.com", "proxy-a")
+	rt.SetBestProxy(key, "site-c.example.com", "proxy-b")
+
+	rt.MarkFailed(key, "proxy-a", 1.0)
+
+	if _, ok := rt.GetBestProxy(key, "site-a.example.com"); ok {
+		t.Fatal("site-a should be cleared")
+	}
+	if _, ok := rt.GetBestProxy(key, "site-b.example.com"); ok {
+		t.Fatal("site-b should be cleared")
+	}
+	if best, _ := rt.GetBestProxy(key, "site-c.example.com"); best != "proxy-b" {
+		t.Fatalf("site-c best = %q, want proxy-b", best)
+	}
+}
+
+func TestDomainTableLRUEviction(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// Fill the domain table to capacity.
+	for i := 0; i < MaxDomainsPerRow; i++ {
+		rt.SetBestProxy(key, fmt.Sprintf("domain-%d.example.com", i), "proxy-a")
+	}
+
+	rt.mu.RLock()
+	count := len(rt.rows[key].domainTable)
+	rt.mu.RUnlock()
+	if count != MaxDomainsPerRow {
+		t.Fatalf("expected %d domains, got %d", MaxDomainsPerRow, count)
+	}
+
+	// The first domain (least recently used) should be evicted on overflow.
+	rt.SetBestProxy(key, "overflow.example.com", "proxy-b")
+
+	rt.mu.RLock()
+	_, firstGone := rt.rows[key].domainTable["domain-0.example.com"]
+	_, overflowPresent := rt.rows[key].domainTable["overflow.example.com"]
+	count = len(rt.rows[key].domainTable)
+	rt.mu.RUnlock()
+
+	if firstGone {
+		t.Fatal("domain-0 should have been evicted (least recently used)")
+	}
+	if !overflowPresent {
+		t.Fatal("overflow domain should be present")
+	}
+	if count != MaxDomainsPerRow {
+		t.Fatalf("expected %d domains after overflow, got %d", MaxDomainsPerRow, count)
+	}
+}
+
+func TestRestoreRowMetaLegacyTargetMigration(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "TARGET:example.com"
+
+	// Legacy persisted rows carried row-level BestProxy/TCPProbed with no
+	// domain map.  A TARGET row can reconstruct its domain from the key.
+	rt.RestoreRowMeta(key, PersistedRow{BestProxy: "proxy-a", TCPProbed: true})
+
+	if best, ok := rt.GetBestProxy(key, "example.com"); !ok || best != "proxy-a" {
+		t.Fatalf("legacy TARGET migration GetBestProxy = %q, %v; want proxy-a, true", best, ok)
+	}
+	if !rt.IsTCPProbed(key, "example.com") {
+		t.Fatal("legacy TARGET migration should restore tcpProbed")
+	}
+	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
+		t.Fatalf("legacy restore should be clean, got %d dirty", len(snap))
+	}
+}
+
+func TestRestoreRowMetaLegacyASNDropped(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:13335"
+
+	// Legacy ASN rows cannot reconstruct a domain from the key, so their old
+	// row-level best is deliberately dropped and re-learned per-domain.
+	rt.RestoreRowMeta(key, PersistedRow{BestProxy: "proxy-a", TCPProbed: true})
+
+	if _, ok := rt.GetBestProxy(key, "example.com"); ok {
+		t.Fatal("legacy ASN best should be dropped (no domain to map to)")
+	}
+	if rt.IsTCPProbed(key, "example.com") {
+		t.Fatal("legacy ASN tcpProbed should be dropped")
 	}
 }

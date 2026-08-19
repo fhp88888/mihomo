@@ -277,7 +277,7 @@ func TestRaceAndWrap_FirstSuccessCancelsLosers(t *testing.T) {
 
 	table := smart.NewRouteTable(10)
 	table.UpdateLatency(key, first.Name(), 10)
-	table.SetBestProxy(key, first.Name())
+	table.SetBestProxy(key, "example.com", first.Name())
 	s := &Smart{testUrl: "test", routeTable: table}
 
 	result := make(chan struct {
@@ -285,7 +285,7 @@ func TestRaceAndWrap_FirstSuccessCancelsLosers(t *testing.T) {
 		err  error
 	}, 1)
 	go func() {
-		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key,
+		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com",
 			[]C.Proxy{first, second, third}, smartTCPFallbackStagger, nil, "Stagger")
 		result <- struct {
 			conn C.Conn
@@ -356,7 +356,7 @@ func TestRaceAndWrap_ClosesLateSuccessfulLoser(t *testing.T) {
 		err  error
 	}, 1)
 	go func() {
-		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key,
+		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com",
 			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "Stagger")
 		result <- struct {
 			conn C.Conn
@@ -392,10 +392,10 @@ func TestRaceAndWrap_ClosesLateSuccessfulLoser(t *testing.T) {
 	if winner.CloseCount() != 0 {
 		t.Fatalf("winner was closed %d times", winner.CloseCount())
 	}
-	if best, ok := s.routeTable.GetBestProxy(key); !ok || best != second.Name() {
+	if best, ok := s.routeTable.GetBestProxy(key, "example.com"); !ok || best != second.Name() {
 		t.Fatalf("best proxy = %q ok=%v, want selected winner %q", best, ok, second.Name())
 	}
-	if !s.routeTable.IsTCPProbed(key) {
+	if !s.routeTable.IsTCPProbed(key, "example.com") {
 		t.Fatal("selected winner did not mark route TCP-probed")
 	}
 	var firstUseCount, secondUseCount int64
@@ -428,9 +428,9 @@ func TestRaceAndWrap_FatalErrorStopsScheduling(t *testing.T) {
 
 	table := smart.NewRouteTable(10)
 	table.UpdateLatency(key, first.Name(), 10)
-	table.SetBestProxy(key, first.Name())
+	table.SetBestProxy(key, "example.com", first.Name())
 	s := &Smart{testUrl: "test", routeTable: table}
-	_, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key,
+	_, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com",
 		[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "Stagger")
 	if !errors.Is(err, resolver.ErrIPNotFound) || !tunnel.ShouldStopRetry(err) {
 		t.Fatalf("fatal error = %v, want ErrIPNotFound", err)
@@ -440,7 +440,7 @@ func TestRaceAndWrap_FatalErrorStopsScheduling(t *testing.T) {
 		t.Fatal("second proxy started after fatal first result")
 	case <-time.After(2 * smartTCPFallbackStagger):
 	}
-	if best, ok := table.GetBestProxy(key); !ok || best != first.Name() {
+	if best, ok := table.GetBestProxy(key, "example.com"); !ok || best != first.Name() {
 		t.Fatalf("fatal error cleared best proxy: best=%q ok=%v", best, ok)
 	}
 }
@@ -463,12 +463,12 @@ func TestRaceAndWrap_ParentCancellationStopsScheduling(t *testing.T) {
 
 	table := smart.NewRouteTable(10)
 	table.UpdateLatency(key, first.Name(), 10)
-	table.SetBestProxy(key, first.Name())
+	table.SetBestProxy(key, "example.com", first.Name())
 	s := &Smart{testUrl: "test", routeTable: table}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, err := s.raceAndWrap(ctx, &C.Metadata{Host: "example.com"}, key,
+		_, err := s.raceAndWrap(ctx, &C.Metadata{Host: "example.com"}, key, "example.com",
 			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "Stagger")
 		result <- err
 	}()
@@ -576,7 +576,7 @@ func TestProbeBatch_FatalError_SkipsMarkFailed(t *testing.T) {
 
 	rt.UpdateLatency("TARGET:example.com", "p1", 10)
 	rt.UpdateLatency("TARGET:example.com", "p2", 10)
-	rt.SetBestProxy("TARGET:example.com", "p1")
+	rt.SetBestProxy("TARGET:example.com", "example.com", "p1")
 
 	proxies := makeStubProxies("p1", "p2")
 
@@ -596,7 +596,7 @@ func TestProbeBatch_FatalError_SkipsMarkFailed(t *testing.T) {
 
 	// MarkFailed should NOT have been called for fatal error.
 	// Best proxy should still be set.
-	bp, _ := rt.GetBestProxy("TARGET:example.com")
+	bp, _ := rt.GetBestProxy("TARGET:example.com", "example.com")
 	if bp == "" {
 		t.Error("best proxy was cleared — MarkFailed was incorrectly called for fatal error")
 	}
@@ -609,7 +609,7 @@ func TestProbeBatch_NodeLevelError_MarksFailingProxy(t *testing.T) {
 
 	rt.UpdateLatency("TARGET:example.com", "p1", 10)
 	rt.UpdateLatency("TARGET:example.com", "p2", 10)
-	rt.SetBestProxy("TARGET:example.com", "p1")
+	rt.SetBestProxy("TARGET:example.com", "example.com", "p1")
 
 	proxies := makeStubProxies("p1", "p2")
 
@@ -633,7 +633,7 @@ func TestProbeBatch_NodeLevelError_MarksFailingProxy(t *testing.T) {
 	// p1 should have been marked failed → best proxy cleared
 	// p2 should NOT be marked failed (cancellation → skip)
 	// So best proxy should be empty (p1 was cleared)
-	bp, _ := rt.GetBestProxy("TARGET:example.com")
+	bp, _ := rt.GetBestProxy("TARGET:example.com", "example.com")
 	if bp == "p1" {
 		t.Error("p1 should have been marked failed (node-level error), best proxy should be cleared")
 	}
@@ -645,7 +645,7 @@ func TestProbeBatch_ContextCanceled_SkipsMarkFailed(t *testing.T) {
 	rt := smart.NewRouteTable(100)
 
 	rt.UpdateLatency("TARGET:example.com", "p1", 10)
-	rt.SetBestProxy("TARGET:example.com", "p1")
+	rt.SetBestProxy("TARGET:example.com", "example.com", "p1")
 
 	proxies := makeStubProxies("p1")
 
@@ -659,7 +659,7 @@ func TestProbeBatch_ContextCanceled_SkipsMarkFailed(t *testing.T) {
 		singleDial, rt,
 	)
 
-	bp, ok := rt.GetBestProxy("TARGET:example.com")
+	bp, ok := rt.GetBestProxy("TARGET:example.com", "example.com")
 	if !ok || bp != "p1" {
 		t.Errorf("best proxy should still be 'p1' after context.Canceled, got %q ok=%v", bp, ok)
 	}
@@ -764,7 +764,7 @@ func TestProbeBatch_KeepsLosersAliveAfterWinner(t *testing.T) {
 	rt := smart.NewRouteTable(100)
 	// Seed the winner as best proxy, as discoverAndRoute would after a win.
 	// The late loser's onConnect must not displace or clear it.
-	rt.SetBestProxy(key, "winner")
+	rt.SetBestProxy(key, "example.com", "winner")
 
 	result := make(chan struct {
 		conn C.Conn
@@ -846,7 +846,7 @@ func TestProbeBatch_KeepsLosersAliveAfterWinner(t *testing.T) {
 	}
 
 	// winner must remain the best proxy; the late loser must not displace it.
-	if best, ok := rt.GetBestProxy(key); !ok || best != "winner" {
+	if best, ok := rt.GetBestProxy(key, "example.com"); !ok || best != "winner" {
 		t.Fatalf("best proxy = %q ok=%v, want winner", best, ok)
 	}
 }
@@ -883,7 +883,7 @@ func TestProbeBatch_KeepsLosersAliveThroughDiscover(t *testing.T) {
 	pc := NewProbeCoordinator()
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
-	rt.SetBestProxy(key, "winner")
+	rt.SetBestProxy(key, "example.com", "winner")
 
 	result := make(chan struct {
 		conn C.Conn
@@ -1003,10 +1003,10 @@ func TestBestFirstRace_BestWinsWithinWindow(t *testing.T) {
 		return nil, errors.New("unexpected other dial")
 	}}
 
-	rt.SetBestProxy(key, "best")
+	rt.SetBestProxy(key, "example.com", "best")
 
 	start := time.Now()
-	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, other})
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, other})
 	if err != nil {
 		t.Fatalf("serialTcpConn error: %v", err)
 	}
@@ -1038,10 +1038,10 @@ func TestBestFirstRace_StaleBestYieldsToFasterFallback(t *testing.T) {
 		return &stubConn{}, nil
 	}}
 
-	rt.SetBestProxy(key, "best")
+	rt.SetBestProxy(key, "example.com", "best")
 
 	start := time.Now()
-	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, second})
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, second})
 	if err != nil {
 		t.Fatalf("serialTcpConn error: %v", err)
 	}
@@ -1063,7 +1063,7 @@ func TestBestFirstRace_StaleBestYieldsToFasterFallback(t *testing.T) {
 	bestUnblock <- struct{}{}
 	pc.wg.Wait()
 
-	got, _ := rt.GetBestProxy(key)
+	got, _ := rt.GetBestProxy(key, "example.com")
 	if got != "second" {
 		t.Fatalf("best = %q, want second", got)
 	}
@@ -1086,10 +1086,10 @@ func TestBestFirstRace_BestFailEarlyStartsFallbackImmediately(t *testing.T) {
 		return &stubConn{}, nil
 	}}
 
-	rt.SetBestProxy(key, "best")
+	rt.SetBestProxy(key, "example.com", "best")
 
 	start := time.Now()
-	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, second})
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, second})
 	if err != nil {
 		t.Fatalf("serialTcpConn error: %v", err)
 	}
@@ -1108,7 +1108,7 @@ func TestBestFirstRace_BestFailEarlyStartsFallbackImmediately(t *testing.T) {
 		t.Fatal("second proxy never launched after best failed early")
 	}
 
-	got, _ := rt.GetBestProxy(key)
+	got, _ := rt.GetBestProxy(key, "example.com")
 	if got != "second" {
 		t.Fatalf("best = %q, want second", got)
 	}
@@ -1179,9 +1179,9 @@ func TestSmartPolicy_LogSequence_BestWinsWithinWindow(t *testing.T) {
 		t.Error("other should not be dialed")
 		return nil, errors.New("unexpected")
 	}}
-	rt.SetBestProxy(key, "best")
+	rt.SetBestProxy(key, "example.com", "best")
 
-	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, other})
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, other})
 	if err != nil || conn == nil {
 		t.Fatalf("serialTcpConn = (%v, %v), want conn", conn, err)
 	}
@@ -1212,9 +1212,9 @@ func TestSmartPolicy_LogSequence_StaleBestFallsBackToRace(t *testing.T) {
 	second := &stubProxy{name: "second", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
 		return &stubConn{}, nil
 	}}
-	rt.SetBestProxy(key, "best")
+	rt.SetBestProxy(key, "example.com", "best")
 
-	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, second})
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, second})
 	if err != nil || conn == nil {
 		t.Fatalf("serialTcpConn = (%v, %v), want conn", conn, err)
 	}
@@ -1244,9 +1244,9 @@ func TestSmartPolicy_LogSequence_BestFailsEarlyStartsFallbackImmediately(t *test
 	second := &stubProxy{name: "second", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
 		return &stubConn{}, nil
 	}}
-	rt.SetBestProxy(key, "best")
+	rt.SetBestProxy(key, "example.com", "best")
 
-	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, second})
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, second})
 	if err != nil || conn == nil {
 		t.Fatalf("serialTcpConn = (%v, %v), want conn", conn, err)
 	}

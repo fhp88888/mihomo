@@ -62,9 +62,25 @@ func routeKey(metadata *C.Metadata) string {
 	return "TARGET:" + target
 }
 
+// routeDomain returns the per-domain key within a route row: the connection's
+// effective target (see smart.GetEffectiveTarget).  This indexes the row's
+// domainTable to key per-domain best proxy selection and connection-size
+// tracking, so both paths must agree on it.
+//
+// It deliberately does NOT reuse metadata.SmartTarget: the rule engine may have
+// pre-populated SmartTarget with a rule descriptor (e.g. "DomainSuffix
+// [example.com]") rather than the effective target.  Using GetEffectiveTarget
+// here keeps the routing-state domain key identical to the conn-size bucket
+// written in wrapTCPConn's close callback (UpdateConnSize), so a domain's best
+// and its conn-size sample land in the same domainCell.
+func routeDomain(metadata *C.Metadata) string {
+	return smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
+}
+
 // tcpRoute implements the TCP routing strategy using the route table and probe coordinator.
 func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	key := routeKey(metadata)
+	domain := routeDomain(metadata)
 	proxies := s.GetProxies(true)
 
 	// If manually selected, use that proxy directly
@@ -73,15 +89,15 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 			if p.Name() == s.selected {
 				dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
 				defer dialCancel()
-				return s.dialAndWrap(dialCtx, p, metadata, key)
+				return s.dialAndWrap(dialCtx, p, metadata, key, domain)
 			}
 		}
 	}
 
 	// Fast path: known route with TCP-probed best proxy.
 	// 4% of requests intentionally skip the fast path to trigger re-discovery
-	if s.routeTable.IsTCPProbed(key) && rand.Intn(100)%25 != 0 {
-		conn, err := s.serialTcpConn(ctx, metadata, key, proxies)
+	if s.routeTable.IsTCPProbed(key, domain) && rand.Intn(100)%25 != 0 {
+		conn, err := s.serialTcpConn(ctx, metadata, key, domain, proxies)
 		if conn != nil || err != nil {
 			return conn, err
 		}
@@ -90,11 +106,11 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 
 	// Fallback, Cold start, 4% re-discover, or all serial fallbacks exhausted:
 	// full parallel discovery.
-	return s.discoverAndRoute(ctx, metadata, key, proxies)
+	return s.discoverAndRoute(ctx, metadata, key, domain, proxies)
 }
 
-func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key string, proxies []C.Proxy) (C.Conn, error) {
-	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
+func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key, domain string, proxies []C.Proxy) (C.Conn, error) {
+	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, domain, smartBestProxyFreshness); ok {
 		for _, p := range proxies {
 			if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
 				// Best-first race: best gets a smartBestExclusiveWindow
@@ -102,7 +118,7 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key str
 				// stagger.  Whoever connects first wins — including a slow best.
 				// Losers are drained in the background via probeCoordinator.
 				ordered := s.rankCandidates(key, proxies, p)
-				conn, err := s.raceAndWrap(ctx, metadata, key, ordered,
+				conn, err := s.raceAndWrap(ctx, metadata, key, domain, ordered,
 					smartBestExclusiveWindow, &s.probeCoordinator.wg, "Best")
 				if conn != nil || err != nil {
 					return conn, err
@@ -118,7 +134,7 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key str
 	if len(ordered) == 0 {
 		return nil, nil
 	}
-	conn, err := s.raceAndWrap(ctx, metadata, key, ordered, smartTCPFallbackStagger, nil, "Stagger")
+	conn, err := s.raceAndWrap(ctx, metadata, key, domain, ordered, smartTCPFallbackStagger, nil, "Stagger")
 	if conn != nil || err != nil {
 		return conn, err
 	}
@@ -170,7 +186,7 @@ func (s *Smart) rankCandidates(key string, proxies []C.Proxy, best C.Proxy) []C.
 // makes loser draining asynchronous so the caller returns the winner
 // immediately while late successful losers still sample latency in the
 // background.  pathTag labels the routed log line: "Best" or "Stagger".
-func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key string,
+func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, domain string,
 	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, pathTag string) (C.Conn, error) {
 	winner, conn, _, err := raceStaggered(ctx, key, ordered, wg, firstStagger, pathTag,
 		// Race dials go through dialTCP, which records a genuine dial failure
@@ -190,8 +206,8 @@ func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key strin
 		// probed.  The winner's latency is already sampled via onConnect.
 		func(proxy C.Proxy, connectTime int64) {
 			s.routeTable.IncrementUseCount(key, proxy.Name())
-			s.routeTable.SetBestProxy(key, proxy.Name())
-			s.routeTable.SetTCPProbed(key)
+			s.routeTable.SetBestProxy(key, domain, proxy.Name())
+			s.routeTable.SetTCPProbed(key, domain)
 		},
 	)
 	if err != nil {
@@ -391,7 +407,7 @@ func (s *Smart) dialTCP(ctx context.Context, proxy C.Proxy, metadata *C.Metadata
 }
 
 // dialAndWrap dials a known proxy and wraps the connection for metrics collection.
-func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Metadata, key string) (C.Conn, error) {
+func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Metadata, key, domain string) (C.Conn, error) {
 	conn, connectTime, err := s.dialTCP(ctx, proxy, metadata, key)
 	if err != nil {
 		return nil, err
@@ -402,14 +418,14 @@ func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Meta
 	// by connection lifetime and is not available for losers.
 	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
 	s.routeTable.IncrementUseCount(key, proxy.Name())
-	s.routeTable.SetBestProxy(key, proxy.Name())
-	s.routeTable.SetTCPProbed(key)
+	s.routeTable.SetBestProxy(key, domain, proxy.Name())
+	s.routeTable.SetTCPProbed(key, domain)
 
 	return s.wrapTCPConn(conn, proxy, metadata), nil
 }
 
 // discoverAndRoute performs pre-rank + concurrent discovery for a new or failed route.
-func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key string, proxies []C.Proxy) (C.Conn, error) {
+func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key, domain string, proxies []C.Proxy) (C.Conn, error) {
 	// Filter proxies: must be alive
 	available := make([]C.Proxy, 0, len(proxies))
 	for _, p := range proxies {
@@ -454,8 +470,8 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key 
 	// (smart_probe.go:189). Do NOT write it again here — that would double-count
 	// the sample.
 	s.routeTable.IncrementUseCount(key, proxy.Name())
-	s.routeTable.SetBestProxy(key, proxy.Name())
-	s.routeTable.SetTCPProbed(key)
+	s.routeTable.SetBestProxy(key, domain, proxy.Name())
+	s.routeTable.SetTCPProbed(key, domain)
 
 	return s.wrapTCPConn(conn, proxy, metadata), nil
 }
@@ -623,6 +639,18 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata) C.Con
 				s.routeTable.UpdateSpeed(key, proxy.Name(), speed)
 			}
 
+			// Collect per-domain connection size (kB) for this CDN row.  Only
+			// recorded when a hostname was resolved; IP-only connections have no
+			// meaningful domain to bucket by, and GetEffectiveTarget would key
+			// them by their IP string.
+			if metadata.Host != "" {
+				connSize := float64(info.DownloadTotal.Load()+info.UploadTotal.Load()) / 1024.0
+				if connSize > 0 {
+					domain := smart.GetEffectiveTarget(metadata.Host, metadata.DstIP.String())
+					s.routeTable.UpdateConnSize(key, domain, connSize)
+				}
+			}
+
 			// Collect pkg_loss from TCP stats.
 			// Always update when TCP stats are available — even 0% loss
 			// drives the EMA back toward 0, preventing stale loss from
@@ -683,6 +711,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	}
 
 	key := routeKey(metadata)
+	domain := routeDomain(metadata)
 	proxies := s.GetProxies(true)
 
 	// If manually selected, use that proxy
@@ -691,7 +720,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 			if p.Name() == s.selected && p.SupportUDP() {
 				dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultUDPTimeout)
 				defer dialCancel()
-				return s.dialUDPAndWrap(dialCtx, p, metadata, key)
+				return s.dialUDPAndWrap(dialCtx, p, metadata, key, domain)
 			}
 		}
 		return nil, errors.New("selected proxy not found or does not support UDP")
@@ -709,11 +738,11 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	}
 
 	// Try fresh best proxy first
-	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
+	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, domain, smartBestProxyFreshness); ok {
 		for _, p := range udpProxies {
 			if p.Name() == bestName {
 				dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultUDPTimeout)
-				pc, err := s.dialUDPAndWrap(dialCtx, p, metadata, key)
+				pc, err := s.dialUDPAndWrap(dialCtx, p, metadata, key, domain)
 				dialCancel()
 				if err == nil {
 					return pc, nil
@@ -758,7 +787,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	var lastErr error
 	for _, p := range ordered {
 		dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultUDPTimeout)
-		pc, err := s.dialUDPAndWrap(dialCtx, p, metadata, key)
+		pc, err := s.dialUDPAndWrap(dialCtx, p, metadata, key, domain)
 		dialCancel()
 		if err == nil {
 			return pc, nil
@@ -773,7 +802,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 }
 
 // dialUDPAndWrap dials a UDP proxy and wraps the packet conn for latency collection.
-func (s *Smart) dialUDPAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Metadata, key string) (C.PacketConn, error) {
+func (s *Smart) dialUDPAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Metadata, key, domain string) (C.PacketConn, error) {
 	start := time.Now()
 	pc, err := proxy.ListenPacketContext(ctx, metadata)
 	connectTime := time.Since(start).Milliseconds()
@@ -784,7 +813,7 @@ func (s *Smart) dialUDPAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.M
 
 	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
 	s.routeTable.IncrementUseCount(key, proxy.Name())
-	s.routeTable.SetBestProxy(key, proxy.Name())
+	s.routeTable.SetBestProxy(key, domain, proxy.Name())
 
 	return s.wrapUDPConn(pc, proxy, metadata), nil
 }
