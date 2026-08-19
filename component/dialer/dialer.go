@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	DefaultTCPTimeout = 5 * time.Second
+	DefaultTCPTimeout = 2 * time.Second
 	DefaultUDPTimeout = DefaultTCPTimeout
 
 	dualStackFallbackTimeout = 300 * time.Millisecond

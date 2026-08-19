@@ -3,15 +3,17 @@ package outboundgroup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/component/smart"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel"
 )
 
-const topK = 5
+const topK = 15
 
 // discoveryState tracks an in-progress discovery for a route key.
 type discoveryState struct {
@@ -80,7 +82,8 @@ func (pc *ProbeCoordinator) Discover(
 
 			if p != nil && e == nil {
 				// Follower gets a NEW connection to the same proxy
-				start := time.Now(); newConn, connectTime, dialErr := singleDial(ctx, p, metadata, start)
+				start := time.Now()
+				newConn, connectTime, dialErr := singleDial(ctx, p, metadata, start)
 				if dialErr != nil {
 					return nil, nil, 0, dialErr
 				}
@@ -93,7 +96,7 @@ func (pc *ProbeCoordinator) Discover(
 	}
 
 	// Leader path: create discovery state
-	leaderCtx, leaderCancel := context.WithCancel(pc.ctx)
+	leaderCtx, leaderCancel := context.WithCancel(ctx)
 	ds = &discoveryState{
 		done:         make(chan struct{}),
 		leaderCtx:    leaderCtx,
@@ -104,7 +107,16 @@ func (pc *ProbeCoordinator) Discover(
 	pc.mu.Unlock()
 
 	defer func() {
-		leaderCancel()
+		// NOTE: leaderCancel is NOT called here.  raceStaggered (reached via
+		// probeBatch below) owns cancellation of raceCtx for the normal path:
+		// on a winner it defers cancelRace until the background drain finishes
+		// sampling late losers' connectTime (keepLosersAlive), and on failure
+		// paths its deferred cancelRace fires immediately.  Canceling
+		// leaderCtx here would abort those in-flight loser dials the instant
+		// the winner returns, defeating the loser sampling.  leaderCtx is only
+		// canceled by Close() for shutdown, or GC'd once this discovery is
+		// deleted and unreferenced (no goroutine blocks on it besides the
+		// self-bounded 2s dials).
 		pc.mu.Lock()
 		delete(pc.discoveries, key)
 		pc.mu.Unlock()
@@ -131,10 +143,12 @@ type probeResult struct {
 	err         error
 }
 
-// probeMetric records a single proxy's connectTime during parallel dial.
-type probeMetric struct {
-	proxyName   string
+// dialResult is the result of a single dial attempt in a staggered race.
+type dialResult struct {
+	proxy       C.Proxy
+	conn        C.Conn
 	connectTime int64
+	err         error
 }
 
 // probeBatch probes proxies in batches of topK. Returns the first successful result.
@@ -168,112 +182,69 @@ func (pc *ProbeCoordinator) probeBatch(
 			break
 		}
 
-		result, metrics := pc.parallelDial(ctx, batch, metadata, singleDial)
-		// Record all successful connectTimes to the route table so losers'
-		// measurements are not wasted — they improve prerank accuracy for
-		// subsequent discoveries on this route key.
-		for _, m := range metrics {
-			rt.UpdateLatency(key, m.proxyName, m.connectTime)
-		}
-		if result.err == nil {
-			return result
+		var failMu sync.Mutex
+		var fatalErr error
+
+		winner, conn, connectTime, err := raceStaggered(ctx, key, batch, &pc.wg, smartTCPFallbackStagger, "Discovery",
+			// Discovery dials use the caller's raw dial (no MarkFailed inside —
+			// probeBatch classifies node-level vs fatal itself).
+			func(dialCtx context.Context, p C.Proxy) (C.Conn, int64, error) {
+				start := time.Now()
+				return singleDial(dialCtx, p, metadata, start)
+			},
+			// onConnect: record successful connectTimes so losers' measurements
+			// are not wasted — they improve prerank accuracy for subsequent
+			// discoveries on this route key.
+			func(proxyName string, connectTime int64) {
+				rt.UpdateLatency(key, proxyName, connectTime)
+			},
+			// onFail: classify node-level vs fatal/cancellation.  Only proxies
+			// with node-level errors are penalized (MarkFailed 1.0); fatal
+			// target-level errors and cancellations are not the proxy's fault.
+			func(p C.Proxy, dialErr error) {
+				if tunnel.ShouldStopRetry(dialErr) {
+					failMu.Lock()
+					if fatalErr == nil {
+						fatalErr = dialErr
+					}
+					failMu.Unlock()
+					return // Don't penalize proxy for target-level error
+				}
+				if errors.Is(dialErr, context.Canceled) {
+					return // Don't penalize proxy for cancellation
+				}
+				rt.MarkFailed(key, p.Name(), 1.0)
+			},
+			// onWinner: probeBatch does its own winner bookkeeping via the
+			// returned winner, so nothing to do here.
+			nil,
+		)
+
+		if err == nil && conn != nil {
+			return probeResult{proxy: winner, conn: conn, connectTime: connectTime}
 		}
 
-		// All failed in this batch; update route table and try next batch
-		for _, p := range batch {
-			rt.MarkFailed(key, p.Name())
-		}
+		// No winner.  Fatal errors were captured live in onFail; node-level
+		// failures were penalized via MarkFailed there too.
+		log.Infoln("[Smart] probeBatch key=%s batch-ALL-FAILED err=%v", key, err)
 
-		// Check for fatal error
-		if tunnel.ShouldStopRetry(result.err) {
-			return result
+		failMu.Lock()
+		fe := fatalErr
+		failMu.Unlock()
+
+		if fe != nil {
+			return probeResult{err: fe}
 		}
 
 		// If ctx is done, stop
 		if ctx.Err() != nil {
 			return probeResult{err: ctx.Err()}
 		}
+
+		// All dials failed with node-level errors — continue to the next batch.
 	}
 
-	return probeResult{err: errors.New("all proxies failed")}
-}
-
-// parallelDial concurrently dials all proxies in the batch.
-// Waits for ALL goroutines to complete, then returns the connection with the
-// lowest connectTime plus all successful (proxyName, connectTime) pairs so
-// losers' measurements are also recorded in the route table.
-func (pc *ProbeCoordinator) parallelDial(
-	ctx context.Context,
-	batch []C.Proxy,
-	metadata *C.Metadata,
-	singleDial func(context.Context, C.Proxy, *C.Metadata, time.Time) (C.Conn, int64, error),
-) (probeResult, []probeMetric) {
-	n := len(batch)
-	if n == 0 {
-		return probeResult{err: errors.New("empty batch")}, nil
-	}
-
-	type dialResult struct {
-		proxy       C.Proxy
-		conn        C.Conn
-		connectTime int64
-		err         error
-	}
-
-	results := make(chan dialResult, n)
-	var allMetrics []probeMetric
-
-	for i := 0; i < n; i++ {
-		pc.wg.Add(1)
-		go func(p C.Proxy) {
-			defer pc.wg.Done()
-			start := time.Now()
-			conn, connectTime, err := singleDial(ctx, p, metadata, start)
-			results <- dialResult{proxy: p, conn: conn, connectTime: connectTime, err: err}
-		}(batch[i])
-	}
-
-	var best *dialResult
-	for received := 0; received < n; received++ {
-		select {
-		case res := <-results:
-			if res.err == nil {
-				allMetrics = append(allMetrics, probeMetric{proxyName: res.proxy.Name(), connectTime: res.connectTime})
-				if best == nil || res.connectTime < best.connectTime {
-					// Close previous best connection
-					if best != nil && best.conn != nil {
-						best.conn.Close()
-					}
-					best = &res
-				} else {
-					// This one is slower — close it
-					if res.conn != nil {
-						res.conn.Close()
-					}
-				}
-			}
-		case <-ctx.Done():
-			// Drain remaining in background
-			go func(remaining int) {
-				for i := 0; i < remaining; i++ {
-					r := <-results
-					if r.conn != nil && r.err == nil {
-						r.conn.Close()
-					}
-				}
-			}(n - received - 1)
-			// If we already have a best, return it
-			if best != nil {
-				return probeResult{proxy: best.proxy, conn: best.conn, connectTime: best.connectTime}, allMetrics
-			}
-			return probeResult{err: ctx.Err()}, allMetrics
-		}
-	}
-
-	if best != nil {
-		return probeResult{proxy: best.proxy, conn: best.conn, connectTime: best.connectTime}, allMetrics
-	}
-	return probeResult{err: errors.New("all proxies failed")}, nil
+	return probeResult{err: fmt.Errorf("all %d proxies failed for key=%s", n, key)}
 }
 
 // Close cancels all active discoveries and waits for workers to finish.

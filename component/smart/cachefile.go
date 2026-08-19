@@ -69,14 +69,48 @@ func (s *Store) BatchSave(operations []StoreOperation) error {
 	return err
 }
 
-// 刷新队列中的操作到数据库
-func (s *Store) FlushQueue(force bool) {
+// FlushQueue drains the global operation queue and writes all pending
+// operations to the database.  When force is false the queue is only
+// drained when it meets the batch threshold.  Returns an error when
+// the database write fails (the drained operations are re-enqueued).
+func (s *Store) FlushQueue(force bool) error {
 	ops := drainGlobalQueue(force)
 	if len(ops) == 0 {
-		return
+		return nil
 	}
-	s.BatchSave(ops)
+
+	// Serialize with threshold-triggered flushes from AppendToGlobalQueue
+	// so that a late-arriving old snapshot cannot overwrite newer data.
+	flushMutex.Lock()
+	defer flushMutex.Unlock()
+
+	if err := s.BatchSave(ops); err != nil {
+		log.Warnln("[SmartStore] FlushQueue failed, re-enqueuing %d operations: %v", len(ops), err)
+		// Re-enqueue: current queue values override the older snapshot.
+		globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
+			opMap := make(map[string]StoreOperation, len(ops)+len(old))
+			for i := range ops {
+				key := formatOperationKey(&ops[i])
+				if key != "" {
+					opMap[key] = ops[i]
+				}
+			}
+			for i := range old {
+				key := formatOperationKey(&old[i])
+				if key != "" {
+					opMap[key] = old[i]
+				}
+			}
+			newQueue := make([]StoreOperation, 0, len(opMap))
+			for _, op := range opMap {
+				newQueue = append(newQueue, op)
+			}
+			return newQueue
+		})
+		return err
+	}
 	log.Debugln("[SmartStore] Queue datas saved, operations: [%d]", len(ops))
+	return nil
 }
 
 func matchKeyPrefix(key, queryPrefix string, strict bool) bool {
@@ -192,6 +226,20 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 				}
 				result[FormatDBKey(KeyTypeHostFailures, op.Config, op.Group, op.Target)] = op.Data
 			}
+		case KeyTypeRoute:
+			if op.Type == OpSaveRoute && op.Target != "" {
+				if depth >= 5 && seg4 != op.Target {
+					continue
+				}
+				result[FormatDBKey(KeyTypeRoute, op.Config, op.Group, op.Target)] = op.Data
+			}
+		case KeyTypeRouteMeta:
+			if op.Type == OpSaveRouteMeta && op.Target != "" {
+				if depth >= 5 && seg4 != op.Target {
+					continue
+				}
+				result[FormatDBKey(KeyTypeRouteMeta, op.Config, op.Group, op.Target)] = op.Data
+			}
 		}
 	}
 
@@ -208,7 +256,7 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 	var groupPrefix string
 
 	switch keyType {
-	case KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures, KeyTypeRanking:
+	case KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures, KeyTypeRanking, KeyTypeRoute, KeyTypeRouteMeta:
 		if depth >= 4 {
 			hasGroupLevel = true
 			groupPrefix = FormatDBKey(keyType, config, group)
@@ -424,4 +472,50 @@ func (s *Store) DBBatchDeletePrefix(prefixes []string, strict bool) error {
 		}
 		return nil
 	})
+}
+
+// LoadRouteCells loads persisted route table cells for all target keys in a group.
+// Returns a map of "key/proxy" -> raw JSON PersistedCell.
+func (s *Store) LoadRouteCells(config, group string) (map[string][]byte, error) {
+	pathPrefix := FormatDBKey(KeyTypeRoute, config, group)
+	rawResult, err := s.GetSubBytesByPath(pathPrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string][]byte, len(rawResult))
+	prefix := pathPrefix + "/"
+	for fullPath, data := range rawResult {
+		if !strings.HasPrefix(fullPath, prefix) {
+			continue
+		}
+		// fullPath = smart/route/{config}/{group}/{key}/{proxy}
+		// keyProxy  = {routeKey}/{proxyName}
+		keyProxy := fullPath[len(prefix):]
+		result[keyProxy] = data
+	}
+	return result, nil
+}
+
+// LoadRouteRows loads persisted per-row routing state (best proxy, tcp-probed
+// flag) for all route keys in a group.  Returns a map of route key -> raw JSON
+// PersistedRow.  Old databases without row metadata return an empty map.
+func (s *Store) LoadRouteRows(config, group string) (map[string][]byte, error) {
+	pathPrefix := FormatDBKey(KeyTypeRouteMeta, config, group)
+	rawResult, err := s.GetSubBytesByPath(pathPrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string][]byte, len(rawResult))
+	prefix := pathPrefix + "/"
+	for fullPath, data := range rawResult {
+		if !strings.HasPrefix(fullPath, prefix) {
+			continue
+		}
+		// fullPath = smart/route_meta/{config}/{group}/{routeKey}
+		routeKey := fullPath[len(prefix):]
+		result[routeKey] = data
+	}
+	return result, nil
 }

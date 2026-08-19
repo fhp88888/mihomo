@@ -111,62 +111,29 @@ func getGroupWeights(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	configName := smartGroup.GetConfigFilename()
-	groupName := smartGroup.Name()
-
-	smartStore := cachefile.GetSmartStore()
-	if smartStore == nil {
-		render.Status(r, http.StatusServiceUnavailable)
+	ranking := smartGroup.NodeRankingSnapshot()
+	if len(ranking.Result) == 0 {
+		log.Debugln("Policy group %s has no usage data", smartGroup.Name())
 		render.JSON(w, r, render.M{
 			"weights": []smart.NodeRankItem{},
-			"error":   "Smart cache not available",
-		})
-		return
-	}
-
-	wrapper, err := smartStore.GetNodeWeightRankingCache(groupName, configName)
-	if err != nil {
-		log.Warnln("[Smart] Failed to get weight ranking: %s", err.Error())
-		render.Status(r, http.StatusInternalServerError)
-		render.JSON(w, r, render.M{
-			"weights": []smart.NodeRankItem{},
-			"error":   "Failed to get weight ranking: " + err.Error(),
-		})
-		return
-	}
-	if len(wrapper.Result) == 0 {
-		log.Debugln("Policy group %s has no weight data", groupName)
-		render.JSON(w, r, render.M{
-			"weights": []smart.NodeRankItem{},
-			"message": "No weight data available for the specified group",
+			"message": "No usage data available for the specified group",
 		})
 		return
 	}
 
 	render.JSON(w, r, render.M{
-		"weights": wrapper.Result,
+		"weights": ranking.Result,
 	})
 }
 
 func getAllGroupWeights(w http.ResponseWriter, r *http.Request) {
-	smartStore := cachefile.GetSmartStore()
-	if smartStore == nil {
-		render.Status(r, http.StatusServiceUnavailable)
-		render.JSON(w, r, render.M{
-			"weights": map[string][]smart.NodeRankItem{},
-			"errors":  map[string]string{},
-			"error":   "Smart cache not available",
-		})
-		return
-	}
-
 	result := make(map[string][]smart.NodeRankItem)
 	errorsMap := make(map[string]string)
 
 	var (
-		mu    sync.Mutex
-		wg    sync.WaitGroup
-		sem   = make(chan struct{}, 5)
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, 5)
 	)
 
 	for _, p := range tunnel.Proxies() {
@@ -175,25 +142,17 @@ func getAllGroupWeights(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		configName := sg.GetConfigFilename()
-		groupName := sg.Name()
-
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(groupName, configName string) {
+		go func(sg *outboundgroup.Smart) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			wrapper, err := smartStore.GetNodeWeightRankingCache(groupName, configName)
+			ranking := sg.NodeRankingSnapshot()
 			mu.Lock()
 			defer mu.Unlock()
-			if err != nil {
-				log.Warnln("[Smart] Failed to get weight ranking for group %s: %s", groupName, err.Error())
-				errorsMap[groupName] = err.Error()
-				return
-			}
-			result[groupName] = wrapper.Result
-		}(groupName, configName)
+			result[sg.Name()] = ranking.Result
+		}(sg)
 	}
 
 	wg.Wait()

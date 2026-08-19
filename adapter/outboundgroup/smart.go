@@ -17,6 +17,7 @@ import (
 	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/mmdb"
+	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/smart"
 	C "github.com/metacubex/mihomo/constant"
@@ -30,7 +31,7 @@ const (
 )
 
 var (
-	smartInitOnce sync.Once
+	smartCleanupOnce sync.Once
 )
 
 type SmartOption struct {
@@ -44,8 +45,8 @@ type SmartOption struct {
 type Smart struct {
 	*GroupBase
 
-	wg  sync.WaitGroup
-	ctx context.Context
+	wg     sync.WaitGroup
+	ctx    context.Context
 	cancel context.CancelFunc
 
 	configName     string
@@ -57,6 +58,10 @@ type Smart struct {
 	// New in-memory routing components
 	routeTable       *smart.RouteTable
 	probeCoordinator *ProbeCoordinator
+
+	// per-proxy aggregation (5-min weighted average across the route table)
+	proxyAggMu sync.RWMutex
+	proxyAgg   smart.ProxyAggregation
 
 	// Policy priority (retained for compatibility)
 	policyPriority []priorityRule
@@ -88,6 +93,8 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 
 	configName := getConfigFilename()
 
+	routeTable := smart.NewRouteTable(smart.DefaultMaxRows)
+
 	s := &Smart{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:           option.Name,
@@ -111,7 +118,7 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		useLightGBM:      smartOption.UseLightGBM,
 		collectData:      smartOption.CollectData,
 		preferASN:        smartOption.PreferASN,
-		routeTable:       smart.NewRouteTable(smart.DefaultMaxRows),
+		routeTable:       routeTable,
 		probeCoordinator: NewProbeCoordinator(),
 	}
 
@@ -123,9 +130,73 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		applyPolicyPriority(s, smartOption.PolicyPriority)
 	}
 
+	// Restore persisted route table cells from the database.
+	s.restoreRouteTable(routeTable, configName)
+
 	s.InitSmart()
 
 	return s, nil
+}
+
+// restoreRouteTable loads persisted route cells and per-row routing state
+// (best proxy, tcp-probed flag) from the bbolt store into the in-memory route
+// table.  Cells and rows that were loaded are marked clean so the periodic
+// flush won't re-persist them until they actually change.
+func (s *Smart) restoreRouteTable(rt *smart.RouteTable, configName string) {
+	store := cachefile.GetSmartStore()
+	if store == nil {
+		return
+	}
+
+	rawCells, err := store.LoadRouteCells(configName, s.Name())
+	if err != nil {
+		log.Debugln("[Smart] No persisted route data for group [%s]: %v", s.Name(), err)
+		return
+	}
+
+	if len(rawCells) > 0 {
+		log.Infoln("[Smart] Loaded %d persisted route cells from cache.db for group [%s], restoring...", len(rawCells), s.Name())
+
+		loaded := 0
+		for keyProxy, data := range rawCells {
+			var pc smart.PersistedCell
+			if json.Unmarshal(data, &pc) != nil {
+				continue
+			}
+			// keyProxy format: {routeKey}/{proxyName}
+			slash := strings.LastIndex(keyProxy, "/")
+			if slash < 0 {
+				continue
+			}
+			key := keyProxy[:slash]
+			proxy := keyProxy[slash+1:]
+			rt.RestoreRow(key, proxy, pc)
+			loaded++
+		}
+		if loaded > 0 {
+			log.Infoln("[Smart] Restored %d persisted route cells for group [%s]", loaded, s.Name())
+		}
+	}
+
+	// Restore per-row routing state so a known route can take the fast path
+	// immediately after restart instead of re-running full discovery.
+	rawRows, err := store.LoadRouteRows(configName, s.Name())
+	if err != nil {
+		log.Debugln("[Smart] No persisted route rows for group [%s]: %v", s.Name(), err)
+		return
+	}
+	rowLoaded := 0
+	for key, data := range rawRows {
+		var pr smart.PersistedRow
+		if json.Unmarshal(data, &pr) != nil {
+			continue
+		}
+		rt.RestoreRowMeta(key, pr)
+		rowLoaded++
+	}
+	if rowLoaded > 0 {
+		log.Infoln("[Smart] Restored %d route rows (best proxy) for group [%s]", rowLoaded, s.Name())
+	}
 }
 
 func (s *Smart) GetConfigFilename() string {
@@ -135,17 +206,22 @@ func (s *Smart) GetConfigFilename() string {
 func (s *Smart) InitSmart() {
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
-	smartInitOnce.Do(func() {
+	smartCleanupOnce.Do(func() {
 		s.startTimedTask(5*time.Minute, cleanupInterval, "Global orphaned groups Clean up", s.cleanupOrphanedGroups, true)
-		// try load ASN database
-		if s.preferASN {
-			if err := geodata.InitASN(); err != nil {
-				log.Warnln("[Smart] Failed to load ASN database: %v", err)
-			}
-		}
 	})
+	// try load ASN database for any smart group that needs it
+	if s.preferASN {
+		if err := geodata.InitASN(); err != nil {
+			log.Warnln("[Smart] Failed to load ASN database: %v", err)
+		}
+	}
 
+	// Periodic route table persistence: every 10 minutes, iterate the route
+	// table and enqueue dirty cells to the bbolt batch queue.
+	s.startTimedTask(10*time.Minute, 10*time.Minute, "Route table persistence", s.persistRouteTable, false)
+	s.startTimedTask(10*time.Minute, 10*time.Minute, "FailedCount decay", s.decayFailedCounts, false)
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, true)
+	s.startTimedTask(1*time.Minute, 1*time.Minute, "Proxy aggregation", s.aggregateProxies, false)
 }
 
 // ── Public proxy methods ────────────────────────────────────
@@ -191,7 +267,7 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 	s.getASNCode(metadata)
 
 	key := routeKey(metadata)
-	if bestName, ok := s.routeTable.GetBestProxy(key); ok {
+	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, smartBestProxyFreshness); ok {
 		for _, p := range proxies {
 			if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
 				return p
@@ -199,7 +275,7 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 		}
 	}
 
-	// Fallback: pre-rank by latency
+	// Fallback: rank by score
 	names := make([]string, 0, len(proxies))
 	for _, p := range proxies {
 		if p.AliveForTestUrl(s.testUrl) {
@@ -209,7 +285,8 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 	if len(names) == 0 {
 		return proxies[0]
 	}
-	ranked := s.routeTable.PreRankLatency(names, func(proxyName string) uint16 {
+	s.routeTable.RefreshScores(key, names)
+	ranked := s.routeTable.RankByScore(names, func(proxyName string) uint16 {
 		for _, p := range proxies {
 			if p.Name() == proxyName {
 				return p.LastDelayForTestUrl(s.testUrl)
@@ -302,6 +379,7 @@ func (s *Smart) MarshalJSON() ([]byte, error) {
 		"sampleRate":      s.sampleRate,
 		"preferASN":       s.preferASN,
 	})
+
 }
 
 func (s *Smart) Providers() []provider.ProxyProvider {
@@ -327,6 +405,34 @@ func (s *Smart) RouteTableSnapshot() smart.TableSnapshot {
 	return s.routeTable.Snapshot(s.Name())
 }
 
+// ProxyAggregationSnapshot returns the latest per-proxy aggregation for the REST API.
+func (s *Smart) ProxyAggregationSnapshot() smart.ProxyAggregation {
+	s.proxyAggMu.RLock()
+	defer s.proxyAggMu.RUnlock()
+	return s.proxyAgg
+}
+
+// NodeRankingSnapshot returns the "most used" proxy ranking for the REST API,
+// derived from the route table's per-proxy UseCount aggregation.  The result
+// keeps the legacy NodeRank shape so the /weights endpoint contract is
+// unchanged while its data now comes from the in-memory route table.
+func (s *Smart) NodeRankingSnapshot() smart.NodeRank {
+	return smart.BuildNodeRanking(s.routeTable.AggregateByProxy().Proxies)
+}
+
+// aggregateProxies recomputes the per-proxy aggregation from the current
+// route table and stores it for the REST API.
+func (s *Smart) aggregateProxies() {
+	agg := s.routeTable.AggregateByProxy()
+	agg.Group = s.Name()
+
+	s.proxyAggMu.Lock()
+	s.proxyAgg = agg
+	s.proxyAggMu.Unlock()
+
+	log.Debugln("[Smart] Proxy aggregation updated for group [%s]: %d proxies", s.Name(), agg.Count)
+}
+
 // ── Lifecycle ───────────────────────────────────────────────
 
 func (s *Smart) Close() error {
@@ -336,13 +442,24 @@ func (s *Smart) Close() error {
 
 	s.wg.Wait()
 
+	// Close the probe coordinator first so that all in-flight dials
+	// and drain goroutines finish before the final persistence pass.
+	// This ensures drain-produced latency updates are included in the
+	// final snapshot.
 	if s.probeCoordinator != nil {
 		s.probeCoordinator.Close()
 	}
 
-	smartInitOnce = sync.Once{}
+	// Final persistence: snapshot remaining dirty cells and force-write
+	// the global queue so that small route tables (< batch threshold)
+	// are not lost on shutdown or config reload.
+	s.persistRouteTable()
+	var flushErr error
+	if store := cachefile.GetSmartStore(); store != nil {
+		flushErr = store.FlushQueue(true)
+	}
 
-	return nil
+	return flushErr
 }
 
 // ── Background tasks ────────────────────────────────────────
@@ -428,6 +545,90 @@ func (s *Smart) cleanupOrphanedNodeCache() {
 				log.Debugln("[Smart] Removed orphaned proxy [%s] from route table", proxyName)
 			}
 		}
+	}
+}
+
+// persistRouteTable atomically snapshots dirty cells and dirty row routing
+// state, then enqueues them to the global bbolt batch queue.  Each snapshot
+// (cells and rows) is a single lock window and clears its own dirty flags, so
+// no dirty flag is lost to concurrent mutations.
+func (s *Smart) persistRouteTable() {
+	dirty := s.routeTable.SnapshotAndClearDirty()
+	dirtyRows := s.routeTable.SnapshotAndClearDirtyRows()
+	if len(dirty) == 0 && len(dirtyRows) == 0 {
+		return
+	}
+
+	store := cachefile.GetSmartStore()
+
+	// Check whether the underlying DB is available.  If not, re-mark the
+	// cells and rows dirty so the next cycle retries — otherwise we'd silently
+	// discard data when the bbolt file can't be opened.
+	if !store.IsDBAvailable() {
+		for cellKey := range dirty {
+			if idx := strings.IndexByte(cellKey, 0); idx >= 0 {
+				s.routeTable.MarkDirty(cellKey[:idx], cellKey[idx+1:])
+			}
+		}
+		for routeKey := range dirtyRows {
+			s.routeTable.MarkRowDirty(routeKey)
+		}
+		log.Infoln("[Smart] DB unavailable, re-marked %d dirty route cells and %d rows for group [%s]", len(dirty), len(dirtyRows), s.Name())
+		return
+	}
+
+	// Collect all operations into a single slice and append them in one call.
+	// AppendToGlobalQueue rebuilds the whole queue on every call, so enqueuing
+	// N operations one-by-one is O(N * queueLen); batching makes it one pass.
+	ops := make([]smart.StoreOperation, 0, len(dirty)+len(dirtyRows))
+
+	for cellKey, pc := range dirty {
+		// cellKey format: {routeKey}\x00{proxyName}
+		if idx := strings.IndexByte(cellKey, 0); idx >= 0 {
+			key := cellKey[:idx]
+			proxy := cellKey[idx+1:]
+
+			data, err := json.Marshal(pc)
+			if err != nil {
+				continue
+			}
+
+			ops = append(ops, smart.StoreOperation{
+				Type:   smart.OpSaveRoute,
+				Group:  s.Name(),
+				Config: s.configName,
+				Target: key + "/" + proxy,
+				Data:   data,
+			})
+		}
+	}
+
+	for routeKey, pr := range dirtyRows {
+		data, err := json.Marshal(pr)
+		if err != nil {
+			continue
+		}
+		ops = append(ops, smart.StoreOperation{
+			Type:   smart.OpSaveRouteMeta,
+			Group:  s.Name(),
+			Config: s.configName,
+			Target: routeKey,
+			Data:   data,
+		})
+	}
+
+	if len(ops) > 0 {
+		store.AppendToGlobalQueue(ops...)
+	}
+
+	log.Infoln("[Smart] Enqueued %d dirty route cells and %d rows for group [%s]", len(dirty), len(dirtyRows), s.Name())
+}
+
+// decayFailedCounts reduces every route cell's FailedCount by 0.1 (floor 0).
+func (s *Smart) decayFailedCounts() {
+	count := s.routeTable.DecayFailedCounts()
+	if count > 0 {
+		log.Debugln("[Smart] Decayed FailedCount for %d cells in group [%s]", count, s.Name())
 	}
 }
 
@@ -544,7 +745,10 @@ func applyPolicyPriority(s *Smart, policyPriority string) {
 // ── ASN resolution ──────────────────────────────────────────
 
 func (s *Smart) getASNCode(metadata *C.Metadata) string {
-	if metadata.DstIPASN == "unknown" {
+	// "0" is the failure sentinel written below; "unknown" is the legacy
+	// sentinel still written by the IP-ASN rule path (rules/common/ipasn.go).
+	// Treat both as "no usable ASN" so routeKey falls back to ASN+domain.
+	if metadata.DstIPASN == "0" || metadata.DstIPASN == "unknown" {
 		return ""
 	}
 
@@ -560,21 +764,28 @@ func (s *Smart) getASNCode(metadata *C.Metadata) string {
 			ip, err = resolver.ResolveIP(ctx, metadata.Host)
 			if err != nil {
 				log.Debugln("[DNS] resolve %s error: %s", metadata.Host, err.Error())
-				metadata.DstIPASN = "unknown"
+				metadata.DstIPASN = "0"
 				return ""
 			}
 			log.Debugln("[DNS] %s --> %s", metadata.Host, ip.String())
 			if !ip.IsValid() {
-				metadata.DstIPASN = "unknown"
+				metadata.DstIPASN = "0"
 				return ""
 			}
 		} else {
 			ip = metadata.DstIP
 		}
 
+		if !geodata.ASNEnable() {
+			if err := geodata.InitASN(); err != nil {
+				log.Warnln("[Smart] ASN not initialized: %v", err)
+				metadata.DstIPASN = "0"
+				return ""
+			}
+		}
 		asn, aso := mmdb.ASNInstance().LookupASN(ip.AsSlice())
 		if asn == "" {
-			metadata.DstIPASN = "unknown"
+			metadata.DstIPASN = "0"
 		} else {
 			metadata.DstIPASN = asn + " " + aso
 		}

@@ -18,50 +18,55 @@ import (
 )
 
 const (
-	OpSaveNodeState         = iota
+	OpSaveNodeState = iota
 	OpSaveStats
 	OpSavePrefetch
 	OpSaveRanking
 	OpSaveHostFailures
+	OpSaveRoute
+	OpSaveRouteMeta
 )
 
 const (
-	KeyTypePrefetch         = "prefetch"
-	KeyTypeNode             = "node"
-	KeyTypeStats            = "stats"
-	KeyTypeRanking          = "ranking"
-	KeyTypeHostFailures     = "failures"
+	KeyTypePrefetch     = "prefetch"
+	KeyTypeNode         = "node"
+	KeyTypeStats        = "stats"
+	KeyTypeRanking      = "ranking"
+	KeyTypeHostFailures = "failures"
+	KeyTypeRoute        = "route"
+	KeyTypeRouteMeta    = "route_meta"
 
-	WeightTypeTCP           = "tcp"
-	WeightTypeUDP           = "udp"
-	WeightTypeTCPASN        = "tcp_asn"
-	WeightTypeUDPASN        = "udp_asn"
+	WeightTypeTCP    = "tcp"
+	WeightTypeUDP    = "udp"
+	WeightTypeTCPASN = "tcp_asn"
+	WeightTypeUDPASN = "udp_asn"
 )
 
 const (
-	DefaultMinSampleCount   = 2
+	DefaultMinSampleCount = 2
 
-	MaxTargetsLimit         = 5000
-	MinTargetsLimit         = 500
-	MaxBatchThreshLimit     = 300
-	MinBatchThreshLimit     = 50
+	MaxTargetsLimit     = 5000
+	MinTargetsLimit     = 500
+	MaxBatchThreshLimit = 300
+	MinBatchThreshLimit = 50
 
-	RecordExpiredTime       = 7 * 24 * time.Hour
+	RecordExpiredTime = 7 * 24 * time.Hour
 
-	HostFailureNodeTTL      = 24 * time.Hour
+	HostFailureNodeTTL = 24 * time.Hour
 
-	AllowedWeight           = 0.4
+	AllowedWeight = 0.4
 
-	RankMostUsed            = "MostUsed"
-	RankOccasional          = "OccasionalUsed"
-	RankRarelyUsed          = "RarelyUsed"
+	RankMostUsed   = "MostUsed"
+	RankOccasional = "OccasionalUsed"
+	RankRarelyUsed = "RarelyUsed"
 )
 
 var (
-	db *bbolt.DB
+	db               *bbolt.DB
 	bucketSmartStats = []byte("smart_stats")
 
 	globalOperationQueue atomic.TypedValue[[]StoreOperation]
+	flushMutex           sync.Mutex
 
 	globalCacheParams struct {
 		BatchSaveThreshold int
@@ -108,7 +113,7 @@ var CdnASNs = map[string]bool{
 }
 
 type (
-	Store struct {}
+	Store struct{}
 
 	StoreOperation struct {
 		Type   int
@@ -159,6 +164,10 @@ func formatOperationKey(op *StoreOperation) string {
 		return FormatDBKey(KeyTypeRanking, op.Config, op.Group)
 	case OpSaveHostFailures:
 		return FormatDBKey(KeyTypeHostFailures, op.Config, op.Group, op.Target)
+	case OpSaveRoute:
+		return FormatDBKey(KeyTypeRoute, op.Config, op.Group, op.Target)
+	case OpSaveRouteMeta:
+		return FormatDBKey(KeyTypeRouteMeta, op.Config, op.Group, op.Target)
 	default:
 		return ""
 	}
@@ -407,7 +416,7 @@ func GetSystemMemoryUsage() float64 {
 	return 0.5
 }
 
-func InitQueue()  {
+func InitQueue() {
 	threshold := GetBatchSaveThreshold()
 	emptyQueue := make([]StoreOperation, 0, threshold)
 	replaceGlobalQueue(emptyQueue)
@@ -455,11 +464,40 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 	})
 
 	if shouldFlush && len(snapshot) > 0 {
-		go func() {
-			if err := s.BatchSave(snapshot); err == nil {
-				log.Debugln("[SmartStore] Queue datas saved, operations: [%d]", len(snapshot))
-			}
-		}()
+		// Synchronous flush under global mutex so that:
+		// 1. Two concurrent threshold-triggered flushes cannot interleave.
+		// 2. No old snapshot can land in the DB after a newer one.
+		// 3. On failure the snapshot is re-enqueued for the next persist
+		//    cycle or the final FlushQueue(true) on Close.
+		flushMutex.Lock()
+		if err := s.BatchSave(snapshot); err != nil {
+			log.Warnln("[SmartStore] Sync batch save failed, re-enqueuing %d operations: %v", len(snapshot), err)
+			// Merge old snapshot first, then current queue, so that newer
+			// values in the current queue override older snapshot values.
+			globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
+				opMap := make(map[string]StoreOperation, len(snapshot)+len(old))
+				for i := range snapshot {
+					key := formatOperationKey(&snapshot[i])
+					if key != "" {
+						opMap[key] = snapshot[i]
+					}
+				}
+				for i := range old {
+					key := formatOperationKey(&old[i])
+					if key != "" {
+						opMap[key] = old[i]
+					}
+				}
+				newQueue := make([]StoreOperation, 0, len(opMap))
+				for _, op := range opMap {
+					newQueue = append(newQueue, op)
+				}
+				return newQueue
+			})
+		} else {
+			log.Debugln("[SmartStore] Queue datas saved, operations: [%d]", len(snapshot))
+		}
+		flushMutex.Unlock()
 	}
 }
 
@@ -573,6 +611,8 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 			FormatDBKey(KeyTypeRanking, config),
 			FormatDBKey(KeyTypePrefetch, config),
 			FormatDBKey(KeyTypeHostFailures, config),
+			FormatDBKey(KeyTypeRoute, config),
+			FormatDBKey(KeyTypeRouteMeta, config),
 		}, false)
 	} else if level == "group" {
 		s.DBBatchDeletePrefix([]string{
@@ -581,6 +621,8 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 			FormatDBKey(KeyTypeRanking, config, group),
 			FormatDBKey(KeyTypePrefetch, config, group),
 			FormatDBKey(KeyTypeHostFailures, config, group),
+			FormatDBKey(KeyTypeRoute, config, group),
+			FormatDBKey(KeyTypeRouteMeta, config, group),
 		}, false)
 	}
 
@@ -612,4 +654,9 @@ func (s *Store) FlushByGroup(group, config string) error {
 		log.Debugln("[SmartStore] All data for group [%s] config [%s] cleared", group, config)
 	}
 	return err
+}
+
+// IsDBAvailable reports whether the underlying bbolt database is open.
+func (s *Store) IsDBAvailable() bool {
+	return db != nil
 }

@@ -397,7 +397,7 @@ func (s *Store) clearCache(level string, config string, group string) {
 	if level == "config" {
 		unwrapCache.RemoveByKeyPrefix(FormatDBKey(config) + "/")
 		recordCache.RemoveByKeyPrefix(FormatDBKey(KeyTypeStats, config) + "/")
-		for _, kt := range []string{KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeRanking, KeyTypeHostFailures} {
+		for _, kt := range []string{KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeRanking, KeyTypeHostFailures, KeyTypeRoute, KeyTypeRouteMeta} {
 			dbResultCache.RemoveByKeyPrefix(FormatDBKey(kt, config) + "/")
 		}
 		blockedNodesCache.RemoveByKeyPrefix(FormatDBKey(config) + "/")
@@ -406,7 +406,7 @@ func (s *Store) clearCache(level string, config string, group string) {
 		groupKey := FormatDBKey(config, group) // "smart/{config}/{group}"
 		unwrapCache.RemoveByKeyPrefix(groupKey + "/")
 		recordCache.RemoveByKeyPrefix(FormatDBKey(KeyTypeStats, config, group) + "/")
-		for _, kt := range []string{KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeRanking, KeyTypeHostFailures} {
+		for _, kt := range []string{KeyTypeStats, KeyTypeNode, KeyTypePrefetch, KeyTypeRanking, KeyTypeHostFailures, KeyTypeRoute, KeyTypeRouteMeta} {
 			dbResultCache.Delete(FormatDBKey(kt, config, group))
 		}
 		blockedNodesCache.Delete(groupKey)
