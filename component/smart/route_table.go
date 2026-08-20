@@ -38,6 +38,7 @@ const maxFailedCount  = 10.0
 type ProxyAttributes struct {
 	PkgLoss     float64 `json:"pkg_loss"`
 	Latency     int64   `json:"latency"`
+	TTFB        int64   `json:"ttfb"`
 	Speed       float64 `json:"speed"`
 	Score       float64 `json:"score"`
 	FailedCount float64 `json:"failed_count"`
@@ -89,11 +90,13 @@ type proxyCell struct {
 	UseCount         int64
 	FailedCount      float64
 	Latency          int64   // EMA, 0 means no sample yet
+	TTFB             int64   // EMA of time-to-first-byte (ms), 0 means no sample yet
 	PkgLoss          float64 // EMA
 	Speed            float64 // EMA
 	Jitter           float64 // EMA of |sample - previous latency EMA|, 0 means no sample yet
 	Score            float64 // non-EMA score derived from latency, speed, pkgLoss and failedCount
 	HasLatencySample bool
+	HasTTFBSample    bool
 	HasPkgLossSample bool
 	HasSpeedSample   bool
 	HasJitterSample  bool
@@ -101,7 +104,7 @@ type proxyCell struct {
 }
 
 func (c *proxyCell) hasSample() bool {
-	return c.HasLatencySample || c.HasPkgLossSample || c.HasSpeedSample || c.HasJitterSample
+	return c.HasLatencySample || c.HasTTFBSample || c.HasPkgLossSample || c.HasSpeedSample || c.HasJitterSample
 }
 
 // hasData is true when the cell has any sample or a failure count, so a proxy
@@ -447,6 +450,22 @@ func (rt *RouteTable) UpdateLatency(key, proxy string, latency int64) {
 	rt.touchLRU(key)
 }
 
+// UpdateTTFB updates the EMA time-to-first-byte for a (key, proxy) pair.
+// TTFB is measured from when the connection is ready (protocol handshake
+// complete) to the first byte read from the target, so it captures end-to-end
+// responsiveness beyond the proxy server alone.
+func (rt *RouteTable) UpdateTTFB(key, proxy string, ttfb int64) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row := rt.getOrCreateRow(key)
+	cell := rt.getOrCreateCell(row, proxy)
+	cell.TTFB = applyEMAInt64(cell.TTFB, ttfb, cell.HasTTFBSample)
+	cell.HasTTFBSample = true
+	cell.Dirty = true
+	row.lastUsed = time.Now().Unix()
+	rt.touchLRU(key)
+}
+
 // UpdatePkgLoss updates the EMA packet loss for a (key, proxy) pair.
 func (rt *RouteTable) UpdatePkgLoss(key, proxy string, loss float64) {
 	rt.mu.Lock()
@@ -718,12 +737,14 @@ func (rt *RouteTable) SnapshotAndClearDirty() map[string]PersistedCell {
 				cellKey := key + "\x00" + cell.Name
 				snapshot[cellKey] = PersistedCell{
 					Latency:          cell.Latency,
+					TTFB:             cell.TTFB,
 					PkgLoss:          cell.PkgLoss,
 					Speed:            cell.Speed,
 					Jitter:           cell.Jitter,
 					UseCount:         cell.UseCount,
 					FailedCount:      cell.FailedCount,
 					HasLatencySample: cell.HasLatencySample,
+					HasTTFBSample:    cell.HasTTFBSample,
 					HasPkgLossSample: cell.HasPkgLossSample,
 					HasSpeedSample:   cell.HasSpeedSample,
 					HasJitterSample:  cell.HasJitterSample,
@@ -755,6 +776,7 @@ func (rt *RouteTable) MarkDirty(key, proxy string) {
 // PersistedCell is the JSON-serializable form of a proxyCell meant for DB storage.
 type PersistedCell struct {
 	Latency          int64   `json:"latency"`
+	TTFB             int64   `json:"ttfb"`
 	PkgLoss          float64 `json:"pkg_loss"`
 	Speed            float64 `json:"speed"`
 	Jitter           float64 `json:"jitter"`
@@ -762,6 +784,7 @@ type PersistedCell struct {
 	FailedCount      float64 `json:"failed_count"`
 	HasSample        bool    `json:"has_sample"` // retained for backward compat with old persisted data
 	HasLatencySample bool    `json:"has_latency_sample"`
+	HasTTFBSample    bool    `json:"has_ttfb_sample"`
 	HasPkgLossSample bool    `json:"has_pkg_loss_sample"`
 	HasSpeedSample   bool    `json:"has_speed_sample"`
 	HasJitterSample  bool    `json:"has_jitter_sample"`
@@ -775,12 +798,14 @@ func (rt *RouteTable) RestoreRow(key, proxy string, pc PersistedCell) {
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
 	cell.Latency = pc.Latency
+	cell.TTFB = pc.TTFB
 	cell.PkgLoss = pc.PkgLoss
 	cell.Speed = pc.Speed
 	cell.Jitter = pc.Jitter
 	cell.UseCount = pc.UseCount
 	cell.FailedCount = pc.FailedCount
 	cell.HasLatencySample = pc.HasLatencySample
+	cell.HasTTFBSample = pc.HasTTFBSample
 	cell.HasPkgLossSample = pc.HasPkgLossSample
 	cell.HasSpeedSample = pc.HasSpeedSample
 	cell.HasJitterSample = pc.HasJitterSample
@@ -958,6 +983,7 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 				Attributes: ProxyAttributes{
 					PkgLoss:     cell.PkgLoss,
 					Latency:     cell.Latency,
+					TTFB:        cell.TTFB,
 					Speed:       cell.Speed,
 					Score:       cell.Score,
 					FailedCount: cell.FailedCount,
@@ -1027,6 +1053,7 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 	type entry struct {
 		name         string
 		latency      int64
+		ttfb         int64
 		use          int64
 		fail         float64
 		loss         float64
@@ -1041,6 +1068,7 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 		entries = append(entries, entry{
 			name:         cell.Name,
 			latency:      cell.Latency,
+			ttfb:         cell.TTFB,
 			use:          cell.UseCount,
 			fail:         cell.FailedCount,
 			loss:         cell.PkgLoss,
@@ -1077,8 +1105,8 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 		if i > 0 {
 			sb.WriteString(" ")
 		}
-		sb.WriteString(fmt.Sprintf("%s(lat=%d,use=%d,fail=%.1f,loss=%.3f,jit=%.1f,spd=%.0f,[latScore=%.4f,speedScore=%.4f,score=%.4f])",
-			e.name, e.latency, e.use, e.fail, e.loss, e.jitter, e.speed, e.latencyScore, e.speedScore, e.score))
+		sb.WriteString(fmt.Sprintf("%s(lat=%d,ttfb=%d,use=%d,fail=%.1f,loss=%.3f,jit=%.1f,spd=%.0f,[latScore=%.4f,speedScore=%.4f,score=%.4f])",
+			e.name, e.latency, e.ttfb, e.use, e.fail, e.loss, e.jitter, e.speed, e.latencyScore, e.speedScore, e.score))
 	}
 	sb.WriteString("]")
 	return sb.String()

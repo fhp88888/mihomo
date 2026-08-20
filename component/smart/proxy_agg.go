@@ -48,6 +48,7 @@ func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
 		rows     int
 		totalW   float64
 		wLatency float64
+		wTTFB    float64
 		wPkgLoss float64
 		wSpeed   float64
 		wJitter  float64
@@ -80,6 +81,7 @@ func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
 			a.rows++
 			a.totalW += weight
 			a.wLatency += float64(cell.Latency) * weight
+			a.wTTFB += float64(cell.TTFB) * weight
 			a.wPkgLoss += cell.PkgLoss * weight
 			a.wSpeed += cell.Speed * weight
 			a.wJitter += cell.Jitter * weight
@@ -97,6 +99,7 @@ func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
 			continue
 		}
 		latency := int64(math.Round(a.wLatency / div))
+		ttfb := int64(math.Round(a.wTTFB / div))
 		speed := a.wSpeed / div
 		pkgLoss := a.wPkgLoss / div
 		jitter := a.wJitter / div
@@ -108,6 +111,7 @@ func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
 			Rows:     a.rows,
 			Attributes: ProxyAttributes{
 				Latency:     latency,
+				TTFB:        ttfb,
 				Speed:       speed,
 				PkgLoss:     pkgLoss,
 				Jitter:      jitter,

@@ -655,10 +655,14 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, conne
 
 	c = callback.NewFirstReadCallBackConn(c, func(err error) {
 		ttfb := time.Since(start).Milliseconds()
+		if ttfb < 1 {
+			ttfb = 1
+		}
 		firstReadLatency.Store(ttfb)
 		if err != nil {
 			firstReadErr.Store(err)
 		}
+		s.routeTable.UpdateTTFB(key, proxy.Name(), ttfb)
 		log.Infoln("[Smart] established key=%s target=%s proxy=%s latency=%dms tcp_connect=%dms ttfb=%dms",
 			key, domain, proxy.Name(), connectTime, tcpConnectTime.Milliseconds(), ttfb)
 	})
