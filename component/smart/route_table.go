@@ -387,10 +387,14 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 	return int64(applyEMA(float64(old), float64(new), hasSample))
 }
 
-func calculateScore(latency int64, speed float64, pkgLoss float64, failedCount float64, jitter float64, connSizeKB float64) float64 {
+// calculateScore computes a proxy score whose response-time term is responseTime.
+// Pass latency for the legacy latency-derived score, or TTFB to score by
+// time-to-first-byte instead.  All other dimensions (speed, pkgLoss,
+// failedCount, jitter) apply identically.
+func calculateScore(responseTime int64, speed float64, pkgLoss float64, failedCount float64, jitter float64, connSizeKB float64) float64 {
 	score := 0.0
-	if latency > 0 {
-		score = 100.0 / (math.Max(float64(latency), 50.0) +
+	if responseTime > 0 {
+		score = 100.0 / (math.Max(float64(responseTime), 50.0) +
 			math.Max(jitter, 10.0))
 	}
 	if speed > 0 && connSizeKB >= minConnSizeForSpeedKB {
@@ -451,9 +455,9 @@ func (rt *RouteTable) UpdateLatency(key, proxy string, latency int64) {
 }
 
 // UpdateTTFB updates the EMA time-to-first-byte for a (key, proxy) pair.
-// TTFB is measured from when the connection is ready (protocol handshake
-// complete) to the first byte read from the target, so it captures end-to-end
-// responsiveness beyond the proxy server alone.
+// TTFB is measured end-to-end from dial start: it includes connecting to the
+// proxy server and the protocol handshake, then the time to the first byte
+// read from the target.
 func (rt *RouteTable) UpdateTTFB(key, proxy string, ttfb int64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -604,12 +608,20 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 	return result
 }
 
-// RankByScore sorts proxies by score descending, falling back to latency-derived scores.
+// RankByScore sorts proxies for a route key's domain.  Once the key has any
+// TTFB sample it switches to TTFB-first ranking:
+//   - proxies with a TTFB sample are ranked first, scored with TTFB replacing
+//     latency as the response-time term;
+//   - proxies without a TTFB sample whose latency already exceeds the key's
+//     minimum TTFB (a known-faster first-byte makes them hopeless) are skipped;
+//     the rest are ranked after the TTFB group by latency-derived score.
+//
+// With no TTFB sample at all (cold start) it falls back to latency-derived
+// scores as before.
 func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(string) uint16, key, domain string) []string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
-	scores := make(map[string]float64, len(proxies))
 	row, rowOK := rt.rows[key]
 
 	// Per-domain connSize gates the speed component.  A domain without a cell
@@ -621,28 +633,86 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 		}
 	}
 
-	for _, proxy := range proxies {
-		if rowOK {
-			if cell, ok := row.proxies[proxy]; ok && cell.hasData() {
-				scores[proxy] = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeKB)
-				continue
-			}
-		}
-		if healthCheckLatency != nil {
-			if hc := healthCheckLatency(proxy); hc != 0 && hc != 0xffff {
-				scores[proxy] = calculateScore(int64(hc), 0, 0, 0, 0, connSizeKB)
-			} else {
-				scores[proxy] = 0
+	// minTTFB is the smallest TTFB EMA among proxies with a sample in this row.
+	var minTTFB int64
+	hasTTFB := false
+	if rowOK {
+		for _, cell := range row.proxies {
+			if cell.HasTTFBSample {
+				if !hasTTFB || cell.TTFB < minTTFB {
+					minTTFB = cell.TTFB
+					hasTTFB = true
+				}
 			}
 		}
 	}
 
-	result := make([]string, len(proxies))
-	copy(result, proxies)
-	sort.SliceStable(result, func(i, j int) bool {
-		return scores[result[i]] > scores[result[j]]
+	type candidate struct {
+		name  string
+		score float64
+		ttfb  bool
+	}
+	cands := make([]candidate, 0, len(proxies))
+
+	for _, proxy := range proxies {
+		var cell *proxyCell
+		if rowOK {
+			if c, ok := row.proxies[proxy]; ok {
+				cell = c
+			}
+		}
+
+		// TTFB group: rank by a score whose response-time term is TTFB.
+		if cell != nil && cell.HasTTFBSample {
+			cands = append(cands, candidate{
+				name:  proxy,
+				score: calculateScore(cell.TTFB, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeKB),
+				ttfb:  true,
+			})
+			continue
+		}
+
+		// No TTFB sample: resolve a latency — cell EMA when the cell has any
+		// data (a failed-only cell keeps latency 0 so its failure penalty still
+		// drives it to the back), otherwise the health-check fallback.
+		var latency int64
+		var speed, pkgLoss, failedCount, jitter float64
+		if cell != nil && cell.hasData() {
+			latency = cell.Latency
+			speed = cell.Speed
+			pkgLoss = cell.PkgLoss
+			failedCount = cell.FailedCount
+			jitter = cell.Jitter
+		} else if healthCheckLatency != nil {
+			if hc := healthCheckLatency(proxy); hc != 0 && hc != 0xffff {
+				latency = int64(hc)
+			}
+		}
+
+		// Once any proxy has a TTFB sample, a proxy whose latency already
+		// exceeds the known minimum first-byte time cannot win — skip it.
+		if hasTTFB && latency > minTTFB {
+			continue
+		}
+
+		cands = append(cands, candidate{
+			name:  proxy,
+			score: calculateScore(latency, speed, pkgLoss, failedCount, jitter, connSizeKB),
+			ttfb:  false,
+		})
+	}
+
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].ttfb != cands[j].ttfb {
+			return cands[i].ttfb // TTFB group first
+		}
+		return cands[i].score > cands[j].score
 	})
 
+	result := make([]string, 0, len(cands))
+	for _, c := range cands {
+		result = append(result, c.name)
+	}
 	return result
 }
 

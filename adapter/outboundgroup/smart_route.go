@@ -654,7 +654,10 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, conne
 	}
 
 	c = callback.NewFirstReadCallBackConn(c, func(err error) {
-		ttfb := time.Since(start).Milliseconds()
+		// TTFB is end-to-end from dial start: connectTime covers dial →
+		// handshake-done, and time.Since(start) the remainder until the first
+		// byte arrives from the target.
+		ttfb := connectTime + time.Since(start).Milliseconds()
 		if ttfb < 1 {
 			ttfb = 1
 		}
@@ -801,10 +804,11 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 		}
 	}
 
-	// Rank remaining by score
+	// Rank remaining by latency.  UDP has no TTFB of its own; a TCP-written
+	// TTFB must not gate UDP candidates, otherwise a row with any TCP TTFB
+	// sample could drop every UDP-capable proxy and leave none to try.
 	names := namesOf(udpProxies)
-	s.routeTable.RefreshScores(key, names)
-	ranked := s.routeTable.RankByScore(names, s.lastDelayOf(proxies), key, domain)
+	ranked := s.routeTable.PreRankLatency(names, s.lastDelayOf(proxies), key)
 
 	ordered := orderByNames(udpProxies, ranked)
 

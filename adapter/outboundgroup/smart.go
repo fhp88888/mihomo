@@ -295,6 +295,16 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 		}
 	}
 
+	// ranked is empty (all alive proxies were dropped, e.g. latency > min TTFB):
+	// fall back to the first alive proxy rather than a possibly-dead proxies[0].
+	for _, name := range names {
+		for _, p := range proxies {
+			if p.Name() == name {
+				return p
+			}
+		}
+	}
+
 	return proxies[0]
 }
 
