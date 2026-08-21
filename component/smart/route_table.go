@@ -17,16 +17,21 @@ const DefaultMaxRows = 200
 // MaxDomainsPerNormalASRow caps the per-row domain table (LRU) for a normal
 // ASN or TARGET row: each tracks at most this many distinct effective domains
 // by connection size.
-const MaxDomainsPerNormalASRow = 20
+const MaxDomainsPerNormalASRow = 40
 
 // MaxDomainsPerCDNASRow caps the per-row domain table (LRU) for a CDN ASN row.
 // A CDN ASN (see CdnASNs in common.go) fronts many distinct sites behind one
 // ASN, so its row gets a larger domain table to avoid thrashing the LRU.
 const MaxDomainsPerCDNASRow = 200
 
+// MaxTTFBProxiesPerRank caps how many TTFB-group proxies RankByScore keeps.
+// Even when many proxies have a TTFB sample, only the top-N by score survive;
+// the rest of the candidate list is filled by the latency (non-TTFB) group.
+const MaxTTFBProxiesPerRank = 4
+
 // minConnSizeForSpeedKB gates the speed term in calculateScore: smaller
 // connections transfer too little data for a reliable throughput reading.
-const minConnSizeForSpeedKB = 16.0
+const minConnSizeForSpeedKB = 4.0
 
 // connSizeUnknown stands in for connSize when none is known (restore,
 // aggregation, debug); it is large enough to always include the speed term.
@@ -611,7 +616,9 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 // RankByScore sorts proxies for a route key's domain.  Once the key has any
 // TTFB sample it switches to TTFB-first ranking:
 //   - proxies with a TTFB sample are ranked first, scored with TTFB replacing
-//     latency as the response-time term;
+//     latency as the response-time term; at most MaxTTFBProxiesPerRank of them
+//     survive (the top-scored ones), so a crowded TTFB group cannot crowd out
+//     the latency-ranked fallbacks;
 //   - proxies without a TTFB sample whose latency already exceeds the key's
 //     minimum TTFB (a known-faster first-byte makes them hopeless) are skipped;
 //     the rest are ranked after the TTFB group by latency-derived score.
@@ -691,7 +698,7 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 
 		// Once any proxy has a TTFB sample, a proxy whose latency already
 		// exceeds the known minimum first-byte time cannot win — skip it.
-		if hasTTFB && latency > minTTFB {
+		if hasTTFB && latency*3/2 > minTTFB {
 			continue
 		}
 
@@ -709,8 +716,18 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 		return cands[i].score > cands[j].score
 	})
 
+	// Only the top MaxTTFBProxiesPerRank TTFB proxies survive.  The sort put
+	// the TTFB group first (score-descending), so skipping past the first N
+	// ttfb candidates keeps exactly the highest-scored TTFB proxies.
 	result := make([]string, 0, len(cands))
+	ttfbKept := 0
 	for _, c := range cands {
+		if c.ttfb {
+			if ttfbKept >= MaxTTFBProxiesPerRank {
+				continue
+			}
+			ttfbKept++
+		}
 		result = append(result, c.name)
 	}
 	return result

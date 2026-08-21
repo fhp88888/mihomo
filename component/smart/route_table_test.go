@@ -412,24 +412,22 @@ func TestRankByScoreSkipsProxiesSlowerThanMinTTFB(t *testing.T) {
 
 	// proxy-a establishes minTTFB=50.
 	rt.UpdateTTFB(key, "proxy-a", 50)
-	// proxy-b has no TTFB and latency already worse than 50 -> skipped.
-	rt.UpdateLatency(key, "proxy-b", 100)
-	// proxy-c has no TTFB but latency better than 50 -> kept.
-	rt.UpdateLatency(key, "proxy-c", 30)
+	// proxy-b has no TTFB and latency 200 -> 2*200 > 50 -> skipped.
+	rt.UpdateLatency(key, "proxy-b", 200)
+	// proxy-c has no TTFB and latency 20 -> 2*20 <= 50 -> kept.
+	rt.UpdateLatency(key, "proxy-c", 20)
+	// proxy-d has no TTFB and latency 40 -> 2*40 > 50 -> skipped (the current
+	// prune threshold is latency > minTTFB/2, so even latency < minTTFB is cut).
+	rt.UpdateLatency(key, "proxy-d", 40)
 
-	ranked := rt.RankByScore([]string{"proxy-b", "proxy-c", "proxy-a"}, nil, key, testDomain)
+	ranked := rt.RankByScore([]string{"proxy-b", "proxy-c", "proxy-d", "proxy-a"}, nil, key, testDomain)
 
 	if len(ranked) != 2 {
-		t.Fatalf("expected 2 proxies (proxy-b skipped), got %d: %v", len(ranked), ranked)
+		t.Fatalf("expected 2 proxies (proxy-b, proxy-d skipped), got %d: %v", len(ranked), ranked)
 	}
 	// TTFB group (proxy-a) first, then the latency group (proxy-c).
 	if ranked[0] != "proxy-a" || ranked[1] != "proxy-c" {
 		t.Fatalf("unexpected order: %v", ranked)
-	}
-	for _, name := range ranked {
-		if name == "proxy-b" {
-			t.Fatalf("proxy-b (latency > minTTFB) should be skipped, got %v", ranked)
-		}
 	}
 }
 
@@ -437,9 +435,10 @@ func TestRankByScoreLatencyGroupAfterTTFBGroup(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	// proxy-a has TTFB=50; proxy-b has no TTFB but latency=30 (< 50, kept).
+	// proxy-a has TTFB=50; proxy-b has no TTFB but latency=20 (<= minTTFB*2,
+	// so it survives the prune even though its raw latency is lower).
 	rt.UpdateTTFB(key, "proxy-a", 50)
-	rt.UpdateLatency(key, "proxy-b", 30)
+	rt.UpdateLatency(key, "proxy-b", 20)
 
 	ranked := rt.RankByScore([]string{"proxy-b", "proxy-a"}, nil, key, testDomain)
 	// TTFB group always comes first, even though proxy-b's raw latency is lower.
@@ -465,6 +464,33 @@ func TestRankByScoreMinTTFBFromWholeRow(t *testing.T) {
 	ranked := rt.RankByScore([]string{"proxy-a", "proxy-c"}, nil, key, testDomain)
 	if len(ranked) != 1 || ranked[0] != "proxy-a" {
 		t.Fatalf("expected only proxy-a (proxy-c skipped via whole-row minTTFB), got %v", ranked)
+	}
+}
+
+func TestRankByScoreCapsTTFBGroup(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// Six proxies with a TTFB sample, clearly distinct first-byte times.
+	// proxy-a is the fastest, proxy-f the slowest.
+	for i, name := range []string{"proxy-a", "proxy-b", "proxy-c", "proxy-d", "proxy-e", "proxy-f"} {
+		rt.UpdateTTFB(key, name, int64(50+10*i))
+	}
+	// A latency-only proxy with latency*2 <= minTTFB so it survives the prune.
+	rt.UpdateLatency(key, "proxy-nottfb", 20)
+
+	proxies := []string{"proxy-f", "proxy-e", "proxy-d", "proxy-c", "proxy-b", "proxy-a", "proxy-nottfb"}
+	ranked := rt.RankByScore(proxies, nil, key, testDomain)
+
+	if len(ranked) != MaxTTFBProxiesPerRank+1 {
+		t.Fatalf("expected %d proxies (4 TTFB + 1 latency), got %d: %v", MaxTTFBProxiesPerRank+1, len(ranked), ranked)
+	}
+	// Only the 4 fastest TTFB proxies survive, score-descending.
+	expected := []string{"proxy-a", "proxy-b", "proxy-c", "proxy-d", "proxy-nottfb"}
+	for i := range expected {
+		if ranked[i] != expected[i] {
+			t.Fatalf("ranked[%d]: expected %s, got %s (full: %v)", i, expected[i], ranked[i], ranked)
+		}
 	}
 }
 

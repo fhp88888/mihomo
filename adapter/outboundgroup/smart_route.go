@@ -26,7 +26,7 @@ import (
 
 const (
 	smartBestProxyFreshness = 5 * time.Second
-	smartTCPFallbackStagger = 200 * time.Millisecond
+	smartTCPFallbackStagger = 400 * time.Millisecond
 	// smartBestExclusiveWindow is how long the current best proxy races alone
 	// before the staggered fallback joins in.
 	smartBestExclusiveWindow = 600 * time.Millisecond
