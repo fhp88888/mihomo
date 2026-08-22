@@ -98,7 +98,7 @@ type proxyCell struct {
 	TTFB             int64   // EMA of time-to-first-byte (ms), 0 means no sample yet
 	PkgLoss          float64 // EMA
 	Speed            float64 // EMA
-	Jitter           float64 // EMA of |sample - previous latency EMA|, 0 means no sample yet
+	Jitter           float64 // EMA of |sample - previous TTFB EMA|, 0 means no sample yet
 	Score            float64 // non-EMA score derived from latency, speed, pkgLoss and failedCount
 	HasLatencySample bool
 	HasTTFBSample    bool
@@ -432,27 +432,13 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 }
 
 // UpdateLatency updates the EMA latency for a (key, proxy) pair.
-// Jitter is updated alongside using the same sample: the absolute deviation
-// of this sample from the previous latency EMA, smoothed with EMA.
 func (rt *RouteTable) UpdateLatency(key, proxy string, latency int64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
-	oldLatency := cell.Latency
 	cell.Latency = applyEMAInt64(cell.Latency, latency, cell.HasLatencySample)
 	cell.HasLatencySample = true
-
-	// Jitter = EMA of |sample - previous latency EMA|. On the first latency
-	// sample there is no baseline yet (oldLatency is 0), so skip the jitter update.
-	if oldLatency > 0 {
-		deviation := float64(latency - oldLatency)
-		if deviation < 0 {
-			deviation = -deviation
-		}
-		cell.Jitter = applyEMA(cell.Jitter, deviation, cell.HasJitterSample)
-		cell.HasJitterSample = true
-	}
 
 	cell.Dirty = true
 	row.lastUsed = time.Now().Unix()
@@ -462,14 +448,29 @@ func (rt *RouteTable) UpdateLatency(key, proxy string, latency int64) {
 // UpdateTTFB updates the EMA time-to-first-byte for a (key, proxy) pair.
 // TTFB is measured end-to-end from dial start: it includes connecting to the
 // proxy server and the protocol handshake, then the time to the first byte
-// read from the target.
+// read from the target.  Jitter is updated alongside using the same sample:
+// the absolute deviation of this sample from the previous TTFB EMA, smoothed
+// with EMA.
 func (rt *RouteTable) UpdateTTFB(key, proxy string, ttfb int64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateCell(row, proxy)
+	oldTTFB := cell.TTFB
 	cell.TTFB = applyEMAInt64(cell.TTFB, ttfb, cell.HasTTFBSample)
 	cell.HasTTFBSample = true
+
+	// Jitter = EMA of |sample - previous TTFB EMA|. On the first TTFB
+	// sample there is no baseline yet (oldTTFB is 0), so skip the jitter update.
+	if oldTTFB > 0 {
+		deviation := float64(ttfb - oldTTFB)
+		if deviation < 0 {
+			deviation = -deviation
+		}
+		cell.Jitter = applyEMA(cell.Jitter, deviation, cell.HasJitterSample)
+		cell.HasJitterSample = true
+	}
+
 	cell.Dirty = true
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)

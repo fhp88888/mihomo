@@ -106,33 +106,33 @@ func TestEMAJitter(t *testing.T) {
 	key := "ASN:64512"
 	proxy := "proxy-a"
 
-	// First latency sample: no baseline yet, jitter stays 0.
-	rt.UpdateLatency(key, proxy, 100)
+	// First TTFB sample: no baseline yet, jitter stays 0.
+	rt.UpdateTTFB(key, proxy, 100)
 	snap := rt.Snapshot("test")
 	rec := snap.Rows[0].Proxies[proxy]
 	if rec.Attributes.Jitter != 0 {
 		t.Fatalf("expected jitter=0 on first sample, got %.2f", rec.Attributes.Jitter)
 	}
-	if rec.Attributes.Latency != 100 {
-		t.Fatalf("expected first latency=100, got %d", rec.Attributes.Latency)
+	if rec.Attributes.TTFB != 100 {
+		t.Fatalf("expected first ttfb=100, got %d", rec.Attributes.TTFB)
 	}
 
-	// Second sample: previous EMA latency was 100, new sample 40.
+	// Second sample: previous EMA ttfb was 100, new sample 40.
 	// deviation = |40-100| = 60, first jitter sample writes directly.
-	rt.UpdateLatency(key, proxy, 40)
+	rt.UpdateTTFB(key, proxy, 40)
 	snap = rt.Snapshot("test")
 	rec = snap.Rows[0].Proxies[proxy]
 	if rec.Attributes.Jitter != 60 {
 		t.Fatalf("expected first jitter=60, got %.2f", rec.Attributes.Jitter)
 	}
-	// EMA latency = 100*3/4 + 40/4 = 85
-	if rec.Attributes.Latency != 85 {
-		t.Fatalf("expected EMA latency=85, got %d", rec.Attributes.Latency)
+	// EMA ttfb = 100*3/4 + 40/4 = 85
+	if rec.Attributes.TTFB != 85 {
+		t.Fatalf("expected EMA ttfb=85, got %d", rec.Attributes.TTFB)
 	}
 
-	// Third sample: previous EMA latency was 85, new sample 100.
+	// Third sample: previous EMA ttfb was 85, new sample 100.
 	// deviation = |100-85| = 15. Jitter EMA = 60*3/4 + 15/4 = 48.75.
-	rt.UpdateLatency(key, proxy, 100)
+	rt.UpdateTTFB(key, proxy, 100)
 	snap = rt.Snapshot("test")
 	rec = snap.Rows[0].Proxies[proxy]
 	expectedJitter := 60*3.0/4.0 + 15.0/4.0
