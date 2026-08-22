@@ -27,7 +27,7 @@ const MaxDomainsPerCDNASRow = 200
 // MaxTTFBProxiesPerRank caps how many TTFB-group proxies RankByScore keeps.
 // Even when many proxies have a TTFB sample, only the top-N by score survive;
 // the rest of the candidate list is filled by the latency (non-TTFB) group.
-const MaxTTFBProxiesPerRank = 4
+const MaxTTFBProxiesPerRank = 6
 
 // minConnSizeForSpeedKB gates the speed term in calculateScore: smaller
 // connections transfer too little data for a reliable throughput reading.
@@ -272,7 +272,7 @@ func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domai
 		delete(row.domainTable, evictKey)
 	}
 
-	cell := &domainCell{domainName: domain}
+	cell := &domainCell{domainName: domain, connSize: 100}
 	row.domainTable[domain] = cell
 	row.domainOrder = append(row.domainOrder, domain)
 	log.Debugln("[smart] LRU create domain key=%s domain=%s size=%d capacity=%d", row.key, domain, len(row.domainTable), capacity)
@@ -698,7 +698,7 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 
 		// Once any proxy has a TTFB sample, a proxy whose latency already
 		// exceeds the known minimum first-byte time cannot win — skip it.
-		if hasTTFB && latency*3/2 > minTTFB {
+		if hasTTFB && latency > minTTFB {
 			continue
 		}
 

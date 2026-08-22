@@ -26,10 +26,10 @@ import (
 
 const (
 	smartBestProxyFreshness = 5 * time.Second
-	smartTCPFallbackStagger = 400 * time.Millisecond
+	smartTCPFallbackStagger = 200 * time.Millisecond
 	// smartBestExclusiveWindow is how long the current best proxy races alone
 	// before the staggered fallback joins in.
-	smartBestExclusiveWindow = 600 * time.Millisecond
+	smartBestExclusiveWindow = 400 * time.Millisecond
 	// smartEarlyDeathLatencyLimit: a connection that fails before its first
 	// byte within this window is treated as a dead proxy, not a slow target.
 	smartEarlyDeathLatencyLimit = 5 * time.Second

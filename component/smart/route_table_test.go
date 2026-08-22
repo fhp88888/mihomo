@@ -317,6 +317,34 @@ func TestRankByScoreSkipsSpeedForSmallConnSize(t *testing.T) {
 	}
 }
 
+func TestRankByScoreDefaultConnSizeForUnseenDomain(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// proxy-a: fast latency (100ms), no speed.
+	// proxy-c: slow latency (200ms) but huge speed — boosted above proxy-a when
+	// the speed term counts.
+	rt.UpdateLatency(key, "proxy-a", 100)
+	rt.UpdateLatency(key, "proxy-c", 200)
+	rt.UpdateSpeed(key, "proxy-c", 10485760)
+
+	// A target with no domain record at all (no connSize sample, no cell)
+	// must default to connSize 100 (> the 4kB threshold), so the speed term is
+	// still counted and proxy-c outranks proxy-a.
+	ranked := rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "fresh.example.com")
+	if ranked[0] != "proxy-c" {
+		t.Fatalf("unseen domain: expected proxy-c first (default connSize keeps speed), got %v", ranked)
+	}
+
+	// Once a real (small) connSize is recorded, the speed term is skipped and
+	// the ranking flips.
+	rt.UpdateConnSize(key, "fresh.example.com", 1)
+	ranked = rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "fresh.example.com")
+	if ranked[0] != "proxy-a" {
+		t.Fatalf("small connSize: expected proxy-a first (speed skipped), got %v", ranked)
+	}
+}
+
 func TestRankByScoreStableSort(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
