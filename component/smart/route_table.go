@@ -37,7 +37,7 @@ const minConnSizeForSpeedKB = 4.0
 // aggregation, debug); it is large enough to always include the speed term.
 const connSizeUnknown = 1e18
 
-const maxFailedCount  = 10.0
+const maxFailedCount = 10.0
 
 // ProxyAttributes holds tracked connection quality metrics.
 type ProxyAttributes struct {
@@ -57,16 +57,18 @@ type ProxyRecord struct {
 	Attributes ProxyAttributes `json:"attributes"`
 }
 
-// rowEntry is one row in the route table, keyed by ASN or TARGET.
+// rowEntry is one row in the route table, keyed by ASN or TARGET.  Proxy
+// quality metrics (latency, TTFB, speed, pkg loss, jitter, failed count) live
+// per-domain inside domainCell, not on the row: they are strongly
+// target-dependent (TTFB especially), so sharing them across every domain
+// behind an ASN would blend unrelated sites' behavior into one noisy signal.
 type rowEntry struct {
 	key      string
 	lastUsed int64
-	proxies  map[string]*proxyCell
-	// domainTable records per-domain routing state and connection sizes (kB)
-	// observed under this CDN/ASN row, keyed by the connection's effective
-	// target (see GetEffectiveTarget).  Bounded to maxDomainsForRow(key) entries
-	// via LRU.  All domains in a row share the same set of proxyCell metrics;
-	// only the best proxy selection (bestProxy/tcpProbed) is per-domain.
+	// domainTable records per-domain routing state, connection sizes (kB) and
+	// proxy quality metrics observed under this CDN/ASN row, keyed by the
+	// connection's effective target (see GetEffectiveTarget).  Bounded to
+	// maxDomainsForRow(key) entries via LRU.
 	domainTable map[string]*domainCell
 	// domainOrder is the LRU order of domainTable keys: index 0 is the least
 	// recently used and is evicted first when the table is full.
@@ -77,17 +79,18 @@ type rowEntry struct {
 }
 
 // domainCell is the per-domain entry in a row's domainTable.  bestProxy and
-// tcpProbed hold this domain's routing decision, while connSize is an EMA of
-// the connection size (kB) seen for the domain.
+// tcpProbed hold this domain's routing decision, connSize is an EMA of the
+// connection size (kB) seen for the domain, and proxies holds this domain's
+// own view of every proxy's quality metrics — nothing here is shared with
+// sibling domains in the same row.
 type domainCell struct {
-	domainName string
-	bestProxy  string
-	tcpProbed  bool
-	lastUsed   int64 // last time this domain's best was used; freshness window
-	connSize   float64
-	// hasConnSizeSample distinguishes "no sample yet" (connSize is the zero
-	// placeholder) from a real sample so applyEMA starts from the sample value.
+	domainName        string
+	bestProxy         string
+	tcpProbed         bool
+	lastUsed          int64 // last time this domain's best was used; freshness window
+	connSize          float64
 	hasConnSizeSample bool
+	proxies           map[string]*proxyCell
 }
 
 type proxyCell struct {
@@ -119,11 +122,22 @@ func (c *proxyCell) hasData() bool {
 	return c.hasSample() || c.FailedCount > 0
 }
 
-// hasDirtyCell returns true when any cell in the row has unsaved changes.
-// Must be called with mu held.
-func hasDirtyCell(row *rowEntry) bool {
-	for _, cell := range row.proxies {
+// hasDirtyDomain returns true when any proxy cell in the domain has unsaved
+// changes.  Must be called with mu held.
+func hasDirtyDomain(dc *domainCell) bool {
+	for _, cell := range dc.proxies {
 		if cell.Dirty {
+			return true
+		}
+	}
+	return false
+}
+
+// hasDirtyCell returns true when any domain's proxy cell in the row has
+// unsaved changes.  Must be called with mu held.
+func hasDirtyCell(row *rowEntry) bool {
+	for _, dc := range row.domainTable {
+		if hasDirtyDomain(dc) {
 			return true
 		}
 	}
@@ -132,21 +146,21 @@ func hasDirtyCell(row *rowEntry) bool {
 
 // DomainSnapshot is a read-only copy of one domain's routing state for the REST API.
 type DomainSnapshot struct {
-	Name      string  `json:"name"`
-	BestProxy string  `json:"best_proxy"`
-	TCPProbed bool    `json:"tcp_probed"`
-	LastUsed  int64   `json:"last_used"`
-	ConnSize  float64 `json:"conn_size"`
+	Name      string                 `json:"name"`
+	BestProxy string                 `json:"best_proxy"`
+	TCPProbed bool                   `json:"tcp_probed"`
+	LastUsed  int64                  `json:"last_used"`
+	ConnSize  float64                `json:"conn_size"`
+	Proxies   map[string]ProxyRecord `json:"proxies"`
 }
 
 // RowSnapshot is a read-only copy of a row for the REST API.
 type RowSnapshot struct {
-	Key       string                 `json:"key"`
-	BestProxy string                 `json:"best_proxy"`
-	TCPProbed bool                   `json:"tcp_probed"`
-	LastUsed  int64                  `json:"last_used"`
-	Proxies   map[string]ProxyRecord `json:"proxies"`
-	Domains   []DomainSnapshot       `json:"domains"`
+	Key       string           `json:"key"`
+	BestProxy string           `json:"best_proxy"`
+	TCPProbed bool             `json:"tcp_probed"`
+	LastUsed  int64            `json:"last_used"`
+	Domains   []DomainSnapshot `json:"domains"`
 }
 
 // TableSnapshot is a read-only copy of the full route table.
@@ -215,7 +229,6 @@ func (rt *RouteTable) getOrCreateRow(key string) *rowEntry {
 	row = &rowEntry{
 		key:         key,
 		lastUsed:    time.Now().Unix(),
-		proxies:     make(map[string]*proxyCell),
 		domainTable: make(map[string]*domainCell),
 	}
 	rt.rows[key] = row
@@ -256,8 +269,10 @@ func maxDomainsForRow(key string) int {
 
 // getOrCreateDomainCell returns the domain cell for a row, creating it if
 // needed and handling the domain-table LRU eviction.  Must be called with mu
-// held.  When the table is full the least-recently-used domain (domainOrder[0])
-// is evicted first.
+// held.  When the table is full, the least-recently-used domain with no
+// unpersisted proxy-metric changes is evicted first, mirroring the row-level
+// eviction preference in getOrCreateRow — otherwise domain churn under a busy
+// CDN ASN row would silently drop unpersisted latency/TTFB/speed samples.
 func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domainCell {
 	if cell, ok := row.domainTable[domain]; ok {
 		return cell
@@ -265,14 +280,23 @@ func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domai
 
 	capacity := maxDomainsForRow(row.key)
 
-	// Evict the least-recently-used domain when at capacity.
 	if len(row.domainTable) >= capacity && len(row.domainOrder) > 0 {
-		evictKey := row.domainOrder[0]
-		row.domainOrder = row.domainOrder[1:]
+		evictIdx := -1
+		for i, d := range row.domainOrder {
+			if dc := row.domainTable[d]; dc != nil && !hasDirtyDomain(dc) {
+				evictIdx = i
+				break
+			}
+		}
+		if evictIdx < 0 {
+			evictIdx = 0
+		}
+		evictKey := row.domainOrder[evictIdx]
+		row.domainOrder = append(row.domainOrder[:evictIdx], row.domainOrder[evictIdx+1:]...)
 		delete(row.domainTable, evictKey)
 	}
 
-	cell := &domainCell{domainName: domain, connSize: 100}
+	cell := &domainCell{domainName: domain, connSize: 100, proxies: make(map[string]*proxyCell)}
 	row.domainTable[domain] = cell
 	row.domainOrder = append(row.domainOrder, domain)
 	log.Debugln("[smart] LRU create domain key=%s domain=%s size=%d capacity=%d", row.key, domain, len(row.domainTable), capacity)
@@ -369,13 +393,13 @@ func (rt *RouteTable) SetBestProxyAndTCPProbed(key, domain, proxy string) {
 	rt.setDomainState(key, domain, proxy, true, true)
 }
 
-// getOrCreateCell returns the proxy cell for a row, creating it if needed.
+// getOrCreateCell returns the proxy cell within a domain, creating it if needed.
 // Must be called with mu held.
-func (rt *RouteTable) getOrCreateCell(row *rowEntry, proxy string) *proxyCell {
-	cell, ok := row.proxies[proxy]
+func (rt *RouteTable) getOrCreateCell(dc *domainCell, proxy string) *proxyCell {
+	cell, ok := dc.proxies[proxy]
 	if !ok {
 		cell = &proxyCell{Name: proxy}
-		row.proxies[proxy] = cell
+		dc.proxies[proxy] = cell
 	}
 	return cell
 }
@@ -414,16 +438,21 @@ func calculateScore(responseTime int64, speed float64, pkgLoss float64, failedCo
 	return score
 }
 
-// RefreshScores updates non-EMA scores for existing proxy samples in a route row.
-func (rt *RouteTable) RefreshScores(key string, proxies []string) {
+// RefreshScores updates non-EMA scores for existing proxy samples in a route
+// key's domain.
+func (rt *RouteTable) RefreshScores(key, domain string, proxies []string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row, ok := rt.rows[key]
 	if !ok {
 		return
 	}
+	dc, ok := row.domainTable[domain]
+	if !ok {
+		return
+	}
 	for _, proxy := range proxies {
-		cell, ok := row.proxies[proxy]
+		cell, ok := dc.proxies[proxy]
 		if !ok || !cell.hasData() {
 			continue
 		}
@@ -431,31 +460,34 @@ func (rt *RouteTable) RefreshScores(key string, proxies []string) {
 	}
 }
 
-// UpdateLatency updates the EMA latency for a (key, proxy) pair.
-func (rt *RouteTable) UpdateLatency(key, proxy string, latency int64) {
+// UpdateLatency updates the EMA latency for a (key, domain, proxy) triple.
+func (rt *RouteTable) UpdateLatency(key, domain, proxy string, latency int64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
-	cell := rt.getOrCreateCell(row, proxy)
+	dc := rt.getOrCreateDomainCell(row, domain)
+	cell := rt.getOrCreateCell(dc, proxy)
 	cell.Latency = applyEMAInt64(cell.Latency, latency, cell.HasLatencySample)
 	cell.HasLatencySample = true
 
 	cell.Dirty = true
+	rt.touchDomainLRU(row, domain)
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
 }
 
-// UpdateTTFB updates the EMA time-to-first-byte for a (key, proxy) pair.
-// TTFB is measured end-to-end from dial start: it includes connecting to the
-// proxy server and the protocol handshake, then the time to the first byte
-// read from the target.  Jitter is updated alongside using the same sample:
-// the absolute deviation of this sample from the previous TTFB EMA, smoothed
-// with EMA.
-func (rt *RouteTable) UpdateTTFB(key, proxy string, ttfb int64) {
+// UpdateTTFB updates the EMA time-to-first-byte for a (key, domain, proxy)
+// triple.  TTFB is measured end-to-end from dial start: it includes
+// connecting to the proxy server and the protocol handshake, then the time to
+// the first byte read from the target.  Jitter is updated alongside using the
+// same sample: the absolute deviation of this sample from the previous TTFB
+// EMA, smoothed with EMA.
+func (rt *RouteTable) UpdateTTFB(key, domain, proxy string, ttfb int64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
-	cell := rt.getOrCreateCell(row, proxy)
+	dc := rt.getOrCreateDomainCell(row, domain)
+	cell := rt.getOrCreateCell(dc, proxy)
 	oldTTFB := cell.TTFB
 	cell.TTFB = applyEMAInt64(cell.TTFB, ttfb, cell.HasTTFBSample)
 	cell.HasTTFBSample = true
@@ -472,32 +504,37 @@ func (rt *RouteTable) UpdateTTFB(key, proxy string, ttfb int64) {
 	}
 
 	cell.Dirty = true
+	rt.touchDomainLRU(row, domain)
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
 }
 
-// UpdatePkgLoss updates the EMA packet loss for a (key, proxy) pair.
-func (rt *RouteTable) UpdatePkgLoss(key, proxy string, loss float64) {
+// UpdatePkgLoss updates the EMA packet loss for a (key, domain, proxy) triple.
+func (rt *RouteTable) UpdatePkgLoss(key, domain, proxy string, loss float64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
-	cell := rt.getOrCreateCell(row, proxy)
+	dc := rt.getOrCreateDomainCell(row, domain)
+	cell := rt.getOrCreateCell(dc, proxy)
 	cell.PkgLoss = applyEMA(float64(cell.PkgLoss), loss, cell.HasPkgLossSample)
 	cell.HasPkgLossSample = true
 	cell.Dirty = true
+	rt.touchDomainLRU(row, domain)
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
 }
 
-// UpdateSpeed updates the EMA speed for a (key, proxy) pair.
-func (rt *RouteTable) UpdateSpeed(key, proxy string, speed float64) {
+// UpdateSpeed updates the EMA speed for a (key, domain, proxy) triple.
+func (rt *RouteTable) UpdateSpeed(key, domain, proxy string, speed float64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
-	cell := rt.getOrCreateCell(row, proxy)
+	dc := rt.getOrCreateDomainCell(row, domain)
+	cell := rt.getOrCreateCell(dc, proxy)
 	cell.Speed = applyEMA(float64(cell.Speed), speed, cell.HasSpeedSample)
 	cell.HasSpeedSample = true
 	cell.Dirty = true
+	rt.touchDomainLRU(row, domain)
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
 }
@@ -519,25 +556,29 @@ func (rt *RouteTable) UpdateConnSize(key, domain string, sizeKB float64) {
 	rt.touchLRU(key)
 }
 
-// IncrementUseCount increments the use counter for a proxy within a row.
-// Also resets failedCount since a successful use means the proxy is working.
-func (rt *RouteTable) IncrementUseCount(key, proxy string) {
+// IncrementUseCount increments the use counter for a proxy within a route
+// key's domain.  Also resets failedCount since a successful use means the
+// proxy is working.
+func (rt *RouteTable) IncrementUseCount(key, domain, proxy string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
-	cell := rt.getOrCreateCell(row, proxy)
+	dc := rt.getOrCreateDomainCell(row, domain)
+	cell := rt.getOrCreateCell(dc, proxy)
 	cell.UseCount++
 	cell.FailedCount = 0
 	cell.Dirty = true
+	rt.touchDomainLRU(row, domain)
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
 }
 
 // PreRankLatency sorts proxies by latency.  When key is non-empty only that
-// row's samples are used (falling back to healthCheckLatency), preventing the
-// first target's winner from biasing later probes via cross-row aggregation.
-// key == "" preserves the legacy cross-row mean.  Sort is stable.
-func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(string) uint16, key string) []string {
+// key's domain samples are used (falling back to healthCheckLatency),
+// preventing the first target's winner from biasing later probes via
+// cross-domain aggregation.  key == "" preserves the legacy cross-row,
+// cross-domain mean.  Sort is stable.
+func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(string) uint16, key, domain string) []string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
@@ -551,12 +592,16 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 	}
 
 	if key != "" {
-		// Per-key: only use the specific row's data
+		// Per-(key,domain): only use that specific domain's data
 		row, ok := rt.rows[key]
+		var dc *domainCell
+		if ok {
+			dc = row.domainTable[domain]
+		}
 		hasKeyData := false
 		for _, proxy := range proxies {
-			if ok {
-				if cell, cOk := row.proxies[proxy]; cOk && cell.HasLatencySample {
+			if dc != nil {
+				if cell, cOk := dc.proxies[proxy]; cOk && cell.HasLatencySample {
 					meanLatency[proxy] = float64(cell.Latency)
 					hasKeyData = true
 					continue
@@ -575,7 +620,7 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 			return result
 		}
 	} else {
-		// Cross-row mean (legacy — used when no key is available)
+		// Cross-row, cross-domain mean (legacy — used when no key is available)
 		type sumCount struct {
 			sum   int64
 			count int
@@ -586,11 +631,13 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 		}
 
 		for _, row := range rt.rows {
-			for _, proxy := range proxies {
-				if cell, cOk := row.proxies[proxy]; cOk && cell.HasLatencySample {
-					s := stats[proxy]
-					s.sum += cell.Latency
-					s.count++
+			for _, dc := range row.domainTable {
+				for _, proxy := range proxies {
+					if cell, cOk := dc.proxies[proxy]; cOk && cell.HasLatencySample {
+						s := stats[proxy]
+						s.sum += cell.Latency
+						s.count++
+					}
 				}
 			}
 		}
@@ -614,38 +661,40 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 	return result
 }
 
-// RankByScore sorts proxies for a route key's domain.  Once the key has any
-// TTFB sample it switches to TTFB-first ranking:
+// RankByScore sorts proxies for a route key's domain.  Once the domain has
+// any TTFB sample it switches to TTFB-first ranking:
 //   - proxies with a TTFB sample are ranked first, scored with TTFB replacing
 //     latency as the response-time term; at most MaxTTFBProxiesPerRank of them
 //     survive (the top-scored ones), so a crowded TTFB group cannot crowd out
 //     the latency-ranked fallbacks;
-//   - proxies without a TTFB sample whose latency already exceeds the key's
+//   - proxies without a TTFB sample whose latency already exceeds the domain's
 //     minimum TTFB (a known-faster first-byte makes them hopeless) are skipped;
 //     the rest are ranked after the TTFB group by latency-derived score.
 //
-// With no TTFB sample at all (cold start) it falls back to latency-derived
-// scores as before.
+// With no TTFB sample at all (cold start for this domain) it falls back to
+// latency-derived scores as before.
 func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(string) uint16, key, domain string) []string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
 	row, rowOK := rt.rows[key]
-
-	// Per-domain connSize gates the speed component.  A domain without a cell
-	// yet has connSize 0, which also skips the speed term.
-	var connSizeKB float64
+	var dc *domainCell
 	if rowOK {
-		if dc, ok := row.domainTable[domain]; ok {
-			connSizeKB = dc.connSize
-		}
+		dc = row.domainTable[domain]
 	}
 
-	// minTTFB is the smallest TTFB EMA among proxies with a sample in this row.
+	// connSize gates the speed component.  A domain without a cell yet has
+	// connSize 0, which also skips the speed term.
+	var connSizeKB float64
+	if dc != nil {
+		connSizeKB = dc.connSize
+	}
+
+	// minTTFB is the smallest TTFB EMA among proxies with a sample in this domain.
 	var minTTFB int64
 	hasTTFB := false
-	if rowOK {
-		for _, cell := range row.proxies {
+	if dc != nil {
+		for _, cell := range dc.proxies {
 			if cell.HasTTFBSample {
 				if !hasTTFB || cell.TTFB < minTTFB {
 					minTTFB = cell.TTFB
@@ -664,8 +713,8 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 
 	for _, proxy := range proxies {
 		var cell *proxyCell
-		if rowOK {
-			if c, ok := row.proxies[proxy]; ok {
+		if dc != nil {
+			if c, ok := dc.proxies[proxy]; ok {
 				cell = c
 			}
 		}
@@ -747,27 +796,34 @@ func (rt *RouteTable) TouchRow(key string) {
 }
 
 // ProxyFailedCount returns the failedCount recorded for a proxy within a
-// specific route key's row, or 0 when the row or proxy has no record.  It backs
-// discovery ordering (exploreOrder) so a proxy that has only failed for this
-// key — and thus has no sample and is absent from the UseCount-weighted
-// proxyAttrs aggregation — is still deferred to the end of the probe batch.
-func (rt *RouteTable) ProxyFailedCount(key, proxy string) float64 {
+// specific route key's domain, or 0 when the row, domain or proxy has no
+// record.  It backs discovery ordering (exploreOrder) so a proxy that has
+// only failed for this (key, domain) — and thus has no sample and is absent
+// from the UseCount-weighted proxyAttrs aggregation — is still deferred to
+// the end of the probe batch.
+func (rt *RouteTable) ProxyFailedCount(key, domain, proxy string) float64 {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	row, ok := rt.rows[key]
 	if !ok {
 		return 0
 	}
-	cell, ok := row.proxies[proxy]
+	dc, ok := row.domainTable[domain]
+	if !ok {
+		return 0
+	}
+	cell, ok := dc.proxies[proxy]
 	if !ok {
 		return 0
 	}
 	return cell.FailedCount
 }
 
-// MarkFailed penalizes a proxy and, when the given domain's best points at it,
-// clears that domain's best/tcpProbed so it re-discovers.  Clearing is
-// domain-scoped: the proxy-wide FailedCount already deprioritizes it elsewhere.
+// MarkFailed penalizes a proxy within a route key's domain and, when that
+// domain's best points at it, clears the domain's best/tcpProbed so it
+// re-discovers.  FailedCount is domain-scoped: a failure on one domain no
+// longer degrades the proxy's score on unrelated domains sharing the same
+// ASN row.
 func (rt *RouteTable) MarkFailed(key, proxy, domain string, penalty float64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -775,34 +831,33 @@ func (rt *RouteTable) MarkFailed(key, proxy, domain string, penalty float64) {
 	if !ok {
 		return
 	}
-	cell := rt.getOrCreateCell(row, proxy)
+	dc := rt.getOrCreateDomainCell(row, domain)
+	cell := rt.getOrCreateCell(dc, proxy)
 	cell.FailedCount = math.Min(cell.FailedCount+penalty, maxFailedCount)
 	cell.Dirty = true
 
-	if domain == "" {
-		return
+	if dc.bestProxy == proxy {
+		dc.bestProxy = ""
+		dc.tcpProbed = false
+		row.rowDirty = true
 	}
-	dc, ok := row.domainTable[domain]
-	if !ok || dc.bestProxy != proxy {
-		return
-	}
-	dc.bestProxy = ""
-	dc.tcpProbed = false
-	row.rowDirty = true
 }
 
 // DecayFailedCounts reduces every cell's FailedCount by 0.1 (floor 0) across all
-// rows. Cells that change are marked dirty so they are persisted on the next cycle.
+// rows and domains. Cells that change are marked dirty so they are persisted
+// on the next cycle.
 func (rt *RouteTable) DecayFailedCounts() int {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	dirtyCount := 0
 	for _, row := range rt.rows {
-		for _, cell := range row.proxies {
-			if cell.FailedCount > 0 {
-				cell.FailedCount = math.Max(0, cell.FailedCount-0.1)
-				cell.Dirty = true
-				dirtyCount++
+		for _, dc := range row.domainTable {
+			for _, cell := range dc.proxies {
+				if cell.FailedCount > 0 {
+					cell.FailedCount = math.Max(0, cell.FailedCount-0.1)
+					cell.Dirty = true
+					dirtyCount++
+				}
 			}
 		}
 	}
@@ -814,30 +869,32 @@ func (rt *RouteTable) DecayFailedCounts() int {
 // so the caller can serialize without holding the lock and without risk of
 // data races with concurrent writers.
 //
-// The map key is "{routeKey}\x00{proxyName}".
+// The map key is "{routeKey}\x00{domain}\x00{proxyName}".
 func (rt *RouteTable) SnapshotAndClearDirty() map[string]PersistedCell {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	snapshot := make(map[string]PersistedCell)
 	for key, row := range rt.rows {
-		for _, cell := range row.proxies {
-			if cell.Dirty {
-				cellKey := key + "\x00" + cell.Name
-				snapshot[cellKey] = PersistedCell{
-					Latency:          cell.Latency,
-					TTFB:             cell.TTFB,
-					PkgLoss:          cell.PkgLoss,
-					Speed:            cell.Speed,
-					Jitter:           cell.Jitter,
-					UseCount:         cell.UseCount,
-					FailedCount:      cell.FailedCount,
-					HasLatencySample: cell.HasLatencySample,
-					HasTTFBSample:    cell.HasTTFBSample,
-					HasPkgLossSample: cell.HasPkgLossSample,
-					HasSpeedSample:   cell.HasSpeedSample,
-					HasJitterSample:  cell.HasJitterSample,
+		for domain, dc := range row.domainTable {
+			for _, cell := range dc.proxies {
+				if cell.Dirty {
+					cellKey := key + "\x00" + domain + "\x00" + cell.Name
+					snapshot[cellKey] = PersistedCell{
+						Latency:          cell.Latency,
+						TTFB:             cell.TTFB,
+						PkgLoss:          cell.PkgLoss,
+						Speed:            cell.Speed,
+						Jitter:           cell.Jitter,
+						UseCount:         cell.UseCount,
+						FailedCount:      cell.FailedCount,
+						HasLatencySample: cell.HasLatencySample,
+						HasTTFBSample:    cell.HasTTFBSample,
+						HasPkgLossSample: cell.HasPkgLossSample,
+						HasSpeedSample:   cell.HasSpeedSample,
+						HasJitterSample:  cell.HasJitterSample,
+					}
+					cell.Dirty = false
 				}
-				cell.Dirty = false
 			}
 		}
 	}
@@ -847,14 +904,18 @@ func (rt *RouteTable) SnapshotAndClearDirty() map[string]PersistedCell {
 // MarkDirty sets the dirty flag on a cell so it will be included in the next
 // periodic persist cycle.  Unlike RestoreRow, it does not touch cell data,
 // LRU order, or the Score field.
-func (rt *RouteTable) MarkDirty(key, proxy string) {
+func (rt *RouteTable) MarkDirty(key, domain, proxy string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row, ok := rt.rows[key]
 	if !ok {
 		return
 	}
-	cell, ok := row.proxies[proxy]
+	dc, ok := row.domainTable[domain]
+	if !ok {
+		return
+	}
+	cell, ok := dc.proxies[proxy]
 	if !ok {
 		return
 	}
@@ -878,13 +939,14 @@ type PersistedCell struct {
 	HasJitterSample  bool    `json:"has_jitter_sample"`
 }
 
-// RestoreRow restores a per-(key,proxy) cell from previously persisted data.
-// The restored cell has dirty=false so it won't be flushed until modified.
-func (rt *RouteTable) RestoreRow(key, proxy string, pc PersistedCell) {
+// RestoreRow restores a per-(key,domain,proxy) cell from previously persisted
+// data.  The restored cell has dirty=false so it won't be flushed until modified.
+func (rt *RouteTable) RestoreRow(key, domain, proxy string, pc PersistedCell) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
-	cell := rt.getOrCreateCell(row, proxy)
+	dc := rt.getOrCreateDomainCell(row, domain)
+	cell := rt.getOrCreateCell(dc, proxy)
 	cell.Latency = pc.Latency
 	cell.TTFB = pc.TTFB
 	cell.PkgLoss = pc.PkgLoss
@@ -908,6 +970,7 @@ func (rt *RouteTable) RestoreRow(key, proxy string, pc PersistedCell) {
 	}
 	cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeUnknown)
 	cell.Dirty = false
+	rt.touchDomainLRU(row, domain)
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
 }
@@ -1016,8 +1079,8 @@ func (rt *RouteTable) RemoveProxy(name string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	for _, row := range rt.rows {
-		delete(row.proxies, name)
 		for _, dc := range row.domainTable {
+			delete(dc.proxies, name)
 			if dc.bestProxy == name {
 				dc.bestProxy = ""
 				dc.tcpProbed = false
@@ -1063,37 +1126,34 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 
 	rows := make([]RowSnapshot, 0, len(rt.rows))
 	for _, row := range rt.rows {
-		proxies := make(map[string]ProxyRecord, len(row.proxies))
-		for _, cell := range row.proxies {
-			proxies[cell.Name] = ProxyRecord{
-				Name:     cell.Name,
-				UseCount: cell.UseCount,
-				Attributes: ProxyAttributes{
-					PkgLoss:     cell.PkgLoss,
-					Latency:     cell.Latency,
-					TTFB:        cell.TTFB,
-					Speed:       cell.Speed,
-					Score:       cell.Score,
-					FailedCount: cell.FailedCount,
-					Jitter:      cell.Jitter,
-				},
-			}
-		}
-
-		// BestProxy/TCPProbed at the row level reflect the most-recently-used
-		// domain that has a best, kept for display compatibility.  The
-		// authoritative per-domain state lives in Domains.
 		domains := make([]DomainSnapshot, 0, len(row.domainTable))
 		var bestBestProxy string
 		var bestTCPProbed bool
 		var bestLastUsed int64 = -1
 		for _, dc := range row.domainTable {
+			proxies := make(map[string]ProxyRecord, len(dc.proxies))
+			for _, cell := range dc.proxies {
+				proxies[cell.Name] = ProxyRecord{
+					Name:     cell.Name,
+					UseCount: cell.UseCount,
+					Attributes: ProxyAttributes{
+						PkgLoss:     cell.PkgLoss,
+						Latency:     cell.Latency,
+						TTFB:        cell.TTFB,
+						Speed:       cell.Speed,
+						Score:       cell.Score,
+						FailedCount: cell.FailedCount,
+						Jitter:      cell.Jitter,
+					},
+				}
+			}
 			domains = append(domains, DomainSnapshot{
 				Name:      dc.domainName,
 				BestProxy: dc.bestProxy,
 				TCPProbed: dc.tcpProbed,
 				LastUsed:  dc.lastUsed,
 				ConnSize:  dc.connSize,
+				Proxies:   proxies,
 			})
 			if dc.bestProxy != "" && dc.lastUsed > bestLastUsed {
 				bestLastUsed = dc.lastUsed
@@ -1105,12 +1165,14 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 			return domains[i].LastUsed > domains[j].LastUsed
 		})
 
+		// BestProxy/TCPProbed at the row level reflect the most-recently-used
+		// domain that has a best, kept for display compatibility.  The
+		// authoritative per-domain state lives in Domains.
 		rows = append(rows, RowSnapshot{
 			Key:       row.key,
 			BestProxy: bestBestProxy,
 			TCPProbed: bestTCPProbed,
 			LastUsed:  row.lastUsed,
-			Proxies:   proxies,
 			Domains:   domains,
 		})
 	}
@@ -1126,75 +1188,74 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 	}
 }
 
-// DebugDumpRow returns a debug string of a single row's proxies map.
-// Format: "proxy1(lat=30,use=5,fail=0,loss=0.01,spd=1024,latScore=...,speedScore=...,score=...) ..."
+// DebugDumpRow returns a debug string of a single row's domains and, within
+// each domain, its own proxy metrics.
 func (rt *RouteTable) DebugDumpRow(key string) string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
 	row, ok := rt.rows[key]
-	if !ok || len(row.proxies) == 0 {
-		return fmt.Sprintf("key=%s proxies=<empty>", key)
+	if !ok || len(row.domainTable) == 0 {
+		return fmt.Sprintf("key=%s domains=<empty>", key)
 	}
 
-	// Collect and sort by latency for readable output
-	type entry struct {
-		name         string
-		latency      int64
-		ttfb         int64
-		use          int64
-		fail         float64
-		loss         float64
-		jitter       float64
-		speed        float64
-		latencyScore float64
-		speedScore   float64
-		score        float64
-	}
-	entries := make([]entry, 0, len(row.proxies))
-	for _, cell := range row.proxies {
-		entries = append(entries, entry{
-			name:         cell.Name,
-			latency:      cell.Latency,
-			ttfb:         cell.TTFB,
-			use:          cell.UseCount,
-			fail:         cell.FailedCount,
-			loss:         cell.PkgLoss,
-			jitter:       cell.Jitter,
-			speed:        cell.Speed,
-			latencyScore: calculateScore(cell.Latency, 0, 0, cell.FailedCount, cell.Jitter, connSizeUnknown),
-			speedScore:   calculateScore(0, cell.Speed, 0, cell.FailedCount, cell.Jitter, connSizeUnknown),
-			score:        cell.Score,
-		})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].latency != entries[j].latency {
-			return entries[i].latency < entries[j].latency
-		}
-		return entries[i].name < entries[j].name
-	})
-
-	var sb strings.Builder
 	domainNames := make([]string, 0, len(row.domainTable))
 	for d := range row.domainTable {
 		domainNames = append(domainNames, d)
 	}
 	sort.Strings(domainNames)
+
+	type entry struct {
+		name    string
+		latency int64
+		ttfb    int64
+		use     int64
+		fail    float64
+		loss    float64
+		jitter  float64
+		speed   float64
+		score   float64
+	}
+
+	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("key=%s domains=[", key))
 	for i, d := range domainNames {
 		dc := row.domainTable[d]
 		if i > 0 {
 			sb.WriteString(" ")
 		}
-		sb.WriteString(fmt.Sprintf("%s(best=%s,tcpProbed=%v)", d, dc.bestProxy, dc.tcpProbed))
-	}
-	sb.WriteString("] proxies=[")
-	for i, e := range entries {
-		if i > 0 {
-			sb.WriteString(" ")
+
+		entries := make([]entry, 0, len(dc.proxies))
+		for _, cell := range dc.proxies {
+			entries = append(entries, entry{
+				name:    cell.Name,
+				latency: cell.Latency,
+				ttfb:    cell.TTFB,
+				use:     cell.UseCount,
+				fail:    cell.FailedCount,
+				loss:    cell.PkgLoss,
+				jitter:  cell.Jitter,
+				speed:   cell.Speed,
+				score:   cell.Score,
+			})
 		}
-		sb.WriteString(fmt.Sprintf("%s(lat=%d,ttfb=%d,use=%d,fail=%.1f,loss=%.3f,jit=%.1f,spd=%.0f,[latScore=%.4f,speedScore=%.4f,score=%.4f])",
-			e.name, e.latency, e.ttfb, e.use, e.fail, e.loss, e.jitter, e.speed, e.latencyScore, e.speedScore, e.score))
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].latency != entries[j].latency {
+				return entries[i].latency < entries[j].latency
+			}
+			return entries[i].name < entries[j].name
+		})
+
+		var pb strings.Builder
+		for j, e := range entries {
+			if j > 0 {
+				pb.WriteString(",")
+			}
+			pb.WriteString(fmt.Sprintf("%s(lat=%d,ttfb=%d,use=%d,fail=%.1f,loss=%.3f,jit=%.1f,spd=%.0f,score=%.4f)",
+				e.name, e.latency, e.ttfb, e.use, e.fail, e.loss, e.jitter, e.speed, e.score))
+		}
+
+		sb.WriteString(fmt.Sprintf("%s(best=%s,tcpProbed=%v,proxies=[%s])", d, dc.bestProxy, dc.tcpProbed, pb.String()))
 	}
 	sb.WriteString("]")
 	return sb.String()

@@ -159,14 +159,23 @@ func (s *Smart) restoreRouteTable(rt *smart.RouteTable, configName string) {
 			if json.Unmarshal(data, &pc) != nil {
 				continue
 			}
-			// keyProxy format: {routeKey}/{proxyName}
-			slash := strings.LastIndex(keyProxy, "/")
-			if slash < 0 {
+			// keyProxy format: {routeKey}/{domain}/{proxyName}
+			lastSlash := strings.LastIndex(keyProxy, "/")
+			if lastSlash < 0 {
 				continue
 			}
-			key := keyProxy[:slash]
-			proxy := keyProxy[slash+1:]
-			rt.RestoreRow(key, proxy, pc)
+			proxy := keyProxy[lastSlash+1:]
+			rest := keyProxy[:lastSlash]
+			secondSlash := strings.LastIndex(rest, "/")
+			if secondSlash < 0 {
+				// Legacy 2-part {routeKey}/{proxyName} format from before
+				// per-domain metrics: no domain to restore into, so drop it —
+				// the proxy simply re-learns via discovery on next use.
+				continue
+			}
+			key := rest[:secondSlash]
+			domain := rest[secondSlash+1:]
+			rt.RestoreRow(key, domain, proxy, pc)
 			loaded++
 		}
 		if loaded > 0 {
@@ -284,7 +293,7 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 	if len(names) == 0 {
 		return proxies[0]
 	}
-	s.routeTable.RefreshScores(key, names)
+	s.routeTable.RefreshScores(key, domain, names)
 	ranked := s.routeTable.RankByScore(names, s.lastDelayOf(proxies), key, domain)
 
 	for _, name := range ranked {
@@ -525,11 +534,18 @@ func (s *Smart) cleanupOrphanedNodeCache() {
 
 	// Remove proxies from route table that are no longer in the provider
 	snapshot := s.routeTable.Snapshot(s.Name())
+	seen := make(map[string]bool)
 	for _, row := range snapshot.Rows {
-		for proxyName := range row.Proxies {
-			if !proxyMap[proxyName] {
-				s.routeTable.RemoveProxy(proxyName)
-				log.Debugln("[Smart] Removed orphaned proxy [%s] from route table", proxyName)
+		for _, dom := range row.Domains {
+			for proxyName := range dom.Proxies {
+				if seen[proxyName] {
+					continue
+				}
+				seen[proxyName] = true
+				if !proxyMap[proxyName] {
+					s.routeTable.RemoveProxy(proxyName)
+					log.Debugln("[Smart] Removed orphaned proxy [%s] from route table", proxyName)
+				}
 			}
 		}
 	}
@@ -553,8 +569,8 @@ func (s *Smart) persistRouteTable() {
 	// discard data when the bbolt file can't be opened.
 	if !store.IsDBAvailable() {
 		for cellKey := range dirty {
-			if idx := strings.IndexByte(cellKey, 0); idx >= 0 {
-				s.routeTable.MarkDirty(cellKey[:idx], cellKey[idx+1:])
+			if parts := strings.SplitN(cellKey, "\x00", 3); len(parts) == 3 {
+				s.routeTable.MarkDirty(parts[0], parts[1], parts[2])
 			}
 		}
 		for routeKey := range dirtyRows {
@@ -570,24 +586,25 @@ func (s *Smart) persistRouteTable() {
 	ops := make([]smart.StoreOperation, 0, len(dirty)+len(dirtyRows))
 
 	for cellKey, pc := range dirty {
-		// cellKey format: {routeKey}\x00{proxyName}
-		if idx := strings.IndexByte(cellKey, 0); idx >= 0 {
-			key := cellKey[:idx]
-			proxy := cellKey[idx+1:]
-
-			data, err := json.Marshal(pc)
-			if err != nil {
-				continue
-			}
-
-			ops = append(ops, smart.StoreOperation{
-				Type:   smart.OpSaveRoute,
-				Group:  s.Name(),
-				Config: s.configName,
-				Target: key + "/" + proxy,
-				Data:   data,
-			})
+		// cellKey format: {routeKey}\x00{domain}\x00{proxyName}
+		parts := strings.SplitN(cellKey, "\x00", 3)
+		if len(parts) != 3 {
+			continue
 		}
+		key, domain, proxy := parts[0], parts[1], parts[2]
+
+		data, err := json.Marshal(pc)
+		if err != nil {
+			continue
+		}
+
+		ops = append(ops, smart.StoreOperation{
+			Type:   smart.OpSaveRoute,
+			Group:  s.Name(),
+			Config: s.configName,
+			Target: key + "/" + domain + "/" + proxy,
+			Data:   data,
+		})
 	}
 
 	for routeKey, pr := range dirtyRows {

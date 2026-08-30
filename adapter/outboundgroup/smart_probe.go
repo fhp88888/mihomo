@@ -182,7 +182,7 @@ func (pc *ProbeCoordinator) probeBatch(
 			// are not wasted — they improve prerank accuracy for subsequent
 			// discoveries on this route key.
 			func(proxyName string, connectTime int64) {
-				rt.UpdateLatency(key, proxyName, connectTime)
+				rt.UpdateLatency(key, routeDomain(metadata), proxyName, connectTime)
 			},
 			// onFail: classify node-level vs fatal/cancellation.  Only proxies
 			// with node-level errors are penalized (MarkFailed 1.0); fatal

@@ -41,15 +41,15 @@ func TestCheckEarlyDeath(t *testing.T) {
 
 	setup := func() (*Smart, float64) {
 		rt := smart.NewRouteTable(smart.DefaultMaxRows)
-		rt.RestoreRow(key, proxyName, smart.PersistedCell{})
+		rt.RestoreRow(key, "example.com", proxyName, smart.PersistedCell{})
 		s := &Smart{routeTable: rt}
-		return s, routeFailedCount(t, rt, key, proxyName)
+		return s, routeFailedCount(t, rt, key, "example.com", proxyName)
 	}
 
 	t.Run("early death marks failed", func(t *testing.T) {
 		s, before := setup()
 		s.checkEarlyDeath(key, "example.com", proxyName, errors.New("connection reset by peer"), 100, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.8 {
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before+0.8 {
 			t.Fatalf("FailedCount = %v, want %v", got, before+0.8)
 		}
 	})
@@ -57,7 +57,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 	t.Run("EOF is ignored", func(t *testing.T) {
 		s, before := setup()
 		s.checkEarlyDeath(key, "example.com", proxyName, io.EOF, 100, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
@@ -68,7 +68,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 		// death must not add its 0.8 on top.
 		err := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
 		s.checkEarlyDeath(key, "example.com", proxyName, err, 100, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
@@ -76,7 +76,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 	t.Run("nil error is ignored", func(t *testing.T) {
 		s, before := setup()
 		s.checkEarlyDeath(key, "example.com", proxyName, nil, 100, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
@@ -86,7 +86,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 		// A full request/response exchange (both upload and download) means the
 		// connection survived its first byte — not an early death.
 		s.checkEarlyDeath(key, "example.com", proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 512))
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
@@ -96,7 +96,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 		// Only upload flowed, no download — the response never arrived, so the
 		// connection died before completing the exchange.
 		s.checkEarlyDeath(key, "example.com", proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 0))
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.8 {
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before+0.8 {
 			t.Fatalf("FailedCount = %v, want %v", got, before+0.8)
 		}
 	})
@@ -105,7 +105,7 @@ func TestCheckEarlyDeath(t *testing.T) {
 		s, before := setup()
 		slow := smartEarlyDeathLatencyLimit.Milliseconds() + 1000
 		s.checkEarlyDeath(key, "example.com", proxyName, errors.New("connection reset by peer"), slow, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
@@ -117,9 +117,9 @@ func TestCheckResetByPeer(t *testing.T) {
 
 	setup := func() (*Smart, float64) {
 		rt := smart.NewRouteTable(smart.DefaultMaxRows)
-		rt.RestoreRow(key, proxyName, smart.PersistedCell{})
+		rt.RestoreRow(key, "example.com", proxyName, smart.PersistedCell{})
 		s := &Smart{routeTable: rt}
-		return s, routeFailedCount(t, rt, key, proxyName)
+		return s, routeFailedCount(t, rt, key, "example.com", proxyName)
 	}
 
 	t.Run("ECONNRESET marks failed", func(t *testing.T) {
@@ -128,7 +128,7 @@ func TestCheckResetByPeer(t *testing.T) {
 		err := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
 		s.checkResetByPeer(key, "example.com", proxyName, err)
 		// RST carries a lighter 0.4 penalty, not the full early-death 0.8.
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.4 {
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before+0.4 {
 			t.Fatalf("FailedCount = %v, want %v", got, before+0.4)
 		}
 	})
@@ -136,7 +136,7 @@ func TestCheckResetByPeer(t *testing.T) {
 	t.Run("non-reset error is ignored", func(t *testing.T) {
 		s, before := setup()
 		s.checkResetByPeer(key, "example.com", proxyName, errors.New("connection closed"))
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
@@ -144,7 +144,7 @@ func TestCheckResetByPeer(t *testing.T) {
 	t.Run("EOF is ignored", func(t *testing.T) {
 		s, before := setup()
 		s.checkResetByPeer(key, "example.com", proxyName, io.EOF)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
@@ -152,7 +152,7 @@ func TestCheckResetByPeer(t *testing.T) {
 	t.Run("nil error is ignored", func(t *testing.T) {
 		s, before := setup()
 		s.checkResetByPeer(key, "example.com", proxyName, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
@@ -306,7 +306,7 @@ func TestExploreOrder_DeferredLast(t *testing.T) {
 	s := &Smart{routeTable: rt, testUrl: "test"}
 
 	proxies := makeStubProxies("good", "deferred", "lossy")
-	ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com")
+	ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com", "example.com")
 
 	names := orderedNames(ordered)
 	if len(names) != 3 || hasDupNames(names) {
@@ -335,7 +335,7 @@ func TestExploreOrder_UnsampledUsesNeutral(t *testing.T) {
 	s := &Smart{routeTable: rt, testUrl: "test"}
 
 	proxies := makeStubProxies("a", "b", "unsampled")
-	ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com")
+	ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com", "example.com")
 	names := orderedNames(ordered)
 
 	if len(names) != 3 || hasDupNames(names) {
@@ -387,7 +387,7 @@ func TestExploreOrder_TopShuffledOnlyForLargePool(t *testing.T) {
 	// non-deferred tier must only ever be a permutation of the same 8.
 	for i := 0; i < 20; i++ {
 		proxies := makeAll()
-		ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com")
+		ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com", "example.com")
 		names := orderedNames(ordered)
 		if len(names) != 9 || hasDupNames(names) {
 			t.Fatalf("expected 9 unique proxies, got %v", names)
@@ -414,12 +414,12 @@ func TestExploreOrder_EmptyAggregationFallsBack(t *testing.T) {
 	const key = "TARGET:example.com"
 	// Seed per-key latency so PreRankLatency sorts deterministically (without
 	// per-key data it shuffles to avoid always favoring the same proxy).
-	rt.UpdateLatency(key, "slow", 300)
-	rt.UpdateLatency(key, "fast", 50)
+	rt.UpdateLatency(key, "example.com", "slow", 300)
+	rt.UpdateLatency(key, "example.com", "fast", 50)
 	s := &Smart{routeTable: rt, testUrl: "test"}
 
 	proxies := makeStubProxies("slow", "fast")
-	ordered := s.exploreOrder(proxies, proxies, key)
+	ordered := s.exploreOrder(proxies, proxies, key, "example.com")
 	names := orderedNames(ordered)
 	// Stable pre-rank by per-key latency: fast(50) before slow(300).
 	if len(names) != 2 || names[0] != "fast" || names[1] != "slow" {

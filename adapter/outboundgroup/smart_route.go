@@ -151,7 +151,7 @@ func (s *Smart) rankCandidates(key, domain string, proxies []C.Proxy, best C.Pro
 	if best != nil {
 		refresh = append(append([]string{}, over...), best.Name())
 	}
-	s.routeTable.RefreshScores(key, refresh)
+	s.routeTable.RefreshScores(key, domain, refresh)
 	ranked := s.routeTable.RankByScore(over, func(proxyName string) uint16 {
 		if p, ok := proxyMap[proxyName]; ok {
 			return p.LastDelayForTestUrl(s.testUrl)
@@ -182,7 +182,7 @@ func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, doma
 		// onConnect: successful dials (winner + late successful losers) each
 		// contribute a latency sample.
 		func(proxyName string, connectTime int64) {
-			s.routeTable.UpdateLatency(key, proxyName, connectTime)
+			s.routeTable.UpdateLatency(key, domain, proxyName, connectTime)
 		},
 		// onFail: dialTCP already handles MarkFailed for genuine failures, so
 		// the race has nothing to add for failures.
@@ -190,7 +190,7 @@ func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, doma
 		// onWinner: promote the winner to best proxy and mark the route
 		// probed.  The winner's latency is already sampled via onConnect.
 		func(proxy C.Proxy, connectTime int64) {
-			s.routeTable.IncrementUseCount(key, proxy.Name())
+			s.routeTable.IncrementUseCount(key, domain, proxy.Name())
 			s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
 		},
 	)
@@ -405,8 +405,8 @@ func (s *Smart) dialAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Meta
 	// Write connectTime to the route table so that all paths (fast-path,
 	// serial fallback, discovery) contribute the same metric. TTFB varies
 	// by connection lifetime and is not available for losers.
-	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
-	s.routeTable.IncrementUseCount(key, proxy.Name())
+	s.routeTable.UpdateLatency(key, domain, proxy.Name(), connectTime)
+	s.routeTable.IncrementUseCount(key, domain, proxy.Name())
 	s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
 
 	return s.wrapTCPConn(conn, proxy, metadata, connectTime), nil
@@ -434,7 +434,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key,
 	// proxy first.  Proxies with no aggregation samples yet (e.g. a quality
 	// node that rarely wins and thus is never sampled) are kept in the
 	// candidate pool with a neutral score so they still get discovered.
-	ordered := s.exploreOrder(available, proxies, key)
+	ordered := s.exploreOrder(available, proxies, key, domain)
 
 	// Concurrent discovery through probe coordinator
 	proxy, conn, connectTime, err := s.probeCoordinator.Discover(
@@ -461,17 +461,17 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key,
 	// Note: probeBatch already wrote the winner's connectTime to the route table
 	// (smart_probe.go:189). Do NOT write it again here — that would double-count
 	// the sample.
-	s.routeTable.IncrementUseCount(key, proxy.Name())
+	s.routeTable.IncrementUseCount(key, domain, proxy.Name())
 	s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
 
 	return s.wrapTCPConn(conn, proxy, metadata, connectTime), nil
 }
 
-func (s *Smart) exploreOrder(available []C.Proxy, proxies []C.Proxy, key string) []C.Proxy {
+func (s *Smart) exploreOrder(available []C.Proxy, proxies []C.Proxy, key, domain string) []C.Proxy {
 	attrs := s.routeTable.ProxyAttrsSnapshot()
 	if len(attrs) == 0 {
 		names := namesOf(available)
-		preRanked := s.routeTable.PreRankLatency(names, s.lastDelayOf(proxies), key)
+		preRanked := s.routeTable.PreRankLatency(names, s.lastDelayOf(proxies), key, domain)
 		return orderByNames(available, preRanked)
 	}
 
@@ -498,7 +498,7 @@ func (s *Smart) exploreOrder(available []C.Proxy, proxies []C.Proxy, key string)
 		// A proxy that has only failed for this key has no sample, so it is
 		// absent from the UseCount-weighted attrs aggregation — defer it from
 		// the row's own FailedCount so it isn't re-dialed in the top tier.
-		if !deferred && s.routeTable.ProxyFailedCount(key, p.Name()) > 0 {
+		if !deferred && s.routeTable.ProxyFailedCount(key, domain, p.Name()) > 0 {
 			deferred = true
 		}
 		cands = append(cands, cand{
@@ -665,7 +665,7 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, conne
 		if err != nil {
 			firstReadErr.Store(err)
 		}
-		s.routeTable.UpdateTTFB(key, proxy.Name(), ttfb)
+		s.routeTable.UpdateTTFB(key, domain, proxy.Name(), ttfb)
 		log.Infoln("[Smart] established key=%s target=%s proxy=%s latency=%dms tcp_connect=%dms ttfb=%dms",
 			key, domain, proxy.Name(), connectTime, tcpConnectTime.Milliseconds(), ttfb)
 	})
@@ -685,7 +685,7 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, conne
 				speed = float64(maxDownload)
 			}
 			if speed > 0 {
-				s.routeTable.UpdateSpeed(key, proxy.Name(), speed)
+				s.routeTable.UpdateSpeed(key, domain, proxy.Name(), speed)
 			}
 
 			// Collect per-domain connection size (kB) for this CDN row.  Only
@@ -707,7 +707,7 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, conne
 				stats := tcpstats.GetTCPStats(trackerConn)
 				if stats != nil {
 					lossRate := stats.LossRate()
-					s.routeTable.UpdatePkgLoss(key, proxy.Name(), lossRate)
+					s.routeTable.UpdatePkgLoss(key, domain, proxy.Name(), lossRate)
 				}
 			}
 		}
@@ -808,7 +808,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	// TTFB must not gate UDP candidates, otherwise a row with any TCP TTFB
 	// sample could drop every UDP-capable proxy and leave none to try.
 	names := namesOf(udpProxies)
-	ranked := s.routeTable.PreRankLatency(names, s.lastDelayOf(proxies), key)
+	ranked := s.routeTable.PreRankLatency(names, s.lastDelayOf(proxies), key, domain)
 
 	ordered := orderByNames(udpProxies, ranked)
 
@@ -840,8 +840,8 @@ func (s *Smart) dialUDPAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.M
 		return nil, err
 	}
 
-	s.routeTable.UpdateLatency(key, proxy.Name(), connectTime)
-	s.routeTable.IncrementUseCount(key, proxy.Name())
+	s.routeTable.UpdateLatency(key, domain, proxy.Name(), connectTime)
+	s.routeTable.IncrementUseCount(key, domain, proxy.Name())
 	s.routeTable.SetBestProxy(key, domain, proxy.Name())
 
 	return s.wrapUDPConn(pc, proxy, metadata), nil

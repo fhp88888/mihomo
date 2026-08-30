@@ -11,20 +11,20 @@ func TestAggregateByProxy(t *testing.T) {
 	keyB := "ASN:100"
 
 	// Row A: p1 use=2 lat=100, p2 use=1 lat=400 (total use=3)
-	rt.UpdateLatency(keyA, "p1", 100)
-	rt.UpdateLatency(keyA, "p2", 400)
+	rt.UpdateLatency(keyA, testDomain, "p1", 100)
+	rt.UpdateLatency(keyA, testDomain, "p2", 400)
 	for i := 0; i < 2; i++ {
-		rt.IncrementUseCount(keyA, "p1")
+		rt.IncrementUseCount(keyA, testDomain, "p1")
 	}
-	rt.IncrementUseCount(keyA, "p2")
+	rt.IncrementUseCount(keyA, testDomain, "p2")
 
 	// Row B: p1 use=1 lat=250 (total use=1)
-	rt.UpdateLatency(keyB, "p1", 250)
-	rt.IncrementUseCount(keyB, "p1")
+	rt.UpdateLatency(keyB, testDomain, "p1", 250)
+	rt.IncrementUseCount(keyB, testDomain, "p1")
 
 	// Unsampled proxy: has use count but no sample, must be excluded.
 	for i := 0; i < 5; i++ {
-		rt.IncrementUseCount(keyA, "p3")
+		rt.IncrementUseCount(keyA, testDomain, "p3")
 	}
 
 	agg := rt.AggregateByProxy()
@@ -96,17 +96,17 @@ func TestAggregateDoesNotBlendScore(t *testing.T) {
 
 	// Two rows on the same proxy; heavy use on the low-latency one.  Use
 	// latencies well above the 100ms score floor so the values discriminate.
-	rt.UpdateLatency(key, "p1", 150)
+	rt.UpdateLatency(key, testDomain, "p1", 150)
 	for i := 0; i < 3; i++ {
-		rt.IncrementUseCount(key, "p1")
+		rt.IncrementUseCount(key, testDomain, "p1")
 	}
-	rt.UpdateLatency("ASN:200", "p1", 450)
-	rt.IncrementUseCount("ASN:200", "p1")
+	rt.UpdateLatency("ASN:200", testDomain, "p1", 450)
+	rt.IncrementUseCount("ASN:200", testDomain, "p1")
 
 	// Before any aggregation: proxy-wise absent -> raw unblended score.
-	rt.RefreshScores(key, []string{"p1"})
+	rt.RefreshScores(key, testDomain, []string{"p1"})
 	snap := rt.Snapshot("test")
-	pre := rowByKey(t, snap, key).Proxies["p1"].Attributes.Score
+	pre := domainProxies(rowByKey(t, snap, key), testDomain)["p1"].Attributes.Score
 	atom := calculateScore(150, 0, 0, 0, 0, connSizeUnknown)
 	if math.Abs(pre-atom) > 0.000001 {
 		t.Fatalf("expected pre-aggregation score atom=%.6f, got %.6f", atom, pre)
@@ -120,9 +120,9 @@ func TestAggregateDoesNotBlendScore(t *testing.T) {
 
 	// After: latency stays raw (150, NOT blended toward the proxy-wise 225),
 	// so the score is unchanged from the pre-aggregation atom.
-	rt.RefreshScores(key, []string{"p1"})
+	rt.RefreshScores(key, testDomain, []string{"p1"})
 	snap = rt.Snapshot("test")
-	post := rowByKey(t, snap, key).Proxies["p1"].Attributes.Score
+	post := domainProxies(rowByKey(t, snap, key), testDomain)["p1"].Attributes.Score
 	if math.Abs(post-atom) > 0.000001 {
 		t.Fatalf("expected latency-unblended score %.6f, got %.6f", atom, post)
 	}

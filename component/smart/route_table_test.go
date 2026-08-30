@@ -12,6 +12,18 @@ import (
 // domain-aware best/tcpProbed routing state.
 const testDomain = "example.com"
 
+// domainProxies returns the ProxyRecord map for a named domain within a row
+// snapshot (nil if the domain isn't present).  Proxy metrics now live per
+// domain, so tests that used to read row.Proxies directly go through this.
+func domainProxies(row RowSnapshot, domain string) map[string]ProxyRecord {
+	for _, d := range row.Domains {
+		if d.Name == domain {
+			return d.Proxies
+		}
+	}
+	return nil
+}
+
 func TestNewRouteTable(t *testing.T) {
 	rt := NewRouteTable(100)
 	if rt == nil {
@@ -61,20 +73,20 @@ func TestEMALatency(t *testing.T) {
 	proxy := "proxy-a"
 
 	// First sample: writes directly (does not average with zero)
-	rt.UpdateLatency(key, proxy, 100)
+	rt.UpdateLatency(key, testDomain, proxy, 100)
 	snap := rt.Snapshot("test")
 	if len(snap.Rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(snap.Rows))
 	}
-	rec := snap.Rows[0].Proxies[proxy]
+	rec := domainProxies(snap.Rows[0], testDomain)[proxy]
 	if rec.Attributes.Latency != 100 {
 		t.Fatalf("expected first latency=100, got %d", rec.Attributes.Latency)
 	}
 
 	// Second sample: EMA = old*3/4 + new*1/4 = 100*3/4 + 40*1/4 = 85
-	rt.UpdateLatency(key, proxy, 40)
+	rt.UpdateLatency(key, testDomain, proxy, 40)
 	snap = rt.Snapshot("test")
-	rec = snap.Rows[0].Proxies[proxy]
+	rec = domainProxies(snap.Rows[0], testDomain)[proxy]
 	expected := int64(float64(100)*3.0/4.0 + float64(40)/4.0)
 	if rec.Attributes.Latency != expected {
 		t.Fatalf("expected EMA latency=%d, got %d", expected, rec.Attributes.Latency)
@@ -86,16 +98,16 @@ func TestEMAPkgLoss(t *testing.T) {
 	key := "ASN:64512"
 	proxy := "proxy-a"
 
-	rt.UpdatePkgLoss(key, proxy, 0.01)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.01)
 	snap := rt.Snapshot("test")
-	if snap.Rows[0].Proxies[proxy].Attributes.PkgLoss != 0.01 {
+	if domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.PkgLoss != 0.01 {
 		t.Fatal("first pkg_loss should be 0.01")
 	}
 
-	rt.UpdatePkgLoss(key, proxy, 0.04)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.04)
 	snap = rt.Snapshot("test")
 	expected := 0.01*3.0/4.0 + 0.04/4.0
-	got := snap.Rows[0].Proxies[proxy].Attributes.PkgLoss
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.PkgLoss
 	if got < expected-0.001 || got > expected+0.001 {
 		t.Fatalf("expected EMA pkg_loss=%.4f, got %.4f", expected, got)
 	}
@@ -107,9 +119,9 @@ func TestEMAJitter(t *testing.T) {
 	proxy := "proxy-a"
 
 	// First TTFB sample: no baseline yet, jitter stays 0.
-	rt.UpdateTTFB(key, proxy, 100)
+	rt.UpdateTTFB(key, testDomain, proxy, 100)
 	snap := rt.Snapshot("test")
-	rec := snap.Rows[0].Proxies[proxy]
+	rec := domainProxies(snap.Rows[0], testDomain)[proxy]
 	if rec.Attributes.Jitter != 0 {
 		t.Fatalf("expected jitter=0 on first sample, got %.2f", rec.Attributes.Jitter)
 	}
@@ -119,9 +131,9 @@ func TestEMAJitter(t *testing.T) {
 
 	// Second sample: previous EMA ttfb was 100, new sample 40.
 	// deviation = |40-100| = 60, first jitter sample writes directly.
-	rt.UpdateTTFB(key, proxy, 40)
+	rt.UpdateTTFB(key, testDomain, proxy, 40)
 	snap = rt.Snapshot("test")
-	rec = snap.Rows[0].Proxies[proxy]
+	rec = domainProxies(snap.Rows[0], testDomain)[proxy]
 	if rec.Attributes.Jitter != 60 {
 		t.Fatalf("expected first jitter=60, got %.2f", rec.Attributes.Jitter)
 	}
@@ -132,9 +144,9 @@ func TestEMAJitter(t *testing.T) {
 
 	// Third sample: previous EMA ttfb was 85, new sample 100.
 	// deviation = |100-85| = 15. Jitter EMA = 60*3/4 + 15/4 = 48.75.
-	rt.UpdateTTFB(key, proxy, 100)
+	rt.UpdateTTFB(key, testDomain, proxy, 100)
 	snap = rt.Snapshot("test")
-	rec = snap.Rows[0].Proxies[proxy]
+	rec = domainProxies(snap.Rows[0], testDomain)[proxy]
 	expectedJitter := 60*3.0/4.0 + 15.0/4.0
 	if rec.Attributes.Jitter < expectedJitter-0.01 || rec.Attributes.Jitter > expectedJitter+0.01 {
 		t.Fatalf("expected jitter=%.2f, got %.2f", expectedJitter, rec.Attributes.Jitter)
@@ -146,16 +158,16 @@ func TestEMASpeed(t *testing.T) {
 	key := "ASN:64512"
 	proxy := "proxy-a"
 
-	rt.UpdateSpeed(key, proxy, 10485760)
+	rt.UpdateSpeed(key, testDomain, proxy, 10485760)
 	snap := rt.Snapshot("test")
-	if snap.Rows[0].Proxies[proxy].Attributes.Speed != 10485760 {
+	if domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.Speed != 10485760 {
 		t.Fatal("first speed should be 10485760")
 	}
 
-	rt.UpdateSpeed(key, proxy, 20971520)
+	rt.UpdateSpeed(key, testDomain, proxy, 20971520)
 	snap = rt.Snapshot("test")
 	expected := 10485760.0*3.0/4.0 + 20971520.0/4.0
-	got := snap.Rows[0].Proxies[proxy].Attributes.Speed
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.Speed
 	if got < expected-1 || got > expected+1 {
 		t.Fatalf("expected EMA speed=%.0f, got %.0f", expected, got)
 	}
@@ -166,11 +178,11 @@ func TestIncrementUseCount(t *testing.T) {
 	key := "ASN:64512"
 	proxy := "proxy-a"
 
-	rt.IncrementUseCount(key, proxy)
-	rt.IncrementUseCount(key, proxy)
+	rt.IncrementUseCount(key, testDomain, proxy)
+	rt.IncrementUseCount(key, testDomain, proxy)
 	snap := rt.Snapshot("test")
-	if snap.Rows[0].Proxies[proxy].UseCount != 2 {
-		t.Fatalf("expected use_count=2, got %d", snap.Rows[0].Proxies[proxy].UseCount)
+	if domainProxies(snap.Rows[0], testDomain)[proxy].UseCount != 2 {
+		t.Fatalf("expected use_count=2, got %d", domainProxies(snap.Rows[0], testDomain)[proxy].UseCount)
 	}
 }
 
@@ -242,23 +254,23 @@ func TestRefreshScoresStoresNonEMA(t *testing.T) {
 	key := "ASN:64512"
 	proxy := "proxy-a"
 
-	rt.UpdateLatency(key, proxy, 100)
-	rt.UpdateSpeed(key, proxy, 10485760)
-	rt.RefreshScores(key, []string{proxy})
+	rt.UpdateLatency(key, testDomain, proxy, 100)
+	rt.UpdateSpeed(key, testDomain, proxy, 10485760)
+	rt.RefreshScores(key, testDomain, []string{proxy})
 	snap := rt.Snapshot("test")
-	got := snap.Rows[0].Proxies[proxy].Attributes.Score
-	rec := snap.Rows[0].Proxies[proxy]
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.Score
+	rec := domainProxies(snap.Rows[0], testDomain)[proxy]
 	atom := 100.0/(math.Max(float64(rec.Attributes.Latency), 50.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
 	expected := atom // no per-proxy aggregation -> raw unblended score
 	if math.Abs(got-expected) > 0.000001 {
 		t.Fatalf("expected initial score %.6f, got %.6f", expected, got)
 	}
 
-	rt.UpdateLatency(key, proxy, 20)
-	rt.UpdateSpeed(key, proxy, 20971520)
-	rt.RefreshScores(key, []string{proxy})
+	rt.UpdateLatency(key, testDomain, proxy, 20)
+	rt.UpdateSpeed(key, testDomain, proxy, 20971520)
+	rt.RefreshScores(key, testDomain, []string{proxy})
 	snap = rt.Snapshot("test")
-	rec = snap.Rows[0].Proxies[proxy]
+	rec = domainProxies(snap.Rows[0], testDomain)[proxy]
 	atom = 100.0/(math.Max(float64(rec.Attributes.Latency), 50.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
 	expected = atom
 	if math.Abs(rec.Attributes.Score-expected) > 0.000001 {
@@ -270,13 +282,13 @@ func TestRankByScore(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	rt.UpdateLatency(key, "proxy-a", 100)
-	rt.UpdateLatency(key, "proxy-b", 50)
-	rt.UpdateLatency(key, "proxy-c", 200)
-	rt.UpdateSpeed(key, "proxy-c", 10485760)
+	rt.UpdateLatency(key, testDomain, "proxy-a", 100)
+	rt.UpdateLatency(key, testDomain, "proxy-b", 50)
+	rt.UpdateLatency(key, testDomain, "proxy-c", 200)
+	rt.UpdateSpeed(key, testDomain, "proxy-c", 10485760)
 	// Give the domain a large connSize so the speed component is not skipped.
 	rt.UpdateConnSize(key, testDomain, 2048)
-	rt.RefreshScores(key, []string{"proxy-a", "proxy-b", "proxy-c"})
+	rt.RefreshScores(key, testDomain, []string{"proxy-a", "proxy-b", "proxy-c"})
 
 	proxies := []string{"proxy-a", "proxy-c", "proxy-b"}
 	ranked := rt.RankByScore(proxies, nil, key, testDomain)
@@ -293,23 +305,31 @@ func TestRankByScoreSkipsSpeedForSmallConnSize(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
+	// Proxy metrics are per-domain now, so each domain under test needs its
+	// own latency/speed samples — a domain no longer inherits data recorded
+	// against a sibling domain in the same row.
+	//
 	// proxy-a: fast latency (100ms), no speed.
 	// proxy-c: slow latency (200ms) but huge speed — normally boosted above
 	// proxy-a when the speed term counts.
-	rt.UpdateLatency(key, "proxy-a", 100)
-	rt.UpdateLatency(key, "proxy-c", 200)
-	rt.UpdateSpeed(key, "proxy-c", 10485760)
+	rt.UpdateLatency(key, "small.example.com", "proxy-a", 100)
+	rt.UpdateLatency(key, "small.example.com", "proxy-c", 200)
+	rt.UpdateSpeed(key, "small.example.com", "proxy-c", 10485760)
 
-	// Small connSize (< 32kB): speed is skipped, so proxy-a (faster latency)
-	// ranks above proxy-c.
-	rt.UpdateConnSize(key, "small.example.com", 10)
+	// Small connSize (< minConnSizeForSpeedKB): speed is skipped, so proxy-a
+	// (faster latency) ranks above proxy-c.
+	rt.UpdateConnSize(key, "small.example.com", 1)
 	ranked := rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "small.example.com")
 	if ranked[0] != "proxy-a" {
 		t.Fatalf("small connSize: expected proxy-a first (speed skipped), got %v", ranked)
 	}
 
-	// Large connSize (>= 32kB): speed is included, so proxy-c's throughput
-	// pushes it above proxy-a.
+	rt.UpdateLatency(key, "large.example.com", "proxy-a", 100)
+	rt.UpdateLatency(key, "large.example.com", "proxy-c", 200)
+	rt.UpdateSpeed(key, "large.example.com", "proxy-c", 10485760)
+
+	// Large connSize (>= minConnSizeForSpeedKB): speed is included, so
+	// proxy-c's throughput pushes it above proxy-a.
 	rt.UpdateConnSize(key, "large.example.com", 2048)
 	ranked = rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "large.example.com")
 	if ranked[0] != "proxy-c" {
@@ -324,13 +344,13 @@ func TestRankByScoreDefaultConnSizeForUnseenDomain(t *testing.T) {
 	// proxy-a: fast latency (100ms), no speed.
 	// proxy-c: slow latency (200ms) but huge speed — boosted above proxy-a when
 	// the speed term counts.
-	rt.UpdateLatency(key, "proxy-a", 100)
-	rt.UpdateLatency(key, "proxy-c", 200)
-	rt.UpdateSpeed(key, "proxy-c", 10485760)
+	rt.UpdateLatency(key, "fresh.example.com", "proxy-a", 100)
+	rt.UpdateLatency(key, "fresh.example.com", "proxy-c", 200)
+	rt.UpdateSpeed(key, "fresh.example.com", "proxy-c", 10485760)
 
-	// A target with no domain record at all (no connSize sample, no cell)
-	// must default to connSize 100 (> the 4kB threshold), so the speed term is
-	// still counted and proxy-c outranks proxy-a.
+	// A domain with no connSize sample yet defaults to connSize 100 (above
+	// minConnSizeForSpeedKB), so the speed term is still counted and proxy-c
+	// outranks proxy-a.
 	ranked := rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "fresh.example.com")
 	if ranked[0] != "proxy-c" {
 		t.Fatalf("unseen domain: expected proxy-c first (default connSize keeps speed), got %v", ranked)
@@ -349,10 +369,10 @@ func TestRankByScoreStableSort(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	rt.UpdateLatency(key, "proxy-a", 50)
-	rt.UpdateLatency(key, "proxy-b", 50)
-	rt.UpdateLatency(key, "proxy-c", 50)
-	rt.RefreshScores(key, []string{"proxy-a", "proxy-b", "proxy-c"})
+	rt.UpdateLatency(key, testDomain, "proxy-a", 50)
+	rt.UpdateLatency(key, testDomain, "proxy-b", 50)
+	rt.UpdateLatency(key, testDomain, "proxy-c", 50)
+	rt.RefreshScores(key, testDomain, []string{"proxy-a", "proxy-b", "proxy-c"})
 
 	proxies := []string{"proxy-c", "proxy-a", "proxy-b"}
 	ranked := rt.RankByScore(proxies, nil, key, testDomain)
@@ -367,8 +387,8 @@ func TestRankByScoreWithHealthCheckFallback(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	rt.UpdateLatency(key, "proxy-a", 100)
-	rt.RefreshScores(key, []string{"proxy-a"})
+	rt.UpdateLatency(key, testDomain, "proxy-a", 100)
+	rt.RefreshScores(key, testDomain, []string{"proxy-a"})
 
 	healthCheck := func(name string) uint16 {
 		switch name {
@@ -399,7 +419,7 @@ func TestRankByScoreFailedOnlyProxyRanksLast(t *testing.T) {
 	key := "ASN:64512"
 
 	// proxy-a has a latency sample; proxy-b has only failures (no sample).
-	rt.UpdateLatency(key, "proxy-a", 100)
+	rt.UpdateLatency(key, testDomain, "proxy-a", 100)
 	rt.MarkFailed(key, "proxy-b", testDomain, 3.0)
 
 	// A healthy-looking fallback latency must NOT rescue the failed-only proxy:
@@ -417,11 +437,11 @@ func TestRankByScorePrefersTTFBGroup(t *testing.T) {
 	key := "ASN:64512"
 
 	// proxy-a: fast latency but slow TTFB.
-	rt.UpdateLatency(key, "proxy-a", 100)
-	rt.UpdateTTFB(key, "proxy-a", 80)
+	rt.UpdateLatency(key, testDomain, "proxy-a", 100)
+	rt.UpdateTTFB(key, testDomain, "proxy-a", 80)
 	// proxy-b: slow latency but fast TTFB.
-	rt.UpdateLatency(key, "proxy-b", 200)
-	rt.UpdateTTFB(key, "proxy-b", 50)
+	rt.UpdateLatency(key, testDomain, "proxy-b", 200)
+	rt.UpdateTTFB(key, testDomain, "proxy-b", 50)
 
 	// Once TTFB exists, ranking uses TTFB (not latency): proxy-b (50ms) beats
 	// proxy-a (80ms) even though proxy-a's latency is lower.
@@ -439,14 +459,14 @@ func TestRankByScoreSkipsProxiesSlowerThanMinTTFB(t *testing.T) {
 	key := "ASN:64512"
 
 	// proxy-a establishes minTTFB=50.
-	rt.UpdateTTFB(key, "proxy-a", 50)
+	rt.UpdateTTFB(key, testDomain, "proxy-a", 50)
 	// proxy-b has no TTFB and latency 200 -> 2*200 > 50 -> skipped.
-	rt.UpdateLatency(key, "proxy-b", 200)
+	rt.UpdateLatency(key, testDomain, "proxy-b", 200)
 	// proxy-c has no TTFB and latency 20 -> 2*20 <= 50 -> kept.
-	rt.UpdateLatency(key, "proxy-c", 20)
+	rt.UpdateLatency(key, testDomain, "proxy-c", 20)
 	// proxy-d has no TTFB and latency 40 -> 2*40 > 50 -> skipped (the current
 	// prune threshold is latency > minTTFB/2, so even latency < minTTFB is cut).
-	rt.UpdateLatency(key, "proxy-d", 40)
+	rt.UpdateLatency(key, testDomain, "proxy-d", 40)
 
 	ranked := rt.RankByScore([]string{"proxy-b", "proxy-c", "proxy-d", "proxy-a"}, nil, key, testDomain)
 
@@ -465,8 +485,8 @@ func TestRankByScoreLatencyGroupAfterTTFBGroup(t *testing.T) {
 
 	// proxy-a has TTFB=50; proxy-b has no TTFB but latency=20 (<= minTTFB*2,
 	// so it survives the prune even though its raw latency is lower).
-	rt.UpdateTTFB(key, "proxy-a", 50)
-	rt.UpdateLatency(key, "proxy-b", 20)
+	rt.UpdateTTFB(key, testDomain, "proxy-a", 50)
+	rt.UpdateLatency(key, testDomain, "proxy-b", 20)
 
 	ranked := rt.RankByScore([]string{"proxy-b", "proxy-a"}, nil, key, testDomain)
 	// TTFB group always comes first, even though proxy-b's raw latency is lower.
@@ -483,11 +503,11 @@ func TestRankByScoreMinTTFBFromWholeRow(t *testing.T) {
 	key := "ASN:64512"
 
 	// proxy-b is NOT in the candidate list but establishes minTTFB=50.
-	rt.UpdateTTFB(key, "proxy-b", 50)
+	rt.UpdateTTFB(key, testDomain, "proxy-b", 50)
 	// proxy-a is in the list with TTFB=100.
-	rt.UpdateTTFB(key, "proxy-a", 100)
+	rt.UpdateTTFB(key, testDomain, "proxy-a", 100)
 	// proxy-c has no TTFB and latency=80, which is > 50 (whole-row min) -> skipped.
-	rt.UpdateLatency(key, "proxy-c", 80)
+	rt.UpdateLatency(key, testDomain, "proxy-c", 80)
 
 	ranked := rt.RankByScore([]string{"proxy-a", "proxy-c"}, nil, key, testDomain)
 	if len(ranked) != 1 || ranked[0] != "proxy-a" {
@@ -502,10 +522,10 @@ func TestRankByScoreCapsTTFBGroup(t *testing.T) {
 	// Six proxies with a TTFB sample, clearly distinct first-byte times.
 	// proxy-a is the fastest, proxy-f the slowest.
 	for i, name := range []string{"proxy-a", "proxy-b", "proxy-c", "proxy-d", "proxy-e", "proxy-f"} {
-		rt.UpdateTTFB(key, name, int64(50+10*i))
+		rt.UpdateTTFB(key, testDomain, name, int64(50+10*i))
 	}
 	// A latency-only proxy with latency*2 <= minTTFB so it survives the prune.
-	rt.UpdateLatency(key, "proxy-nottfb", 20)
+	rt.UpdateLatency(key, testDomain, "proxy-nottfb", 20)
 
 	proxies := []string{"proxy-f", "proxy-e", "proxy-d", "proxy-c", "proxy-b", "proxy-a", "proxy-nottfb"}
 	ranked := rt.RankByScore(proxies, nil, key, testDomain)
@@ -526,19 +546,19 @@ func TestProxyFailedCount(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	if got := rt.ProxyFailedCount(key, "proxy-a"); got != 0 {
+	if got := rt.ProxyFailedCount(key, testDomain, "proxy-a"); got != 0 {
 		t.Fatalf("ProxyFailedCount on absent proxy = %v, want 0", got)
 	}
 
 	// MarkFailed only records on an existing row (a proxy that failed was
 	// being used, so its row already exists). Create it first.
-	rt.UpdateLatency(key, "proxy-a", 100)
+	rt.UpdateLatency(key, testDomain, "proxy-a", 100)
 	rt.MarkFailed(key, "proxy-a", testDomain, 0.4)
 	rt.MarkFailed(key, "proxy-a", testDomain, 0.8)
-	if got := rt.ProxyFailedCount(key, "proxy-a"); math.Abs(got-1.2) > 0.001 {
+	if got := rt.ProxyFailedCount(key, testDomain, "proxy-a"); math.Abs(got-1.2) > 0.001 {
 		t.Fatalf("ProxyFailedCount = %v, want 1.2", got)
 	}
-	if got := rt.ProxyFailedCount("ASN:other", "proxy-a"); got != 0 {
+	if got := rt.ProxyFailedCount("ASN:other", testDomain, "proxy-a"); got != 0 {
 		t.Fatalf("ProxyFailedCount on other key = %v, want 0", got)
 	}
 }
@@ -562,12 +582,12 @@ func TestSnapshotIncludesScore(t *testing.T) {
 	key := "ASN:64512"
 	proxy := "proxy-a"
 
-	rt.UpdateLatency(key, proxy, 100)
-	rt.UpdateSpeed(key, proxy, 10485760)
-	rt.RefreshScores(key, []string{proxy})
+	rt.UpdateLatency(key, testDomain, proxy, 100)
+	rt.UpdateSpeed(key, testDomain, proxy, 10485760)
+	rt.RefreshScores(key, testDomain, []string{proxy})
 	snap := rt.Snapshot("test")
-	got := snap.Rows[0].Proxies[proxy].Attributes.Score
-	rec := snap.Rows[0].Proxies[proxy]
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.Score
+	rec := domainProxies(snap.Rows[0], testDomain)[proxy]
 	atom := 100.0/(math.Max(float64(rec.Attributes.Latency), 50.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
 	expected := atom // no per-proxy aggregation -> raw unblended score
 	if math.Abs(got-expected) > 0.000001 {
@@ -598,14 +618,14 @@ func TestPreRankLatency(t *testing.T) {
 	rt := NewRouteTable(100)
 
 	// Build known latencies: proxy-a avg=50, proxy-b avg=30, proxy-c avg=80
-	rt.UpdateLatency("ASN:1", "proxy-a", 40)
-	rt.UpdateLatency("ASN:2", "proxy-a", 60)
-	rt.UpdateLatency("ASN:1", "proxy-b", 30)
-	rt.UpdateLatency("ASN:2", "proxy-b", 30)
-	rt.UpdateLatency("ASN:1", "proxy-c", 80)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 40)
+	rt.UpdateLatency("ASN:2", testDomain, "proxy-a", 60)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-b", 30)
+	rt.UpdateLatency("ASN:2", testDomain, "proxy-b", 30)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-c", 80)
 
 	proxies := []string{"proxy-a", "proxy-c", "proxy-b"}
-	ranked := rt.PreRankLatency(proxies, nil, "")
+	ranked := rt.PreRankLatency(proxies, nil, "", "")
 
 	// proxy-b (30) < proxy-a (50) < proxy-c (80)
 	expected := []string{"proxy-b", "proxy-a", "proxy-c"}
@@ -620,12 +640,12 @@ func TestPreRankStableSort(t *testing.T) {
 	rt := NewRouteTable(100)
 
 	// Same latency for all → preserves input order (stable sort)
-	rt.UpdateLatency("ASN:1", "proxy-a", 50)
-	rt.UpdateLatency("ASN:1", "proxy-b", 50)
-	rt.UpdateLatency("ASN:1", "proxy-c", 50)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 50)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-b", 50)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-c", 50)
 
 	proxies := []string{"proxy-c", "proxy-a", "proxy-b"}
-	ranked := rt.PreRankLatency(proxies, nil, "")
+	ranked := rt.PreRankLatency(proxies, nil, "", "")
 
 	// All same latency, stable sort keeps input order
 	for i := range proxies {
@@ -639,8 +659,8 @@ func TestPreRankWithHealthCheckFallback(t *testing.T) {
 	rt := NewRouteTable(100)
 
 	// proxy-d has no route table data, falls back to health check
-	rt.UpdateLatency("ASN:1", "proxy-a", 50)
-	rt.UpdateLatency("ASN:1", "proxy-b", 30)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 50)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-b", 30)
 
 	healthCheck := func(name string) uint16 {
 		if name == "proxy-d" {
@@ -650,7 +670,7 @@ func TestPreRankWithHealthCheckFallback(t *testing.T) {
 	}
 
 	proxies := []string{"proxy-a", "proxy-b", "proxy-d"}
-	ranked := rt.PreRankLatency(proxies, healthCheck, "")
+	ranked := rt.PreRankLatency(proxies, healthCheck, "", "")
 
 	// proxy-d (20 health) < proxy-b (30) < proxy-a (50)
 	expected := []string{"proxy-d", "proxy-b", "proxy-a"}
@@ -701,28 +721,28 @@ func TestLRUEviction(t *testing.T) {
 
 func TestSnapshotIsCopy(t *testing.T) {
 	rt := NewRouteTable(100)
-	rt.UpdateLatency("ASN:1", "proxy-a", 42)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 42)
 
 	snap := rt.Snapshot("test")
 	// Mutate snapshot
-	snap.Rows[0].Proxies["proxy-a"] = ProxyRecord{Name: "hacked"}
+	domainProxies(snap.Rows[0], testDomain)["proxy-a"] = ProxyRecord{Name: "hacked"}
 	// Original should be unchanged
 	snap2 := rt.Snapshot("test")
-	if snap2.Rows[0].Proxies["proxy-a"].Name != "proxy-a" {
+	if domainProxies(snap2.Rows[0], testDomain)["proxy-a"].Name != "proxy-a" {
 		t.Fatal("snapshot must be a deep copy — mutation should not affect original")
 	}
 }
 
 func TestRemoveProxy(t *testing.T) {
 	rt := NewRouteTable(100)
-	rt.UpdateLatency("ASN:1", "proxy-a", 42)
-	rt.UpdateLatency("ASN:1", "proxy-b", 30)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 42)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-b", 30)
 	rt.SetBestProxy("ASN:1", testDomain, "proxy-a")
 
 	rt.RemoveProxy("proxy-a")
 
 	snap := rt.Snapshot("test")
-	proxies := snap.Rows[0].Proxies
+	proxies := domainProxies(snap.Rows[0], testDomain)
 	if _, ok := proxies["proxy-a"]; ok {
 		t.Fatal("proxy-a should be removed")
 	}
@@ -737,7 +757,7 @@ func TestRemoveProxy(t *testing.T) {
 
 func TestMarkFailed(t *testing.T) {
 	rt := NewRouteTable(100)
-	rt.UpdateLatency("ASN:1", "proxy-a", 42)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 42)
 	rt.SetBestProxy("ASN:1", testDomain, "proxy-a")
 
 	rt.MarkFailed("ASN:1", "proxy-a", testDomain, 1.0)
@@ -757,15 +777,15 @@ func TestConcurrentSafety(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			key := "ASN:" + string(rune('0'+id%10))
-			rt.UpdateLatency(key, "proxy-a", int64(id))
-			rt.UpdatePkgLoss(key, "proxy-a", 0.01)
-			rt.UpdateSpeed(key, "proxy-a", 1000)
-			rt.IncrementUseCount(key, "proxy-a")
+			rt.UpdateLatency(key, testDomain, "proxy-a", int64(id))
+			rt.UpdatePkgLoss(key, testDomain, "proxy-a", 0.01)
+			rt.UpdateSpeed(key, testDomain, "proxy-a", 1000)
+			rt.IncrementUseCount(key, testDomain, "proxy-a")
 			rt.SetBestProxy(key, testDomain, "proxy-a")
 			rt.GetBestProxy(key, testDomain)
 			rt.IsTCPProbed(key, testDomain)
-			rt.PreRankLatency([]string{"proxy-a", "proxy-b"}, nil, "")
-			rt.RefreshScores(key, []string{"proxy-a", "proxy-b"})
+			rt.PreRankLatency([]string{"proxy-a", "proxy-b"}, nil, "", "")
+			rt.RefreshScores(key, testDomain, []string{"proxy-a", "proxy-b"})
 			rt.RankByScore([]string{"proxy-a", "proxy-b"}, nil, key, testDomain)
 			rt.GetBestProxyIfFresh(key, testDomain, time.Second)
 			rt.Snapshot("test")
@@ -797,9 +817,9 @@ func TestPerMetricHasSampleIndependent(t *testing.T) {
 	proxy := "proxy-a"
 
 	// Update only latency — verify only latency flag is set
-	rt.UpdateLatency(key, proxy, 100)
+	rt.UpdateLatency(key, testDomain, proxy, 100)
 	rt.mu.RLock()
-	cell := rt.rows[key].proxies[proxy]
+	cell := rt.rows[key].domainTable[testDomain].proxies[proxy]
 	hasLat := cell.HasLatencySample
 	hasSpd := cell.HasSpeedSample
 	hasLoss := cell.HasPkgLossSample
@@ -815,22 +835,22 @@ func TestPerMetricHasSampleIndependent(t *testing.T) {
 	}
 
 	// Update speed — verify both latency and speed flags now set
-	rt.UpdateSpeed(key, proxy, 10485760)
+	rt.UpdateSpeed(key, testDomain, proxy, 10485760)
 	rt.mu.RLock()
-	cell = rt.rows[key].proxies[proxy]
+	cell = rt.rows[key].domainTable[testDomain].proxies[proxy]
 	hasSpd = cell.HasSpeedSample
 	rt.mu.RUnlock()
 	if !hasSpd {
 		t.Fatal("HasSpeedSample should be true after UpdateSpeed")
 	}
-	if !rt.rows[key].proxies[proxy].HasLatencySample {
+	if !rt.rows[key].domainTable[testDomain].proxies[proxy].HasLatencySample {
 		t.Fatal("HasLatencySample should still be true")
 	}
 
 	// Update pkg_loss — verify all three flags now set
-	rt.UpdatePkgLoss(key, proxy, 0.01)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.01)
 	rt.mu.RLock()
-	cell = rt.rows[key].proxies[proxy]
+	cell = rt.rows[key].domainTable[testDomain].proxies[proxy]
 	hasLoss = cell.HasPkgLossSample
 	rt.mu.RUnlock()
 	if !hasLoss {
@@ -844,12 +864,12 @@ func TestEMASpeedIsCorrectWithPriorLatencySample(t *testing.T) {
 	proxy := "proxy-a"
 
 	// Latency sample first (sets HasLatencySample, not HasSpeedSample)
-	rt.UpdateLatency(key, proxy, 100)
+	rt.UpdateLatency(key, testDomain, proxy, 100)
 
 	// Speed sample second — must be 100% of real speed, NOT 25% (EMA with 0)
-	rt.UpdateSpeed(key, proxy, 10485760)
+	rt.UpdateSpeed(key, testDomain, proxy, 10485760)
 	snap := rt.Snapshot("test")
-	got := snap.Rows[0].Proxies[proxy].Attributes.Speed
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.Speed
 	if got != 10485760 {
 		t.Fatalf("expected first speed=10485760 (100%% of value), got %.0f (%.1f%%)",
 			got, got/10485760*100)
@@ -862,12 +882,12 @@ func TestEMAPkgLossIsCorrectWithPriorLatencySample(t *testing.T) {
 	proxy := "proxy-a"
 
 	// Latency sample first (sets HasLatencySample, not HasPkgLossSample)
-	rt.UpdateLatency(key, proxy, 100)
+	rt.UpdateLatency(key, testDomain, proxy, 100)
 
 	// PkgLoss sample second — must be 100% of real value, NOT 25%
-	rt.UpdatePkgLoss(key, proxy, 0.08)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.08)
 	snap := rt.Snapshot("test")
-	got := snap.Rows[0].Proxies[proxy].Attributes.PkgLoss
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.PkgLoss
 	if got != 0.08 {
 		t.Fatalf("expected first pkg_loss=0.08 (100%% of value), got %.4f", got)
 	}
@@ -879,26 +899,26 @@ func TestPkgLossZeroUpdatesEMA(t *testing.T) {
 	proxy := "proxy-a"
 
 	// Record initial loss
-	rt.UpdatePkgLoss(key, proxy, 0.1)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.1)
 	snap := rt.Snapshot("test")
-	if snap.Rows[0].Proxies[proxy].Attributes.PkgLoss != 0.1 {
+	if domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.PkgLoss != 0.1 {
 		t.Fatal("first pkg_loss should be 0.1")
 	}
 
 	// Update with 0% loss — EMA should decay toward 0
-	rt.UpdatePkgLoss(key, proxy, 0.0)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.0)
 	snap = rt.Snapshot("test")
 	expected := 0.1*3.0/4.0 + 0.0/4.0 // = 0.075
-	got := snap.Rows[0].Proxies[proxy].Attributes.PkgLoss
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.PkgLoss
 	if got < expected-0.001 || got > expected+0.001 {
 		t.Fatalf("expected pkg_loss=%.4f after 0%% update, got %.4f", expected, got)
 	}
 
 	// Second 0% update — should decay further
-	rt.UpdatePkgLoss(key, proxy, 0.0)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.0)
 	snap = rt.Snapshot("test")
 	expected = expected*3.0/4.0 + 0.0/4.0 // = 0.05625
-	got = snap.Rows[0].Proxies[proxy].Attributes.PkgLoss
+	got = domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.PkgLoss
 	if got < expected-0.001 || got > expected+0.001 {
 		t.Fatalf("expected pkg_loss=%.4f after second 0%% update, got %.4f", expected, got)
 	}
@@ -921,10 +941,10 @@ func TestBackwardCompatPersistedCell(t *testing.T) {
 		// (zero values from old-format JSON)
 	}
 
-	rt.RestoreRow(key, proxy, pc)
+	rt.RestoreRow(key, testDomain, proxy, pc)
 
 	rt.mu.RLock()
-	cell := rt.rows[key].proxies[proxy]
+	cell := rt.rows[key].domainTable[testDomain].proxies[proxy]
 	hasLat := cell.HasLatencySample
 	hasLoss := cell.HasPkgLossSample
 	hasSpd := cell.HasSpeedSample
@@ -949,18 +969,18 @@ func TestIntegrationLatencySpeedLossFromSingleConnection(t *testing.T) {
 	// Simulate a full connection lifecycle:
 	// 1. dialAndWrap / probeBatch writes connectTime once
 	connectTime := int64(120)
-	rt.UpdateLatency(key, proxy, connectTime)
+	rt.UpdateLatency(key, testDomain, proxy, connectTime)
 
 	// 2. Speed sample from tracker (written on close)
 	speed := 10485760.0 // 10 MiB/s
-	rt.UpdateSpeed(key, proxy, speed)
+	rt.UpdateSpeed(key, testDomain, proxy, speed)
 
 	// 3. Loss rate from TCP stats (written on close, 0% loss — should still update)
-	rt.UpdatePkgLoss(key, proxy, 0.0)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.0)
 
 	// Verify all per-metric flags are set independently
 	rt.mu.RLock()
-	cell := rt.rows[key].proxies[proxy]
+	cell := rt.rows[key].domainTable[testDomain].proxies[proxy]
 	if !cell.HasLatencySample {
 		t.Fatal("HasLatencySample should be true after connectTime write")
 	}
@@ -974,7 +994,7 @@ func TestIntegrationLatencySpeedLossFromSingleConnection(t *testing.T) {
 
 	// Verify final values
 	snap := rt.Snapshot("test")
-	rec := snap.Rows[0].Proxies[proxy]
+	rec := domainProxies(snap.Rows[0], testDomain)[proxy]
 
 	// Speed: first sample, no prior = raw value
 	if rec.Attributes.Speed != speed {
@@ -1165,12 +1185,15 @@ func TestMarkFailedClearsOnlyFailingDomain(t *testing.T) {
 		t.Fatalf("site-c best = %q, want proxy-b", best)
 	}
 
-	// The failure penalty is still proxy-wide: failedCount on proxy-a advances.
-	rt.mu.RLock()
-	fc := rt.rows[key].proxies["proxy-a"].FailedCount
-	rt.mu.RUnlock()
-	if fc != 1.0 {
-		t.Fatalf("proxy-a failedCount = %v, want 1.0", fc)
+	// The failure penalty is domain-scoped: failedCount advances only on the
+	// domain that actually observed the failure (site-a), not on sibling
+	// domains sharing the same ASN row (site-b), since proxy quality metrics
+	// now live per domain rather than per row.
+	if fcA := rt.ProxyFailedCount(key, "site-a.example.com", "proxy-a"); fcA != 1.0 {
+		t.Fatalf("site-a proxy-a failedCount = %v, want 1.0", fcA)
+	}
+	if fcB := rt.ProxyFailedCount(key, "site-b.example.com", "proxy-a"); fcB != 0 {
+		t.Fatalf("site-b proxy-a failedCount = %v, want 0 (unaffected by site-a's failure)", fcB)
 	}
 }
 

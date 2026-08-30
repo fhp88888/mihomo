@@ -242,12 +242,31 @@ func (s *stubConn) RemoteDestination() string                   { return "" }
 
 var _ C.Conn = (*stubConn)(nil)
 
-func routeFailedCount(t *testing.T, table *smart.RouteTable, key, proxy string) float64 {
+// domainRecords returns the ProxyRecord map for a named domain within a row
+// snapshot (nil if the domain isn't present).  Proxy metrics live per domain,
+// not per row, so tests that used to read row.Proxies directly go through this.
+func domainRecords(row smart.RowSnapshot, domain string) map[string]smart.ProxyRecord {
+	for _, d := range row.Domains {
+		if d.Name == domain {
+			return d.Proxies
+		}
+	}
+	return nil
+}
+
+func routeFailedCount(t *testing.T, table *smart.RouteTable, key, domain, proxy string) float64 {
 	t.Helper()
 	for _, row := range table.Snapshot("").Rows {
-		if row.Key == key {
-			return row.Proxies[proxy].Attributes.FailedCount
+		if row.Key != key {
+			continue
 		}
+		for _, dom := range row.Domains {
+			if dom.Name == domain {
+				return dom.Proxies[proxy].Attributes.FailedCount
+			}
+		}
+		// Domain has no recorded state yet — equivalent to FailedCount 0.
+		return 0
 	}
 	t.Fatalf("route row %q not found", key)
 	return 0
@@ -276,7 +295,7 @@ func TestRaceAndWrap_FirstSuccessCancelsLosers(t *testing.T) {
 	}}
 
 	table := smart.NewRouteTable(10)
-	table.UpdateLatency(key, first.Name(), 10)
+	table.UpdateLatency(key, "example.com", first.Name(), 10)
 	table.SetBestProxy(key, "example.com", first.Name())
 	s := &Smart{testUrl: "test", routeTable: table}
 
@@ -324,7 +343,7 @@ func TestRaceAndWrap_FirstSuccessCancelsLosers(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first proxy did not observe cancellation")
 	}
-	if got := routeFailedCount(t, table, key, first.Name()); got != 0 {
+	if got := routeFailedCount(t, table, key, "example.com", first.Name()); got != 0 {
 		t.Fatalf("canceled first proxy failed count = %v, want 0", got)
 	}
 	if winner.CloseCount() != 0 {
@@ -401,8 +420,9 @@ func TestRaceAndWrap_ClosesLateSuccessfulLoser(t *testing.T) {
 	var firstUseCount, secondUseCount int64
 	for _, row := range s.routeTable.Snapshot("").Rows {
 		if row.Key == key {
-			firstUseCount = row.Proxies[first.Name()].UseCount
-			secondUseCount = row.Proxies[second.Name()].UseCount
+			proxies := domainRecords(row, "example.com")
+			firstUseCount = proxies[first.Name()].UseCount
+			secondUseCount = proxies[second.Name()].UseCount
 			break
 		}
 	}
@@ -427,7 +447,7 @@ func TestRaceAndWrap_FatalErrorStopsScheduling(t *testing.T) {
 	}}
 
 	table := smart.NewRouteTable(10)
-	table.UpdateLatency(key, first.Name(), 10)
+	table.UpdateLatency(key, "example.com", first.Name(), 10)
 	table.SetBestProxy(key, "example.com", first.Name())
 	s := &Smart{testUrl: "test", routeTable: table}
 	_, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com",
@@ -462,7 +482,7 @@ func TestRaceAndWrap_ParentCancellationStopsScheduling(t *testing.T) {
 	}}
 
 	table := smart.NewRouteTable(10)
-	table.UpdateLatency(key, first.Name(), 10)
+	table.UpdateLatency(key, "example.com", first.Name(), 10)
 	table.SetBestProxy(key, "example.com", first.Name())
 	s := &Smart{testUrl: "test", routeTable: table}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -497,7 +517,7 @@ func TestRaceAndWrap_ParentCancellationStopsScheduling(t *testing.T) {
 		t.Fatal("second proxy started after parent cancellation")
 	case <-time.After(2 * smartTCPFallbackStagger):
 	}
-	if got := routeFailedCount(t, table, key, first.Name()); got != 0 {
+	if got := routeFailedCount(t, table, key, "example.com", first.Name()); got != 0 {
 		t.Fatalf("canceled first proxy failed count = %v, want 0", got)
 	}
 }
@@ -544,7 +564,7 @@ func TestProbeBatch_FatalError_ReturnsImmediately(t *testing.T) {
 	pc := NewProbeCoordinator()
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
-	rt.UpdateLatency("TARGET:example.com", "p1", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p1", 10)
 
 	proxies := makeStubProxies("p1", "p2")
 
@@ -574,8 +594,8 @@ func TestProbeBatch_FatalError_SkipsMarkFailed(t *testing.T) {
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
 
-	rt.UpdateLatency("TARGET:example.com", "p1", 10)
-	rt.UpdateLatency("TARGET:example.com", "p2", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p1", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p2", 10)
 	rt.SetBestProxy("TARGET:example.com", "example.com", "p1")
 
 	proxies := makeStubProxies("p1", "p2")
@@ -607,8 +627,8 @@ func TestProbeBatch_NodeLevelError_MarksFailingProxy(t *testing.T) {
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
 
-	rt.UpdateLatency("TARGET:example.com", "p1", 10)
-	rt.UpdateLatency("TARGET:example.com", "p2", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p1", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p2", 10)
 	rt.SetBestProxy("TARGET:example.com", "example.com", "p1")
 
 	proxies := makeStubProxies("p1", "p2")
@@ -644,7 +664,7 @@ func TestProbeBatch_ContextCanceled_SkipsMarkFailed(t *testing.T) {
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
 
-	rt.UpdateLatency("TARGET:example.com", "p1", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p1", 10)
 	rt.SetBestProxy("TARGET:example.com", "example.com", "p1")
 
 	proxies := makeStubProxies("p1")
@@ -670,8 +690,8 @@ func TestProbeBatch_MixedErrors_ReturnsFatal(t *testing.T) {
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
 
-	rt.UpdateLatency("TARGET:example.com", "p1", 10)
-	rt.UpdateLatency("TARGET:example.com", "p2", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p1", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p2", 10)
 
 	proxies := makeStubProxies("p1", "p2")
 
@@ -704,7 +724,7 @@ func TestProbeBatch_AllProxiesNodeLevel_NoSentinelDetected(t *testing.T) {
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
 
-	rt.UpdateLatency("TARGET:example.com", "p1", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p1", 10)
 
 	proxies := makeStubProxies("p1")
 
@@ -838,7 +858,9 @@ func TestProbeBatch_KeepsLosersAliveAfterWinner(t *testing.T) {
 	var loserLat int64
 	for _, row := range rt.Snapshot("").Rows {
 		if row.Key == key {
-			loserLat = row.Proxies["loser"].Attributes.Latency
+			// probeBatch/Discover above dial with &C.Metadata{} (empty Host),
+			// so routeDomain resolves to the zero-value DstIP's string form.
+			loserLat = domainRecords(row, "invalid IP")["loser"].Attributes.Latency
 		}
 	}
 	if loserLat != 42 {
@@ -954,7 +976,9 @@ func TestProbeBatch_KeepsLosersAliveThroughDiscover(t *testing.T) {
 	var loserLat int64
 	for _, row := range rt.Snapshot("").Rows {
 		if row.Key == key {
-			loserLat = row.Proxies["loser"].Attributes.Latency
+			// probeBatch/Discover above dial with &C.Metadata{} (empty Host),
+			// so routeDomain resolves to the zero-value DstIP's string form.
+			loserLat = domainRecords(row, "invalid IP")["loser"].Attributes.Latency
 		}
 	}
 	if loserLat != 42 {
