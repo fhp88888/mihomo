@@ -3,7 +3,6 @@ package outboundgroup
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"math/rand"
 	"net"
@@ -41,7 +40,10 @@ const (
 	// the end of discovery.
 	highLossThreshold = 0.1
 	// rediscoverEvery is the fast-path skip rate: 1 in N requests re-discovers.
-	rediscoverEvery = 25
+	rediscoverEvery   = 25
+	smartBestTag      = "Best"
+	smartStaggerTag   = "Stagger#1"
+	smartDiscoveryTag = "Discovery#1"
 )
 
 // routeKey returns the route table key for a connection's metadata:
@@ -98,13 +100,13 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key, do
 	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, domain, smartBestProxyFreshness); ok {
 		for _, p := range proxies {
 			if p.Name() == bestName && p.AliveForTestUrl(s.testUrl) {
-				// Best-first race: best gets a smartBestExclusiveWindow
-				// head-start, then the rest ranked by score race at the normal
-				// stagger.  Whoever connects first wins — including a slow best.
-				// Losers are drained in the background via probeCoordinator.
+				// Part 1 dials only the current best.  If it has not connected
+				// within smartBestExclusiveWindow, part 2 starts the remaining
+				// candidates as a staggered fallback race.  The best remains in
+				// flight and can still win after the fallback has started.
 				ordered := s.rankCandidates(key, domain, proxies, p)
 				conn, err := s.raceAndWrap(ctx, metadata, key, domain, ordered,
-					smartBestExclusiveWindow, &s.probeCoordinator.wg, "Best")
+					smartBestExclusiveWindow, &s.probeCoordinator.wg, bestName)
 				if conn != nil || err != nil {
 					return conn, err
 				}
@@ -119,7 +121,8 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key, do
 	if len(ordered) == 0 {
 		return nil, nil
 	}
-	conn, err := s.raceAndWrap(ctx, metadata, key, domain, ordered, smartTCPFallbackStagger, nil, "Stagger")
+	conn, err := s.raceAndWrap(ctx, metadata, key, domain, ordered, smartTCPFallbackStagger, nil,
+		"")
 	if conn != nil || err != nil {
 		return conn, err
 	}
@@ -170,10 +173,10 @@ func (s *Smart) rankCandidates(key, domain string, proxies []C.Proxy, best C.Pro
 // immediately); later candidates follow at smartTCPFallbackStagger.  wg != nil
 // makes loser draining asynchronous so the caller returns the winner
 // immediately while late successful losers still sample latency in the
-// background.  pathTag labels the routed log line: "Best" or "Stagger".
+// background.
 func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, domain string,
-	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, pathTag string) (C.Conn, error) {
-	winner, conn, connectTime, err := raceStaggered(ctx, key, ordered, wg, firstStagger, pathTag,
+	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, bestName string) (C.Conn, error) {
+	winner, conn, connectTime, err := raceStaggered(ctx, ordered, wg, firstStagger,
 		// Race dials go through dialTCP, which records a genuine dial failure
 		// as MarkFailed.
 		func(dialCtx context.Context, proxy C.Proxy) (C.Conn, int64, error) {
@@ -190,6 +193,11 @@ func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, doma
 		// onWinner: promote the winner to best proxy and mark the route
 		// probed.  The winner's latency is already sampled via onConnect.
 		func(proxy C.Proxy, connectTime int64) {
+			tag := smartStaggerTag
+			if bestName != "" && proxy.Name() == bestName {
+				tag = smartBestTag
+			}
+			log.Infoln("[Smart] route key=%s routed via %s (%dms, %s)", key, proxy.Name(), connectTime, tag)
 			s.routeTable.IncrementUseCount(key, domain, proxy.Name())
 			s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
 		},
@@ -203,8 +211,8 @@ func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, doma
 	return s.wrapTCPConn(conn, winner, metadata, connectTime), nil
 }
 
-func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.WaitGroup,
-	firstStagger time.Duration, pathTag string,
+func raceStaggered(ctx context.Context, ordered []C.Proxy, wg *sync.WaitGroup,
+	firstStagger time.Duration,
 	dial func(context.Context, C.Proxy) (C.Conn, int64, error),
 	onConnect func(proxyName string, connectTime int64),
 	onFail func(proxy C.Proxy, err error),
@@ -228,10 +236,6 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 	results := make(chan dialResult, len(ordered))
 	var workers sync.WaitGroup
 	launched, received := 0, 0
-	// successes counts successful results observed before the winner, so the
-	// routed log can tell whether the winner was the 1st, 2nd, … successful
-	// connection (not dial) on this path.
-	successes := 0
 	// firstFailed: the first candidate (best) failed inside its head-start
 	// window — collapse it and dial the next candidate immediately.
 	firstFailed := false
@@ -306,8 +310,6 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 		case result := <-results:
 			received++
 			if result.err == nil {
-				successes++
-				log.Infoln("[Smart] route key=%s routed via %s (%dms, %s)", key, result.proxy.Name(), result.connectTime, successTag(pathTag, successes))
 				onConnect(result.proxy.Name(), result.connectTime)
 				if onWinner != nil {
 					onWinner(result.proxy, result.connectTime)
@@ -331,7 +333,8 @@ func raceStaggered(ctx context.Context, key string, ordered []C.Proxy, wg *sync.
 				return nil, nil, 0, result.err
 			}
 			// Collapse the head-start if the first candidate (best) failed
-			// early, so fallback starts immediately instead of at 600ms.
+			// early, so fallback starts immediately instead of waiting for the
+			// full exclusive window.
 			if !firstFailed && result.proxy == ordered[0] && next < len(ordered) {
 				firstFailed = true
 				if timer != nil {
@@ -588,13 +591,6 @@ func orderByNamesFrom(names []string, byName map[string]C.Proxy) []C.Proxy {
 		}
 	}
 	return out
-}
-
-// successTag renders the per-path winner tag for the routed log: "Best" for
-// the best-first fast path, or "Discovery#N" / "Stagger#N" where N is the
-// winner's ordinal among successful connections on that path.
-func successTag(pathTag string, n int) string {
-	return fmt.Sprintf("%s#%d", pathTag, n)
 }
 
 func median(vals []float64) float64 {

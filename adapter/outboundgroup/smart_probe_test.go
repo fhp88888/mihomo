@@ -305,7 +305,7 @@ func TestRaceAndWrap_FirstSuccessCancelsLosers(t *testing.T) {
 	}, 1)
 	go func() {
 		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com",
-			[]C.Proxy{first, second, third}, smartTCPFallbackStagger, nil, "Stagger")
+			[]C.Proxy{first, second, third}, smartTCPFallbackStagger, nil, "")
 		result <- struct {
 			conn C.Conn
 			err  error
@@ -376,7 +376,7 @@ func TestRaceAndWrap_ClosesLateSuccessfulLoser(t *testing.T) {
 	}, 1)
 	go func() {
 		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com",
-			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "Stagger")
+			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "")
 		result <- struct {
 			conn C.Conn
 			err  error
@@ -451,7 +451,7 @@ func TestRaceAndWrap_FatalErrorStopsScheduling(t *testing.T) {
 	table.SetBestProxy(key, "example.com", first.Name())
 	s := &Smart{testUrl: "test", routeTable: table}
 	_, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com",
-		[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "Stagger")
+		[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "")
 	if !errors.Is(err, resolver.ErrIPNotFound) || !tunnel.ShouldStopRetry(err) {
 		t.Fatalf("fatal error = %v, want ErrIPNotFound", err)
 	}
@@ -489,7 +489,7 @@ func TestRaceAndWrap_ParentCancellationStopsScheduling(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		_, err := s.raceAndWrap(ctx, &C.Metadata{Host: "example.com"}, key, "example.com",
-			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "Stagger")
+			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "")
 		result <- err
 	}()
 
@@ -1146,7 +1146,7 @@ func TestBestFirstRace_BestFailEarlyStartsFallbackImmediately(t *testing.T) {
 // collectLogs subscribes to log events; waitForLog polls until a log with the
 // given prefix arrives or the deadline elapses.  waitAbsentLog polls for the
 // absence of a prefix (used to assert a proxy was never dialed).
-func collectLogs() (waitForLog func(prefix string, timeout time.Duration) bool, stop func()) {
+func collectLogs() (waitForLog func(timeout time.Duration, parts ...string) bool, stop func()) {
 	sub := log.Subscribe()
 	var mu sync.Mutex
 	var logs []string
@@ -1159,20 +1159,27 @@ func collectLogs() (waitForLog func(prefix string, timeout time.Duration) bool, 
 		}
 		close(done)
 	}()
-	contains := func(prefix string) bool {
+	contains := func(parts ...string) bool {
 		mu.Lock()
 		defer mu.Unlock()
 		for _, l := range logs {
-			if strings.Contains(l, prefix) {
+			matches := true
+			for _, part := range parts {
+				if !strings.Contains(l, part) {
+					matches = false
+					break
+				}
+			}
+			if matches {
 				return true
 			}
 		}
 		return false
 	}
-	waitForLog = func(prefix string, timeout time.Duration) bool {
+	waitForLog = func(timeout time.Duration, parts ...string) bool {
 		deadline := time.After(timeout)
 		for {
-			if contains(prefix) {
+			if contains(parts...) {
 				return true
 			}
 			select {
@@ -1211,11 +1218,76 @@ func TestSmartPolicy_LogSequence_BestWinsWithinWindow(t *testing.T) {
 	}
 	_ = conn.Close()
 
-	if !waitForLog("routed via best", time.Second) {
-		t.Fatal("best not marked winner")
+	if !waitForLog(time.Second, "routed via best", ", Best)") {
+		t.Fatal("best winner did not use the Best tag")
 	}
-	if waitForLog("routed via other", 200*time.Millisecond) {
+	if waitForLog(50*time.Millisecond, "Best#") {
+		t.Fatal("best winner used a numbered Best tag")
+	}
+	if waitForLog(200*time.Millisecond, "routed via other") {
 		t.Fatal("other dialed despite best winning")
+	}
+}
+
+// TestSmartPolicy_LogSequence_BestWinsAfterFallbackStarts verifies that the
+// log describes the winning connection, not merely the phase currently active.
+func TestSmartPolicy_LogSequence_BestWinsAfterFallbackStarts(t *testing.T) {
+	const key = "TARGET:example.com"
+	waitForLog, stop := collectLogs()
+	defer stop()
+
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	bestStarted := make(chan struct{})
+	bestUnblock := make(chan struct{})
+	best := blockingProxy("best", bestUnblock, &stubConn{}, bestStarted)
+	secondStarted := make(chan struct{})
+	secondUnblock := make(chan struct{})
+	second := blockingProxy("second", secondUnblock, &stubConn{}, secondStarted)
+	rt.SetBestProxy(key, "example.com", "best")
+
+	result := make(chan struct {
+		conn C.Conn
+		err  error
+	}, 1)
+	go func() {
+		conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, second})
+		result <- struct {
+			conn C.Conn
+			err  error
+		}{conn: conn, err: err}
+	}()
+
+	select {
+	case <-secondStarted:
+		// The exclusive window elapsed and the fallback is now in flight.
+	case <-time.After(2 * smartBestExclusiveWindow):
+		t.Fatal("fallback did not start after the best exclusive window")
+	}
+	close(bestUnblock)
+
+	var got struct {
+		conn C.Conn
+		err  error
+	}
+	select {
+	case got = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("best did not win after fallback started")
+	}
+	if got.err != nil || got.conn == nil {
+		t.Fatalf("serialTcpConn = (%v, %v), want best connection", got.conn, got.err)
+	}
+	close(secondUnblock)
+	pc.wg.Wait()
+	_ = got.conn.Close()
+
+	if !waitForLog(time.Second, "routed via best", ", Best)") {
+		t.Fatal("late best winner did not use the Best tag")
+	}
+	if waitForLog(50*time.Millisecond, "routed via best", "Best#") {
+		t.Fatal("late best winner used a numbered Best tag")
 	}
 }
 
@@ -1246,8 +1318,8 @@ func TestSmartPolicy_LogSequence_StaleBestFallsBackToRace(t *testing.T) {
 	pc.wg.Wait() // let the background drain settle
 	_ = conn.Close()
 
-	if !waitForLog("routed via second", time.Second) {
-		t.Fatal("second never dialed in fallback race")
+	if !waitForLog(time.Second, "routed via second", ", Stagger#1)") {
+		t.Fatal("fallback winner did not use the Stagger#1 tag")
 	}
 }
 
@@ -1277,10 +1349,38 @@ func TestSmartPolicy_LogSequence_BestFailsEarlyStartsFallbackImmediately(t *test
 	pc.wg.Wait()
 	_ = conn.Close()
 
-	if !waitForLog("dial best failed", time.Second) {
+	if !waitForLog(time.Second, "dial best failed") {
 		t.Fatal("best failure not logged")
 	}
-	if !waitForLog("routed via second", time.Second) {
-		t.Fatal("second not marked winner")
+	if !waitForLog(time.Second, "routed via second", ", Stagger#1)") {
+		t.Fatal("fallback winner did not use the Stagger#1 tag")
+	}
+}
+
+func TestSmartPolicy_LogSequence_DiscoveryWinner(t *testing.T) {
+	const key = "TARGET:example.com"
+	waitForLog, stop := collectLogs()
+	defer stop()
+
+	pc := NewProbeCoordinator()
+	defer pc.Close()
+	rt := smart.NewRouteTable(10)
+	winner := &stubProxy{name: "discovery", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return &stubConn{}, nil
+	}}
+
+	result := pc.probeBatch(context.Background(), key, []C.Proxy{winner},
+		&C.Metadata{Host: "example.com"}, []string{winner.Name()},
+		func(ctx context.Context, p C.Proxy, metadata *C.Metadata, _ time.Time) (C.Conn, int64, error) {
+			conn, err := p.DialContext(ctx, metadata)
+			return conn, 1, err
+		}, rt)
+	if result.err != nil || result.conn == nil {
+		t.Fatalf("probeBatch = (%v, %v), want discovery connection", result.conn, result.err)
+	}
+	_ = result.conn.Close()
+
+	if !waitForLog(time.Second, "routed via discovery", ", Discovery#1)") {
+		t.Fatal("discovery winner did not preserve the Discovery#1 tag")
 	}
 }

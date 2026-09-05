@@ -215,7 +215,7 @@ func (pc *ProbeCoordinator) probeBatch(
 		var failMu sync.Mutex
 		var fatalErr error
 
-		winner, conn, connectTime, err := raceStaggered(ctx, key, batch, &pc.wg, smartTCPFallbackStagger, "Discovery",
+		winner, conn, connectTime, err := raceStaggered(ctx, batch, &pc.wg, smartTCPFallbackStagger,
 			// Discovery dials use the caller's raw dial (no MarkFailed inside —
 			// probeBatch classifies node-level vs fatal itself).
 			func(dialCtx context.Context, p C.Proxy) (C.Conn, int64, error) {
@@ -251,9 +251,11 @@ func (pc *ProbeCoordinator) probeBatch(
 				}
 				rt.MarkFailed(key, p.Name(), routeDomain(metadata), 1.0)
 			},
-			// onWinner: probeBatch does its own winner bookkeeping via the
-			// returned winner, so nothing to do here.
-			nil,
+			// onWinner: discovery has no distinguished first candidate; every
+			// winner belongs to the discovery race.
+			func(proxy C.Proxy, connectTime int64) {
+				log.Infoln("[Smart] route key=%s routed via %s (%dms, %s)", key, proxy.Name(), connectTime, smartDiscoveryTag)
+			},
 		)
 
 		if err == nil && conn != nil {
