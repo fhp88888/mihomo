@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand"
 	"net/netip"
 	"path/filepath"
 	"strconv"
@@ -59,7 +61,7 @@ type Smart struct {
 	proxyAggMu sync.RWMutex
 	proxyAgg   smart.ProxyAggregation
 
-	// Policy priority (retained for compatibility)
+	// Policy priority biases candidate ordering without changing raw metrics.
 	policyPriority []priorityRule
 	priorityCache  xsync.Map[string, float64]
 	sampleRate     float64
@@ -83,6 +85,9 @@ func getConfigFilename() string {
 }
 
 func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C.Proxy, providers []provider.ProxyProvider) (*Smart, error) {
+	if smartOption.SampleRate != 0 && (smartOption.SampleRate <= 0 || smartOption.SampleRate > 1 || math.IsNaN(smartOption.SampleRate)) {
+		return nil, fmt.Errorf("sample-rate must be in (0, 1], or 0 for the default 1")
+	}
 	if option.URL == "" {
 		option.URL = C.DefaultTestURL
 	}
@@ -294,7 +299,7 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 		return proxies[0]
 	}
 	s.routeTable.RefreshScores(key, domain, names)
-	ranked := s.routeTable.RankByScore(names, s.lastDelayOf(proxies), key, domain)
+	ranked := s.routeTable.RankByScore(names, s.lastDelayOf(proxies), key, domain, s.getPriorityFactor)
 
 	for _, name := range ranked {
 		for _, p := range proxies {
@@ -696,7 +701,7 @@ func applyPolicyPriority(s *Smart, policyPriority string) {
 	unescapePattern := func(p string) string {
 		var b strings.Builder
 		for i := 0; i < len(p); i++ {
-			if p[i] == '\\' && i+1 < len(p) {
+			if p[i] == '\\' && i+1 < len(p) && p[i+1] == ':' {
 				b.WriteByte(p[i+1])
 				i++
 			} else {
@@ -727,7 +732,7 @@ func applyPolicyPriority(s *Smart, policyPriority string) {
 			log.Warnln("[Smart] Invalid priority factor format for pattern [%s:%v]", patternRaw, err)
 			continue
 		}
-		if factor <= 0 {
+		if factor <= 0 || math.IsNaN(factor) || math.IsInf(factor, 0) {
 			log.Warnln("[Smart] Invalid priority factor [%.2f] for pattern [%s], factor must be positive", factor, patternRaw)
 			continue
 		}
@@ -800,4 +805,10 @@ func (s *Smart) getASNCode(metadata *C.Metadata) string {
 		return metadata.DstIPASN[:idx]
 	}
 	return metadata.DstIPASN
+}
+
+// sampleConnection selects passive telemetry once per connection. Zero retains
+// the historical default (full sampling); routing and failures are never sampled.
+func (s *Smart) sampleConnection() bool {
+	return s.sampleRate <= 0 || s.sampleRate >= 1 || rand.Float64() < s.sampleRate
 }

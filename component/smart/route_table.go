@@ -573,12 +573,23 @@ func (rt *RouteTable) IncrementUseCount(key, domain, proxy string) {
 	rt.touchLRU(key)
 }
 
+// priorityFactor leaves raw measurements untouched; policy only affects ordering.
+func priorityFactor(priority []func(string) float64, name string) float64 {
+	if len(priority) > 0 && priority[0] != nil {
+		factor := priority[0](name)
+		if factor > 0 && !math.IsNaN(factor) && !math.IsInf(factor, 0) {
+			return factor
+		}
+	}
+	return 1
+}
+
 // PreRankLatency sorts proxies by latency.  When key is non-empty only that
 // key's domain samples are used (falling back to healthCheckLatency),
 // preventing the first target's winner from biasing later probes via
 // cross-domain aggregation.  key == "" preserves the legacy cross-row,
 // cross-domain mean.  Sort is stable.
-func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(string) uint16, key, domain string) []string {
+func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(string) uint16, key, domain string, priority ...func(string) float64) []string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
@@ -616,6 +627,9 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 			copy(result, proxies)
 			rand.Shuffle(len(result), func(i, j int) {
 				result[i], result[j] = result[j], result[i]
+			})
+			sort.SliceStable(result, func(i, j int) bool {
+				return priorityFactor(priority, result[i]) > priorityFactor(priority, result[j])
 			})
 			return result
 		}
@@ -655,7 +669,7 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 	result := make([]string, len(proxies))
 	copy(result, proxies)
 	sort.SliceStable(result, func(i, j int) bool {
-		return meanLatency[result[i]] < meanLatency[result[j]]
+		return meanLatency[result[i]]/priorityFactor(priority, result[i]) < meanLatency[result[j]]/priorityFactor(priority, result[j])
 	})
 
 	return result
@@ -673,7 +687,7 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 //
 // With no TTFB sample at all (cold start for this domain) it falls back to
 // latency-derived scores as before.
-func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(string) uint16, key, domain string) []string {
+func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(string) uint16, key, domain string, priority ...func(string) float64) []string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
@@ -723,7 +737,7 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 		if cell != nil && cell.HasTTFBSample {
 			cands = append(cands, candidate{
 				name:  proxy,
-				score: calculateScore(cell.TTFB, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeKB),
+				score: calculateScore(cell.TTFB, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeKB) * priorityFactor(priority, proxy),
 				ttfb:  true,
 			})
 			continue
@@ -754,7 +768,7 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 
 		cands = append(cands, candidate{
 			name:  proxy,
-			score: calculateScore(latency, speed, pkgLoss, failedCount, jitter, connSizeKB),
+			score: calculateScore(latency, speed, pkgLoss, failedCount, jitter, connSizeKB) * priorityFactor(priority, proxy),
 			ttfb:  false,
 		})
 	}
