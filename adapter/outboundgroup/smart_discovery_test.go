@@ -3,12 +3,37 @@ package outboundgroup
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/metacubex/mihomo/component/smart"
 	C "github.com/metacubex/mihomo/constant"
 )
+
+type manualDeadlineContext struct {
+	done    chan struct{}
+	expired atomic.Bool
+}
+
+func newManualDeadlineContext() *manualDeadlineContext {
+	return &manualDeadlineContext{done: make(chan struct{})}
+}
+
+func (c *manualDeadlineContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *manualDeadlineContext) Done() <-chan struct{}       { return c.done }
+func (c *manualDeadlineContext) Err() error {
+	if c.expired.Load() {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+func (c *manualDeadlineContext) Value(any) any { return nil }
+func (c *manualDeadlineContext) expire() {
+	if c.expired.CompareAndSwap(false, true) {
+		close(c.done)
+	}
+}
 
 func TestDiscoverSeparatesDomains(t *testing.T) {
 	pc := NewProbeCoordinator()
@@ -123,5 +148,151 @@ func TestDiscoverFollowerRecordsOwnLatency(t *testing.T) {
 				t.Fatalf("latency = %d, want %d", actual, wantLatency)
 			}
 		})
+	}
+}
+
+func TestDiscoverFollowerCallerDeadlineIsNotNodeFailure(t *testing.T) {
+	pc := NewProbeCoordinator()
+	defer pc.Close()
+	rt := smart.NewRouteTable(10)
+	const key = "TARGET:deadline.example.com"
+	metadata := &C.Metadata{Host: "deadline.example.com"}
+	domain := routeDomain(metadata)
+	proxies := makeStubProxies("leader", "alternative")
+	ds := &discoveryState{done: make(chan struct{}), proxy: proxies[0], leaderCancel: func() {}}
+	close(ds.done)
+	pc.discoveries[discoveryKey{routeKey: key, domain: domain}] = ds
+	rt.UpdateLatency(key, domain, "leader", 100)
+
+	ctx := newManualDeadlineContext()
+	dialStarted := make(chan struct{})
+	discoverDone := make(chan error, 1)
+	calls := 0
+	go func() {
+		_, _, _, err := pc.Discover(ctx, key, proxies, metadata, []string{"alternative"},
+			func(ctx context.Context, _ C.Proxy, _ *C.Metadata, _ time.Time) (C.Conn, int64, error) {
+				calls++
+				close(dialStarted)
+				<-ctx.Done()
+				return nil, 1, ctx.Err()
+			}, rt)
+		discoverDone <- err
+	}()
+	select {
+	case <-dialStarted:
+	case <-time.After(time.Second):
+		t.Fatal("follower redial did not start")
+	}
+	ctx.expire()
+	var err error
+	select {
+	case err = <-discoverDone:
+	case <-time.After(time.Second):
+		t.Fatal("follower did not return after deadline")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want caller deadline", err)
+	}
+	if calls != 1 {
+		t.Fatalf("dial calls = %d, want no fallback after caller deadline", calls)
+	}
+	if failed := rt.ProxyFailedCount(key, domain, "leader"); failed != 0 {
+		t.Fatalf("caller deadline counted as node failure: %v", failed)
+	}
+}
+
+func TestDiscoverFollowerFallbackIsClosedWithCoordinator(t *testing.T) {
+	pc := NewProbeCoordinator()
+	rt := smart.NewRouteTable(10)
+	const key = "TARGET:close.example.com"
+	metadata := &C.Metadata{Host: "close.example.com"}
+	domain := routeDomain(metadata)
+	proxies := makeStubProxies("leader", "alternative")
+	ds := &discoveryState{done: make(chan struct{}), proxy: proxies[0], leaderCancel: func() {}}
+	close(ds.done)
+	pc.discoveries[discoveryKey{routeKey: key, domain: domain}] = ds
+	rt.UpdateLatency(key, domain, "leader", 100)
+
+	fallbackStarted := make(chan struct{})
+	discoverDone := make(chan error, 1)
+	go func() {
+		_, _, _, err := pc.Discover(context.Background(), key, proxies, metadata, []string{"alternative"},
+			func(ctx context.Context, p C.Proxy, _ *C.Metadata, _ time.Time) (C.Conn, int64, error) {
+				if p == proxies[0] {
+					return nil, 1, errors.New("leader redial failed")
+				}
+				close(fallbackStarted)
+				<-ctx.Done()
+				return nil, 1, ctx.Err()
+			}, rt)
+		discoverDone <- err
+	}()
+
+	select {
+	case <-fallbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("follower fallback did not start")
+	}
+	if err := pc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-discoverDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("follower error = %v, want coordinator cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("follower did not return after Close canceled its fallback")
+	}
+}
+
+func TestDiscoverFollowerFallbackDeadlineIsNotNodeFailure(t *testing.T) {
+	pc := NewProbeCoordinator()
+	defer pc.Close()
+	rt := smart.NewRouteTable(10)
+	const key = "TARGET:fallback-deadline.example.com"
+	metadata := &C.Metadata{Host: "fallback-deadline.example.com"}
+	domain := routeDomain(metadata)
+	proxies := makeStubProxies("leader", "alternative")
+	ds := &discoveryState{done: make(chan struct{}), proxy: proxies[0], leaderCancel: func() {}}
+	close(ds.done)
+	pc.discoveries[discoveryKey{routeKey: key, domain: domain}] = ds
+	rt.UpdateLatency(key, domain, "leader", 100)
+
+	ctx := newManualDeadlineContext()
+	fallbackStarted := make(chan struct{})
+	discoverDone := make(chan error, 1)
+	go func() {
+		_, _, _, err := pc.Discover(ctx, key, proxies, metadata, []string{"alternative"},
+			func(ctx context.Context, p C.Proxy, _ *C.Metadata, _ time.Time) (C.Conn, int64, error) {
+				if p == proxies[0] {
+					return nil, 1, errors.New("leader redial failed")
+				}
+				close(fallbackStarted)
+				<-ctx.Done()
+				return nil, 1, ctx.Err()
+			}, rt)
+		discoverDone <- err
+	}()
+	select {
+	case <-fallbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("follower fallback did not start")
+	}
+	ctx.expire()
+	var err error
+	select {
+	case err = <-discoverDone:
+	case <-time.After(time.Second):
+		t.Fatal("follower fallback did not return after deadline")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want caller deadline", err)
+	}
+	if failed := rt.ProxyFailedCount(key, domain, "leader"); failed != 1 {
+		t.Fatalf("leader node failure = %v, want 1", failed)
+	}
+	if failed := rt.ProxyFailedCount(key, domain, "alternative"); failed != 0 {
+		t.Fatalf("fallback caller deadline counted as node failure: %v", failed)
 	}
 }

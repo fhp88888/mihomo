@@ -573,23 +573,12 @@ func (rt *RouteTable) IncrementUseCount(key, domain, proxy string) {
 	rt.touchLRU(key)
 }
 
-// priorityFactor leaves raw measurements untouched; policy only affects ordering.
-func priorityFactor(priority []func(string) float64, name string) float64 {
-	if len(priority) > 0 && priority[0] != nil {
-		factor := priority[0](name)
-		if factor > 0 && !math.IsNaN(factor) && !math.IsInf(factor, 0) {
-			return factor
-		}
-	}
-	return 1
-}
-
 // PreRankLatency sorts proxies by latency.  When key is non-empty only that
 // key's domain samples are used (falling back to healthCheckLatency),
 // preventing the first target's winner from biasing later probes via
 // cross-domain aggregation.  key == "" preserves the legacy cross-row,
 // cross-domain mean.  Sort is stable.
-func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(string) uint16, key, domain string, priority ...func(string) float64) []string {
+func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(string) uint16, key, domain string) []string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
@@ -627,9 +616,6 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 			copy(result, proxies)
 			rand.Shuffle(len(result), func(i, j int) {
 				result[i], result[j] = result[j], result[i]
-			})
-			sort.SliceStable(result, func(i, j int) bool {
-				return priorityFactor(priority, result[i]) > priorityFactor(priority, result[j])
 			})
 			return result
 		}
@@ -669,7 +655,7 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 	result := make([]string, len(proxies))
 	copy(result, proxies)
 	sort.SliceStable(result, func(i, j int) bool {
-		return meanLatency[result[i]]/priorityFactor(priority, result[i]) < meanLatency[result[j]]/priorityFactor(priority, result[j])
+		return meanLatency[result[i]] < meanLatency[result[j]]
 	})
 
 	return result
@@ -686,10 +672,8 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 //     the rest are ranked after the TTFB group by latency-derived score.
 //
 // With no TTFB sample at all (cold start for this domain) it falls back to
-// latency-derived scores as before. An active priority factor is applied to
-// pruning and compares weighted scores across the two groups, so an explicit
-// policy cannot be hidden behind the TTFB tier boundary.
-func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(string) uint16, key, domain string, priority ...func(string) float64) []string {
+// latency-derived scores as before.
+func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(string) uint16, key, domain string) []string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
@@ -726,7 +710,6 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 		ttfb  bool
 	}
 	cands := make([]candidate, 0, len(proxies))
-	priorityActive := false
 
 	for _, proxy := range proxies {
 		var cell *proxyCell
@@ -738,11 +721,9 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 
 		// TTFB group: rank by a score whose response-time term is TTFB.
 		if cell != nil && cell.HasTTFBSample {
-			factor := priorityFactor(priority, proxy)
-			priorityActive = priorityActive || factor != 1
 			cands = append(cands, candidate{
 				name:  proxy,
-				score: calculateScore(cell.TTFB, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeKB) * factor,
+				score: calculateScore(cell.TTFB, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeKB),
 				ttfb:  true,
 			})
 			continue
@@ -767,33 +748,27 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 
 		// Once any proxy has a TTFB sample, a proxy whose latency already
 		// exceeds the known minimum first-byte time cannot win — skip it.
-		factor := priorityFactor(priority, proxy)
-		priorityActive = priorityActive || factor != 1
-		if hasTTFB && float64(latency)/factor > float64(minTTFB) {
+		if hasTTFB && latency > minTTFB {
 			continue
 		}
 
 		cands = append(cands, candidate{
 			name:  proxy,
-			score: calculateScore(latency, speed, pkgLoss, failedCount, jitter, connSizeKB) * factor,
+			score: calculateScore(latency, speed, pkgLoss, failedCount, jitter, connSizeKB),
 			ttfb:  false,
 		})
 	}
 
 	sort.SliceStable(cands, func(i, j int) bool {
-		// Preserve the established TTFB-first tiers when no policy changes a
-		// candidate. Once a policy is active, compare the weighted scores across
-		// tiers so an explicit preference cannot be neutralized merely because a
-		// node has not collected its first TTFB sample yet.
-		if !priorityActive && cands[i].ttfb != cands[j].ttfb {
+		if cands[i].ttfb != cands[j].ttfb {
 			return cands[i].ttfb // TTFB group first
 		}
 		return cands[i].score > cands[j].score
 	})
 
-	// Only the top MaxTTFBProxiesPerRank TTFB proxies survive. Without a
-	// priority policy the TTFB group is first; with one, weighted latency-only
-	// candidates may be interleaved while the TTFB cap is still enforced.
+	// Only the top MaxTTFBProxiesPerRank TTFB proxies survive. The sort put
+	// the TTFB group first (score-descending), so skipping past the first N
+	// TTFB candidates keeps exactly the highest-scored TTFB proxies.
 	result := make([]string, 0, len(cands))
 	ttfbKept := 0
 	for _, c := range cands {

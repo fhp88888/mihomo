@@ -77,9 +77,22 @@ func (pc *ProbeCoordinator) Discover(
 
 	ds, exists := pc.discoveries[discoveryID]
 	if exists {
-		// Follower path: wait for leader
+		// Register the complete follower lifetime while holding pc.mu. Close
+		// takes the same lock before Wait, so the counter cannot reach zero and
+		// then be incremented by a late follower fallback.
+		pc.wg.Add(1)
 		done := ds.done
 		pc.mu.Unlock()
+		defer pc.wg.Done()
+
+		// A follower is owned by both its caller and the coordinator. This keeps
+		// its re-dial and any fallback discovery cancellable during Smart.Close.
+		followerCtx, cancelFollower := context.WithCancel(ctx)
+		stopCoordinatorCancel := context.AfterFunc(pc.ctx, cancelFollower)
+		defer func() {
+			stopCoordinatorCancel()
+			cancelFollower()
+		}()
 
 		select {
 		case <-done:
@@ -90,7 +103,7 @@ func (pc *ProbeCoordinator) Discover(
 			if p != nil && e == nil {
 				// Follower gets a NEW connection to the same proxy
 				start := time.Now()
-				newConn, connectTime, dialErr := singleDial(ctx, p, metadata, start)
+				newConn, connectTime, dialErr := singleDial(followerCtx, p, metadata, start)
 				if dialErr == nil {
 					rt.UpdateLatency(key, domain, p.Name(), connectTime)
 					return p, newConn, connectTime, nil
@@ -100,6 +113,9 @@ func (pc *ProbeCoordinator) Discover(
 				// still fail because of a transient node error or a concurrency
 				// limit. Penalize node-level failures and continue discovery with
 				// the remaining candidates instead of failing the request outright.
+				if err := followerCtx.Err(); err != nil {
+					return nil, nil, 0, err
+				}
 				if tunnel.ShouldStopRetry(dialErr) || errors.Is(dialErr, context.Canceled) {
 					return nil, nil, 0, dialErr
 				}
@@ -114,12 +130,12 @@ func (pc *ProbeCoordinator) Discover(
 				if len(remainingNames) == 0 {
 					return nil, nil, 0, dialErr
 				}
-				fallback := pc.probeBatch(ctx, key, proxies, metadata, remainingNames, singleDial, rt)
+				fallback := pc.probeBatch(followerCtx, key, proxies, metadata, remainingNames, singleDial, rt)
 				return fallback.proxy, fallback.conn, fallback.connectTime, fallback.err
 			}
 			return nil, nil, 0, e
-		case <-ctx.Done():
-			return nil, nil, 0, ctx.Err()
+		case <-followerCtx.Done():
+			return nil, nil, 0, followerCtx.Err()
 		}
 	}
 
@@ -216,6 +232,12 @@ func (pc *ProbeCoordinator) probeBatch(
 			// with node-level errors are penalized (MarkFailed 1.0); fatal
 			// target-level errors and cancellations are not the proxy's fault.
 			func(p C.Proxy, dialErr error) {
+				// The parent request or coordinator may have expired while a dial
+				// result was becoming ready. Check the parent first so a select race
+				// cannot turn caller cancellation/deadline into a node penalty.
+				if ctx.Err() != nil {
+					return
+				}
 				if tunnel.ShouldStopRetry(dialErr) {
 					failMu.Lock()
 					if fatalErr == nil {

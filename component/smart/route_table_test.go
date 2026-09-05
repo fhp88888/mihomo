@@ -482,7 +482,7 @@ func TestRankByScoreLatencyGroupAfterTTFBGroup(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	// proxy-a has TTFB=50; proxy-b has no TTFB but latency=20 (<= minTTFB*2,
+	// proxy-a has TTFB=50; proxy-b has no TTFB but latency=20 (<= minTTFB,
 	// so it survives the prune even though its raw latency is lower).
 	rt.UpdateTTFB(key, testDomain, "proxy-a", 50)
 	rt.UpdateLatency(key, testDomain, "proxy-b", 20)
@@ -523,7 +523,7 @@ func TestRankByScoreCapsTTFBGroup(t *testing.T) {
 	for i, name := range []string{"proxy-a", "proxy-b", "proxy-c", "proxy-d", "proxy-e", "proxy-f"} {
 		rt.UpdateTTFB(key, testDomain, name, int64(50+10*i))
 	}
-	// A latency-only proxy with latency*2 <= minTTFB so it survives the prune.
+	// A latency-only proxy with latency <= minTTFB so it survives the prune.
 	rt.UpdateLatency(key, testDomain, "proxy-nottfb", 20)
 
 	proxies := []string{"proxy-f", "proxy-e", "proxy-d", "proxy-c", "proxy-b", "proxy-a", "proxy-nottfb"}

@@ -14,9 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dlclark/regexp2"
 	"github.com/metacubex/mihomo/common/utils"
-	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/mmdb"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
@@ -33,7 +31,7 @@ const (
 )
 
 type SmartOption struct {
-	PolicyPriority string  `group:"policy-priority,omitempty"`
+	PolicyPriority string  `group:"policy-priority,omitempty"` // retained for config compatibility; intentionally ignored
 	UseLightGBM    bool    `group:"uselightgbm,omitempty"`
 	CollectData    bool    `group:"collectdata,omitempty"`
 	SampleRate     float64 `group:"sample-rate,omitempty"`
@@ -61,20 +59,10 @@ type Smart struct {
 	proxyAggMu sync.RWMutex
 	proxyAgg   smart.ProxyAggregation
 
-	// Policy priority biases candidate ordering without changing raw metrics.
-	policyPriority []priorityRule
-	priorityCache  xsync.Map[string, float64]
-	sampleRate     float64
-	useLightGBM    bool // retained for config parsing, no-op in new impl
-	collectData    bool // retained for config parsing, no-op in new impl
-	preferASN      bool
-}
-
-type priorityRule struct {
-	pattern string
-	regex   *regexp2.Regexp
-	factor  float64
-	isRegex bool
+	sampleRate  float64
+	useLightGBM bool // retained for config parsing, no-op in new impl
+	collectData bool // retained for config parsing, no-op in new impl
+	preferASN   bool
 }
 
 func getConfigFilename() string {
@@ -114,7 +102,6 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		expectedStatus:   option.ExpectedStatus,
 		configName:       configName,
 		disableUDP:       option.DisableUDP,
-		policyPriority:   make([]priorityRule, 0),
 		sampleRate:       1,
 		useLightGBM:      smartOption.UseLightGBM,
 		collectData:      smartOption.CollectData,
@@ -125,10 +112,6 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 
 	if smartOption.SampleRate > 0 && smartOption.SampleRate <= 1 {
 		s.sampleRate = smartOption.SampleRate
-	}
-
-	if smartOption.PolicyPriority != "" {
-		applyPolicyPriority(s, smartOption.PolicyPriority)
 	}
 
 	// Restore persisted route table cells from the database.
@@ -299,7 +282,7 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 		return proxies[0]
 	}
 	s.routeTable.RefreshScores(key, domain, names)
-	ranked := s.routeTable.RankByScore(names, s.lastDelayOf(proxies), key, domain, s.getPriorityFactor)
+	ranked := s.routeTable.RankByScore(names, s.lastDelayOf(proxies), key, domain)
 
 	for _, name := range ranked {
 		for _, p := range proxies {
@@ -371,14 +354,6 @@ func (s *Smart) MarshalJSON() ([]byte, error) {
 		all[i] = proxy.Name()
 	}
 
-	var policyPriorityBuf strings.Builder
-	for i, rule := range s.policyPriority {
-		if i > 0 {
-			policyPriorityBuf.WriteByte(';')
-		}
-		fmt.Fprintf(&policyPriorityBuf, "%s:%.2f", rule.pattern, rule.factor)
-	}
-
 	return json.Marshal(map[string]any{
 		"type":            s.Type().String(),
 		"now":             s.Now(),
@@ -389,7 +364,7 @@ func (s *Smart) MarshalJSON() ([]byte, error) {
 		"hidden":          s.Hidden(),
 		"icon":            s.Icon(),
 		"emptyFallback":   s.EmptyFallback().Name(),
-		"policy-priority": policyPriorityBuf.String(),
+		"policy-priority": "",
 		"useLightGBM":     s.useLightGBM,
 		"collectData":     s.collectData,
 		"sampleRate":      s.sampleRate,
@@ -653,102 +628,6 @@ func (s *Smart) StatusTest(proxy C.Proxy, host string) (uint16, bool, error) {
 func randInt63() int64 {
 	// Simple fast random for URL cache-busting
 	return time.Now().UnixNano()
-}
-
-// ── Policy priority ─────────────────────────────────────────
-
-func (s *Smart) getPriorityFactor(proxyName string) float64 {
-	if len(s.policyPriority) == 0 {
-		return 1.0
-	}
-	if v, ok := s.priorityCache.Load(proxyName); ok {
-		return v
-	}
-	factor := 1.0
-	for _, rule := range s.policyPriority {
-		if rule.isRegex && rule.regex != nil {
-			if matched, _ := rule.regex.MatchString(proxyName); matched {
-				factor = rule.factor
-				break
-			}
-		} else if strings.Contains(proxyName, rule.pattern) {
-			factor = rule.factor
-			break
-		}
-	}
-	s.priorityCache.Store(proxyName, factor)
-	return factor
-}
-
-func applyPolicyPriority(s *Smart, policyPriority string) {
-	lastUnescapedColon := func(str string) int {
-		for i := len(str) - 1; i >= 0; i-- {
-			if str[i] == ':' {
-				bs := 0
-				j := i - 1
-				for j >= 0 && str[j] == '\\' {
-					bs++
-					j--
-				}
-				if bs%2 == 0 {
-					return i
-				}
-			}
-		}
-		return -1
-	}
-
-	unescapePattern := func(p string) string {
-		var b strings.Builder
-		for i := 0; i < len(p); i++ {
-			if p[i] == '\\' && i+1 < len(p) && p[i+1] == ':' {
-				b.WriteByte(p[i+1])
-				i++
-			} else {
-				b.WriteByte(p[i])
-			}
-		}
-		return b.String()
-	}
-
-	pairs := strings.Split(policyPriority, ";")
-	for _, pair := range pairs {
-		pair = strings.TrimSpace(pair)
-		if pair == "" {
-			continue
-		}
-
-		idx := lastUnescapedColon(pair)
-		if idx <= 0 || idx == len(pair)-1 {
-			log.Warnln("[Smart] Invalid policy-priority rule: [%s], must be in 'pattern:factor' format and factor is required", pair)
-			continue
-		}
-
-		patternRaw := strings.TrimSpace(pair[:idx])
-		factorStr := strings.TrimSpace(pair[idx+1:])
-
-		factor, err := strconv.ParseFloat(factorStr, 64)
-		if err != nil {
-			log.Warnln("[Smart] Invalid priority factor format for pattern [%s:%v]", patternRaw, err)
-			continue
-		}
-		if factor <= 0 || math.IsNaN(factor) || math.IsInf(factor, 0) {
-			log.Warnln("[Smart] Invalid priority factor [%.2f] for pattern [%s], factor must be positive", factor, patternRaw)
-			continue
-		}
-
-		rule := priorityRule{
-			pattern: unescapePattern(patternRaw),
-			factor:  factor,
-		}
-
-		if re, err := regexp2.Compile(rule.pattern, regexp2.None); err == nil {
-			rule.regex = re
-			rule.isRegex = true
-		}
-
-		s.policyPriority = append(s.policyPriority, rule)
-	}
 }
 
 // ── ASN resolution ──────────────────────────────────────────

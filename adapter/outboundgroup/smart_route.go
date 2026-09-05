@@ -157,7 +157,7 @@ func (s *Smart) rankCandidates(key, domain string, proxies []C.Proxy, best C.Pro
 			return p.LastDelayForTestUrl(s.testUrl)
 		}
 		return 0xffff
-	}, key, domain, s.getPriorityFactor)
+	}, key, domain)
 
 	if best != nil {
 		return append([]C.Proxy{best}, orderByNamesFrom(ranked, proxyMap)...)
@@ -470,7 +470,7 @@ func (s *Smart) exploreOrder(available []C.Proxy, proxies []C.Proxy, key, domain
 	attrs := s.routeTable.ProxyAttrsSnapshot()
 	if len(attrs) == 0 {
 		names := namesOf(available)
-		preRanked := s.routeTable.PreRankLatency(names, s.lastDelayOf(proxies), key, domain, s.getPriorityFactor)
+		preRanked := s.routeTable.PreRankLatency(names, s.lastDelayOf(proxies), key, domain)
 		return orderByNames(available, preRanked)
 	}
 
@@ -502,7 +502,7 @@ func (s *Smart) exploreOrder(available []C.Proxy, proxies []C.Proxy, key, domain
 		}
 		cands = append(cands, cand{
 			proxy:    p,
-			score:    score * s.getPriorityFactor(p.Name()),
+			score:    score,
 			deferred: deferred,
 		})
 	}
@@ -523,14 +523,13 @@ func (s *Smart) exploreOrder(available []C.Proxy, proxies []C.Proxy, key, domain
 	// in when the pool is bigger than exploreBatch — a small pool keeps its
 	// deterministic quality order.  Deferred proxies stay at the end — they are
 	// the last-resort tier and must not be pulled forward by the shuffle.
-	// Explicit policies keep their weighted order instead of being shuffled away.
 	nonDeferred := 0
 	for i := range cands {
 		if !cands[i].deferred {
 			nonDeferred++
 		}
 	}
-	if nonDeferred > exploreBatch && len(s.policyPriority) == 0 {
+	if nonDeferred > exploreBatch {
 		rand.Shuffle(exploreBatch, func(i, j int) {
 			cands[i], cands[j] = cands[j], cands[i]
 		})
@@ -811,7 +810,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	// TTFB must not gate UDP candidates, otherwise a row with any TCP TTFB
 	// sample could drop every UDP-capable proxy and leave none to try.
 	names := namesOf(udpProxies)
-	ranked := s.routeTable.PreRankLatency(names, s.lastDelayOf(proxies), key, domain, s.getPriorityFactor)
+	ranked := s.routeTable.PreRankLatency(names, s.lastDelayOf(proxies), key, domain)
 
 	ordered := orderByNames(udpProxies, ranked)
 
