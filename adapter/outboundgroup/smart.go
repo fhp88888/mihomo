@@ -651,11 +651,11 @@ func (s *Smart) getASNCode(metadata *C.Metadata) string {
 			var err error
 			ip, err = resolver.ResolveIP(ctx, metadata.Host)
 			if err != nil {
-				log.Debugln("[DNS] resolve %s error: %s", metadata.Host, err.Error())
+				log.Debugln("[Smart] DNS resolve %s error: %s", metadata.Host, err.Error())
 				metadata.DstIPASN = "0"
 				return ""
 			}
-			log.Debugln("[DNS] %s --> %s", metadata.Host, ip.String())
+			log.Debugln("[Smart] DNS %s --> %s", metadata.Host, ip.String())
 			if !ip.IsValid() {
 				metadata.DstIPASN = "0"
 				return ""

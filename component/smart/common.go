@@ -470,14 +470,14 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 		//    cycle or the final FlushQueue(true) on Close.
 		flushMutex.Lock()
 		if err := s.BatchSave(snapshot); err != nil {
-			log.Warnln("[SmartStore] Sync batch save failed, re-enqueuing %d operations: %v", len(snapshot), err)
+			log.Warnln("[Smart] Sync batch save failed, re-enqueuing %d operations: %v", len(snapshot), err)
 			// Merge old snapshot first, then current queue, so that newer
 			// values in the current queue override older snapshot values.
 			globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
 				return mergeOperations(snapshot, old)
 			})
 		} else {
-			log.Debugln("[SmartStore] Queue datas saved, operations: [%d]", len(snapshot))
+			log.Debugln("[Smart] Queue datas saved, operations: [%d]", len(snapshot))
 		}
 		flushMutex.Unlock()
 	}
@@ -597,10 +597,10 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 
 // 清空所有缓存
 func (s *Store) FlushAll() error {
-	log.Debugln("[SmartStore] Starting FlushAll, current queue length: %d", len(globalOperationQueue.Load()))
+	log.Debugln("[Smart] Starting FlushAll, current queue length: %d", len(globalOperationQueue.Load()))
 	err := s.FlushByLevel("all", "", "")
 	if err == nil {
-		log.Debugln("[SmartStore] All Smart data cleared")
+		log.Debugln("[Smart] All Smart data cleared")
 	}
 	return err
 }
@@ -609,7 +609,7 @@ func (s *Store) FlushAll() error {
 func (s *Store) FlushByConfig(config string) error {
 	err := s.FlushByLevel("config", config, "")
 	if err == nil {
-		log.Debugln("[SmartStore] All data for config [%s] cleared", config)
+		log.Debugln("[Smart] All data for config [%s] cleared", config)
 	}
 	return err
 }
@@ -617,7 +617,7 @@ func (s *Store) FlushByConfig(config string) error {
 func (s *Store) FlushByGroup(group, config string) error {
 	err := s.FlushByLevel("group", config, group)
 	if err == nil {
-		log.Debugln("[SmartStore] All data for group [%s] config [%s] cleared", group, config)
+		log.Debugln("[Smart] All data for group [%s] config [%s] cleared", group, config)
 	}
 	return err
 }

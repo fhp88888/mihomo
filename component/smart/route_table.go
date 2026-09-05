@@ -233,7 +233,7 @@ func (rt *RouteTable) getOrCreateRow(key string) *rowEntry {
 	}
 	rt.rows[key] = row
 	rt.lruOrder = append(rt.lruOrder, key)
-	log.Debugln("[smart] LRU create key=%s size=%d capacity=%d", key, len(rt.rows), rt.maxRows)
+	log.Debugln("[Smart] LRU create key=%s size=%d capacity=%d", key, len(rt.rows), rt.maxRows)
 	return row
 }
 
@@ -299,7 +299,7 @@ func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domai
 	cell := &domainCell{domainName: domain, connSize: 100, proxies: make(map[string]*proxyCell)}
 	row.domainTable[domain] = cell
 	row.domainOrder = append(row.domainOrder, domain)
-	log.Debugln("[smart] LRU create domain key=%s domain=%s size=%d capacity=%d", row.key, domain, len(row.domainTable), capacity)
+	log.Debugln("[Smart] LRU create domain key=%s domain=%s size=%d capacity=%d", row.key, domain, len(row.domainTable), capacity)
 	return cell
 }
 

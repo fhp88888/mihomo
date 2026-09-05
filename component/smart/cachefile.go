@@ -63,7 +63,7 @@ func (s *Store) BatchSave(operations []StoreOperation) error {
 	})
 
 	if err != nil {
-		log.Debugln("[SmartStore] Batch save operation failed: %v", err)
+		log.Debugln("[Smart] Batch save operation failed: %v", err)
 	}
 
 	return err
@@ -85,14 +85,14 @@ func (s *Store) FlushQueue(force bool) error {
 	defer flushMutex.Unlock()
 
 	if err := s.BatchSave(ops); err != nil {
-		log.Warnln("[SmartStore] FlushQueue failed, re-enqueuing %d operations: %v", len(ops), err)
+		log.Warnln("[Smart] FlushQueue failed, re-enqueuing %d operations: %v", len(ops), err)
 		// Re-enqueue: current queue values override the older snapshot.
 		globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
 			return mergeOperations(ops, old)
 		})
 		return err
 	}
-	log.Debugln("[SmartStore] Queue datas saved, operations: [%d]", len(ops))
+	log.Debugln("[Smart] Queue datas saved, operations: [%d]", len(ops))
 	return nil
 }
 

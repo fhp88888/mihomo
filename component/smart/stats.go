@@ -793,10 +793,10 @@ func (s *Store) GetActiveTargets(group, config string, limit int) []ActiveTarget
 
 // RunPrefetch 最佳节点预计算
 func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int {
-	log.Debugln("[SmartStore] Executing target and ASN pre-calculation for policy group [%s]", group)
+	log.Debugln("[Smart] Executing target and ASN pre-calculation for policy group [%s]", group)
 
 	if len(proxyMap) == 0 {
-		log.Debugln("[SmartStore] No available nodes for prefetch calculation in group [%s]", group)
+		log.Debugln("[Smart] No available nodes for prefetch calculation in group [%s]", group)
 		return 0
 	}
 
@@ -1000,22 +1000,22 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]bool) int 
 		}
 
 		if len(oldNodes) == 0 {
-			log.Debugln("[SmartStore] Prefetching for group [%s]: network: [%s] => target: [%s] => result: [%s] (no old result)",
+			log.Debugln("[Smart] Prefetching for group [%s]: network: [%s] => target: [%s] => result: [%s] (no old result)",
 				group, networkType, target, strings.Join(nodeWeightPairs, ", "))
 		} else if cacheHit {
-			log.Debugln("[SmartStore] Prefetching for group [%s]: network: [%s] => target: [%s] => result: [%s] (from cache)",
+			log.Debugln("[Smart] Prefetching for group [%s]: network: [%s] => target: [%s] => result: [%s] (from cache)",
 				group, networkType, target, strings.Join(nodeWeightPairs, ", "))
 		} else if needUpdate {
 			oldNodeWeightPairs := make([]string, len(oldNodes))
 			for i := range oldNodes {
 				oldNodeWeightPairs[i] = fmt.Sprintf("%s: %.2f", oldNodes[i], oldWeights[i])
 			}
-			log.Debugln("[SmartStore] Prefetching for group [%s]: network: [%s] => target: [%s] => result: [%s] (updated from old: [%s])",
+			log.Debugln("[Smart] Prefetching for group [%s]: network: [%s] => target: [%s] => result: [%s] (updated from old: [%s])",
 				group, networkType, target, strings.Join(nodeWeightPairs, ", "), strings.Join(oldNodeWeightPairs, ", "))
 		}
 	}
 
-	log.Infoln("[SmartStore] Prefetch completed for group [%s]: pre-calculated [%d] targets",
+	log.Infoln("[Smart] Prefetch completed for group [%s]: pre-calculated [%d] targets",
 		group, prefetchCount)
 	return prefetchCount
 }
@@ -1870,7 +1870,7 @@ func (s *Store) CleanupOldRecords(group, config string) {
 		}
 		if len(toDelete) > 0 {
 			if delErr := s.DBBatchDeletePrefix(toDelete, true); delErr != nil {
-				log.Debugln("[SmartStore] Failed to batch clean records for keyType [%s], group [%s]: %v", keyType, group, delErr)
+				log.Debugln("[Smart] Failed to batch clean records for keyType [%s], group [%s]: %v", keyType, group, delErr)
 				deleted = 0
 			}
 		}
@@ -1883,7 +1883,7 @@ func (s *Store) CleanupOldRecords(group, config string) {
 			} else if keyType == KeyTypeHostFailures {
 				hostStatusCache.RemoveByKeyPrefix(pathPrefix)
 			}
-			log.Debugln("[SmartStore] Cleaned up [%d] old [%s] records, group [%s] keeping [%d] valuable and recent data...",
+			log.Debugln("[Smart] Cleaned up [%d] old [%s] records, group [%s] keeping [%d] valuable and recent data...",
 				deleted, keyType, group, totalRecords - deleted)
 		}
 	}

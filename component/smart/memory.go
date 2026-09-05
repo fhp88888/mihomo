@@ -364,7 +364,7 @@ func (s *Store) AdjustCacheParameters() {
 		globalCacheParams.BatchSaveThreshold = MinBatchThreshLimit + int(float64(MaxBatchThreshLimit-MinBatchThreshLimit)*adjustFactor)
 	}
 
-	log.Infoln("[SmartStore] Parameters adjusted: MaxTargets=%d, BatchThreshold=%d",
+	log.Infoln("[Smart] Parameters adjusted: MaxTargets=%d, BatchThreshold=%d",
 		globalCacheParams.MaxTargets,
 		globalCacheParams.BatchSaveThreshold)
 
