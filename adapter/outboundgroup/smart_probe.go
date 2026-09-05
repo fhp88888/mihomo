@@ -91,11 +91,31 @@ func (pc *ProbeCoordinator) Discover(
 				// Follower gets a NEW connection to the same proxy
 				start := time.Now()
 				newConn, connectTime, dialErr := singleDial(ctx, p, metadata, start)
-				if dialErr != nil {
+				if dialErr == nil {
+					rt.UpdateLatency(key, domain, p.Name(), connectTime)
+					return p, newConn, connectTime, nil
+				}
+
+				// A winner is only a hint for followers: its next connection can
+				// still fail because of a transient node error or a concurrency
+				// limit. Penalize node-level failures and continue discovery with
+				// the remaining candidates instead of failing the request outright.
+				if tunnel.ShouldStopRetry(dialErr) || errors.Is(dialErr, context.Canceled) {
 					return nil, nil, 0, dialErr
 				}
-				rt.UpdateLatency(key, domain, p.Name(), connectTime)
-				return p, newConn, connectTime, nil
+				rt.MarkFailed(key, p.Name(), domain, 1.0)
+
+				remainingNames := make([]string, 0, len(preRanked))
+				for _, name := range preRanked {
+					if name != p.Name() {
+						remainingNames = append(remainingNames, name)
+					}
+				}
+				if len(remainingNames) == 0 {
+					return nil, nil, 0, dialErr
+				}
+				fallback := pc.probeBatch(ctx, key, proxies, metadata, remainingNames, singleDial, rt)
+				return fallback.proxy, fallback.conn, fallback.connectTime, fallback.err
 			}
 			return nil, nil, 0, e
 		case <-ctx.Done():

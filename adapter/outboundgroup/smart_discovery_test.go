@@ -77,28 +77,40 @@ func TestDiscoverFollowerRecordsOwnLatency(t *testing.T) {
 			pc.discoveries[discoveryKey{routeKey: key, domain: domain}] = ds
 			rt.UpdateLatency(key, domain, "leader", 100)
 			conn := &stubConn{}
+			fallbackConn := &stubConn{}
 			dialErr := errors.New("follower dial failed")
 			calls := 0
 			p, got, latency, err := pc.Discover(context.Background(), key, proxies, metadata, []string{"alternative"},
 				func(_ context.Context, p C.Proxy, m *C.Metadata, _ time.Time) (C.Conn, int64, error) {
 					calls++
-					if p != proxies[0] || m != metadata {
-						t.Fatal("follower did not dial leader proxy with its own metadata")
+					if m != metadata {
+						t.Fatal("follower did not dial with its own metadata")
 					}
-					if fail {
+					if fail && p == proxies[0] {
 						return nil, 300, dialErr
+					}
+					if p == proxies[1] {
+						return fallbackConn, 80, nil
 					}
 					return conn, 300, nil
 				}, rt)
-			if calls != 1 {
-				t.Fatalf("dial calls = %d, want 1", calls)
+			wantCalls := 1
+			if fail {
+				wantCalls = 2
+			}
+			if calls != wantCalls {
+				t.Fatalf("dial calls = %d, want %d", calls, wantCalls)
 			}
 			wantLatency := int64(150) // 100*0.75 + 300*0.25, exactly one new sample.
 			if fail {
 				wantLatency = 100
-				if !errors.Is(err, dialErr) || got != nil {
-					t.Fatalf("unexpected failure result: %v %v", got, err)
+				if err != nil || p != proxies[1] || got != fallbackConn || latency != 80 {
+					t.Fatalf("follower did not fall back: proxy=%v conn=%v latency=%d err=%v", p, got, latency, err)
 				}
+				if failed := rt.ProxyFailedCount(key, domain, "leader"); failed != 1 {
+					t.Fatalf("leader failure not recorded: %v", failed)
+				}
+				got.Close()
 			} else {
 				if err != nil || p != proxies[0] || got != conn || latency != 300 {
 					t.Fatalf("unexpected follower result: %v %v %d %v", p, got, latency, err)

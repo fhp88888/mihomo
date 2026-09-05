@@ -226,21 +226,21 @@ func TestCalculateScore(t *testing.T) {
 }
 
 func TestCalculateScoreSkipsSpeedForSmallConnSize(t *testing.T) {
-	// For a domain whose connections are smaller than 32kB, the speed term must
+	// For a domain whose connections are smaller than 4kB, the speed term must
 	// be skipped, leaving only the latency (+penalty) components.
 	latencyOnly := 100.0 / (100.0 + 10.0) // latency=100, jitter=0 -> 100/110
 	withSpeed := latencyOnly + math.Log1p(10485760.0/1024.0/1024.0/0.5)
 
-	// connSize below the 32kB threshold: speed skipped.
-	if got := calculateScore(100, 10485760, 0, 0, 0, 31.0); math.Abs(got-latencyOnly) > 0.000001 {
+	// connSize below the 4kB threshold: speed skipped.
+	if got := calculateScore(100, 10485760, 0, 0, 0, 3.0); math.Abs(got-latencyOnly) > 0.000001 {
 		t.Fatalf("small connSize: expected %.6f (speed skipped), got %.6f", latencyOnly, got)
 	}
-	// connSize exactly at the threshold (32kB): speed included.
-	if got := calculateScore(100, 10485760, 0, 0, 0, 32.0); math.Abs(got-withSpeed) > 0.000001 {
+	// connSize exactly at the threshold (4kB): speed included.
+	if got := calculateScore(100, 10485760, 0, 0, 0, 4.0); math.Abs(got-withSpeed) > 0.000001 {
 		t.Fatalf("connSize at threshold: expected %.6f (speed included), got %.6f", withSpeed, got)
 	}
 	// connSize above the threshold: speed included.
-	if got := calculateScore(100, 10485760, 0, 0, 0, 33.0); math.Abs(got-withSpeed) > 0.000001 {
+	if got := calculateScore(100, 10485760, 0, 0, 0, 5.0); math.Abs(got-withSpeed) > 0.000001 {
 		t.Fatalf("large connSize: expected %.6f (speed included), got %.6f", withSpeed, got)
 	}
 	// connSize unknown sentinel: speed included (domain-less callers).
@@ -460,21 +460,20 @@ func TestRankByScoreSkipsProxiesSlowerThanMinTTFB(t *testing.T) {
 
 	// proxy-a establishes minTTFB=50.
 	rt.UpdateTTFB(key, testDomain, "proxy-a", 50)
-	// proxy-b has no TTFB and latency 200 -> 2*200 > 50 -> skipped.
+	// proxy-b has no TTFB and latency 200 > 50 -> skipped.
 	rt.UpdateLatency(key, testDomain, "proxy-b", 200)
-	// proxy-c has no TTFB and latency 20 -> 2*20 <= 50 -> kept.
+	// proxy-c has no TTFB and latency 20 <= 50 -> kept.
 	rt.UpdateLatency(key, testDomain, "proxy-c", 20)
-	// proxy-d has no TTFB and latency 40 -> 2*40 > 50 -> skipped (the current
-	// prune threshold is latency > minTTFB/2, so even latency < minTTFB is cut).
+	// proxy-d has no TTFB and latency 40 <= 50 -> kept.
 	rt.UpdateLatency(key, testDomain, "proxy-d", 40)
 
 	ranked := rt.RankByScore([]string{"proxy-b", "proxy-c", "proxy-d", "proxy-a"}, nil, key, testDomain)
 
-	if len(ranked) != 2 {
-		t.Fatalf("expected 2 proxies (proxy-b, proxy-d skipped), got %d: %v", len(ranked), ranked)
+	if len(ranked) != 3 {
+		t.Fatalf("expected 3 proxies (only proxy-b skipped), got %d: %v", len(ranked), ranked)
 	}
-	// TTFB group (proxy-a) first, then the latency group (proxy-c).
-	if ranked[0] != "proxy-a" || ranked[1] != "proxy-c" {
+	// TTFB group (proxy-a) first, then the latency group by score.
+	if ranked[0] != "proxy-a" || ranked[1] != "proxy-c" || ranked[2] != "proxy-d" {
 		t.Fatalf("unexpected order: %v", ranked)
 	}
 }
@@ -531,10 +530,10 @@ func TestRankByScoreCapsTTFBGroup(t *testing.T) {
 	ranked := rt.RankByScore(proxies, nil, key, testDomain)
 
 	if len(ranked) != MaxTTFBProxiesPerRank+1 {
-		t.Fatalf("expected %d proxies (4 TTFB + 1 latency), got %d: %v", MaxTTFBProxiesPerRank+1, len(ranked), ranked)
+		t.Fatalf("expected %d proxies (%d TTFB + 1 latency), got %d: %v", MaxTTFBProxiesPerRank+1, MaxTTFBProxiesPerRank, len(ranked), ranked)
 	}
-	// Only the 4 fastest TTFB proxies survive, score-descending.
-	expected := []string{"proxy-a", "proxy-b", "proxy-c", "proxy-d", "proxy-nottfb"}
+	// All 6 configured TTFB slots survive, score-descending.
+	expected := []string{"proxy-a", "proxy-b", "proxy-c", "proxy-d", "proxy-e", "proxy-f", "proxy-nottfb"}
 	for i := range expected {
 		if ranked[i] != expected[i] {
 			t.Fatalf("ranked[%d]: expected %s, got %s (full: %v)", i, expected[i], ranked[i], ranked)

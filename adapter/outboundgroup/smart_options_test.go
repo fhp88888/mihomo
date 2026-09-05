@@ -74,6 +74,21 @@ func TestSmartPriorityBeforeTTFBCap(t *testing.T) {
 	}
 }
 
+func TestSmartPriorityCrossesTTFBTierAndPrune(t *testing.T) {
+	rt := smart.NewRouteTable(10)
+	s := &Smart{routeTable: rt}
+	applyPolicyPriority(s, "preferred:3")
+
+	const key, domain = "key", "domain"
+	rt.UpdateTTFB(key, domain, "sampled", 100)
+	rt.UpdateLatency(key, domain, "preferred", 200)
+
+	got := rt.RankByScore([]string{"sampled", "preferred"}, nil, key, domain, s.getPriorityFactor)
+	if len(got) != 2 || got[0] != "preferred" {
+		t.Fatalf("priority was lost at TTFB tier/prune boundary: %v", got)
+	}
+}
+
 func TestSmartSampleRate(t *testing.T) {
 	for _, rate := range []float64{0, 1} {
 		s := &Smart{sampleRate: rate}
