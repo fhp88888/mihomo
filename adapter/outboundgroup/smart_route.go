@@ -458,9 +458,8 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key,
 		return nil, err
 	}
 
-	// Note: probeBatch already wrote the winner's connectTime to the route table
-	// (smart_probe.go:189). Do NOT write it again here — that would double-count
-	// the sample.
+	// Discover already recorded latency for the leader or follower connection.
+	// Do not write it again here, which would double-count the sample.
 	s.routeTable.IncrementUseCount(key, domain, proxy.Name())
 	s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
 

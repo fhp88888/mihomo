@@ -15,7 +15,12 @@ import (
 
 const topK = 15
 
-// discoveryState tracks an in-progress discovery for a route key.
+type discoveryKey struct {
+	routeKey string
+	domain   string
+}
+
+// discoveryState tracks an in-progress discovery for a route key and domain.
 type discoveryState struct {
 	mu           sync.Mutex
 	done         chan struct{}
@@ -26,11 +31,11 @@ type discoveryState struct {
 	leaderCancel context.CancelFunc
 }
 
-// ProbeCoordinator manages concurrent TCP discovery with per-route-key merging.
-// Only one discovery (leader) runs per route key; followers wait for the result.
+// ProbeCoordinator merges TCP discovery for the same route key and domain.
+// Only one leader runs per pair; followers wait for its result.
 type ProbeCoordinator struct {
 	mu          sync.Mutex
-	discoveries map[string]*discoveryState
+	discoveries map[discoveryKey]*discoveryState
 	closed      bool
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -41,14 +46,14 @@ type ProbeCoordinator struct {
 func NewProbeCoordinator() *ProbeCoordinator {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &ProbeCoordinator{
-		discoveries: make(map[string]*discoveryState),
+		discoveries: make(map[discoveryKey]*discoveryState),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
 }
 
-// Discover runs a discovery for the given route key. If another goroutine is
-// already discovering this key, the caller waits for that result. Otherwise,
+// Discover runs a discovery for the given route key and normalized domain.
+// If another goroutine is discovering that pair, the caller waits. Otherwise,
 // this goroutine becomes the leader and probes the top-K proxies concurrently,
 // returning the first successful connection.
 func (pc *ProbeCoordinator) Discover(
@@ -60,6 +65,8 @@ func (pc *ProbeCoordinator) Discover(
 	singleDial func(context.Context, C.Proxy, *C.Metadata, time.Time) (C.Conn, int64, error),
 	rt *smart.RouteTable,
 ) (C.Proxy, C.Conn, int64, error) {
+	domain := routeDomain(metadata)
+	discoveryID := discoveryKey{routeKey: key, domain: domain}
 
 	// Check if we should join an existing discovery
 	pc.mu.Lock()
@@ -68,7 +75,7 @@ func (pc *ProbeCoordinator) Discover(
 		return nil, nil, 0, errors.New("probe coordinator closed")
 	}
 
-	ds, exists := pc.discoveries[key]
+	ds, exists := pc.discoveries[discoveryID]
 	if exists {
 		// Follower path: wait for leader
 		done := ds.done
@@ -87,6 +94,7 @@ func (pc *ProbeCoordinator) Discover(
 				if dialErr != nil {
 					return nil, nil, 0, dialErr
 				}
+				rt.UpdateLatency(key, domain, p.Name(), connectTime)
 				return p, newConn, connectTime, nil
 			}
 			return nil, nil, 0, e
@@ -102,7 +110,7 @@ func (pc *ProbeCoordinator) Discover(
 		leaderCtx:    leaderCtx,
 		leaderCancel: leaderCancel,
 	}
-	pc.discoveries[key] = ds
+	pc.discoveries[discoveryID] = ds
 	pc.wg.Add(1)
 	pc.mu.Unlock()
 
@@ -111,7 +119,7 @@ func (pc *ProbeCoordinator) Discover(
 		// in-flight loser dials keep sampling their connectTime after the winner
 		// returns.  leaderCtx is only canceled by Close().
 		pc.mu.Lock()
-		delete(pc.discoveries, key)
+		delete(pc.discoveries, discoveryID)
 		pc.mu.Unlock()
 		close(ds.done)
 		pc.wg.Done()
