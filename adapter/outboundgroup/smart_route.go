@@ -3,6 +3,7 @@ package outboundgroup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
@@ -40,10 +41,8 @@ const (
 	// the end of discovery.
 	highLossThreshold = 0.1
 	// rediscoverEvery is the fast-path skip rate: 1 in N requests re-discovers.
-	rediscoverEvery   = 25
-	smartBestTag      = "Best"
-	smartStaggerTag   = "Stagger#1"
-	smartDiscoveryTag = "Discovery#1"
+	rediscoverEvery = 25
+	smartBestTag    = "Best"
 )
 
 // routeKey returns the route table key for a connection's metadata:
@@ -193,10 +192,7 @@ func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, doma
 		// onWinner: promote the winner to best proxy and mark the route
 		// probed.  The winner's latency is already sampled via onConnect.
 		func(proxy C.Proxy, connectTime int64) {
-			tag := smartStaggerTag
-			if bestName != "" && proxy.Name() == bestName {
-				tag = smartBestTag
-			}
+			tag := staggerTag(ordered, proxy.Name(), bestName)
 			log.Infoln("[Smart] route key=%s routed via %s (%dms, %s)", key, proxy.Name(), connectTime, tag)
 			s.routeTable.IncrementUseCount(key, domain, proxy.Name())
 			s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
@@ -209,6 +205,26 @@ func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, doma
 		return nil, nil
 	}
 	return s.wrapTCPConn(conn, winner, metadata, connectTime), nil
+}
+
+// staggerTag identifies the winner by its position in this race. When a best
+// proxy is present it is named Best and excluded from the stagger numbering;
+// otherwise numbering starts at the first candidate.
+func staggerTag(ordered []C.Proxy, winnerName, bestName string) string {
+	if bestName != "" && winnerName == bestName {
+		return smartBestTag
+	}
+	ordinal := 0
+	for _, proxy := range ordered {
+		if bestName != "" && proxy.Name() == bestName {
+			continue
+		}
+		ordinal++
+		if proxy.Name() == winnerName {
+			return fmt.Sprintf("Stagger#%d", ordinal)
+		}
+	}
+	return "Stagger#unknown"
 }
 
 func raceStaggered(ctx context.Context, ordered []C.Proxy, wg *sync.WaitGroup,

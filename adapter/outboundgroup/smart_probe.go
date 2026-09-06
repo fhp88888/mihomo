@@ -198,6 +198,10 @@ func (pc *ProbeCoordinator) probeBatch(
 	}
 
 	n := len(preRanked)
+	discoveryOrdinal := make(map[string]int, len(preRanked))
+	for i, name := range preRanked {
+		discoveryOrdinal[name] = i + 1
+	}
 	for offset := 0; offset < n; {
 		// Take up to topK proxies from the current offset
 		batch := make([]C.Proxy, 0, topK)
@@ -254,7 +258,8 @@ func (pc *ProbeCoordinator) probeBatch(
 			// onWinner: discovery has no distinguished first candidate; every
 			// winner belongs to the discovery race.
 			func(proxy C.Proxy, connectTime int64) {
-				log.Infoln("[Smart] route key=%s routed via %s (%dms, %s)", key, proxy.Name(), connectTime, smartDiscoveryTag)
+				log.Infoln("[Smart] route key=%s routed via %s (%dms, Discovery#%d)",
+					key, proxy.Name(), connectTime, discoveryOrdinal[proxy.Name()])
 			},
 		)
 

@@ -1384,3 +1384,28 @@ func TestSmartPolicy_LogSequence_DiscoveryWinner(t *testing.T) {
 		t.Fatal("discovery winner did not preserve the Discovery#1 tag")
 	}
 }
+
+func TestStaggerTagUsesCandidateOrder(t *testing.T) {
+	best := &stubProxy{name: "best"}
+	first := &stubProxy{name: "first"}
+	second := &stubProxy{name: "second"}
+	ordered := []C.Proxy{best, first, second}
+
+	if got := staggerTag(ordered, "best", "best"); got != "Best" {
+		t.Fatalf("best tag = %q, want Best", got)
+	}
+	if got := staggerTag(ordered, "first", "best"); got != "Stagger#1" {
+		t.Fatalf("first fallback tag = %q, want Stagger#1", got)
+	}
+	if got := staggerTag(ordered, "second", "best"); got != "Stagger#2" {
+		t.Fatalf("second fallback tag = %q, want Stagger#2", got)
+	}
+
+	staggerOnly := []C.Proxy{first, second}
+	if got := staggerTag(staggerOnly, "first", ""); got != "Stagger#1" {
+		t.Fatalf("first stagger-only tag = %q, want Stagger#1", got)
+	}
+	if got := staggerTag(staggerOnly, "second", ""); got != "Stagger#2" {
+		t.Fatalf("second stagger-only tag = %q, want Stagger#2", got)
+	}
+}
