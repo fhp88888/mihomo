@@ -52,6 +52,29 @@ func NewProbeCoordinator() *ProbeCoordinator {
 	}
 }
 
+// TrackRace registers a non-discovery race before it can create asynchronous
+// loser-drain work. Registration and the closed check share pc.mu with Close,
+// so Wait can never overtake a later WaitGroup.Add. The returned context is
+// canceled by either the caller or the coordinator.
+func (pc *ProbeCoordinator) TrackRace(ctx context.Context) (context.Context, func(), error) {
+	pc.mu.Lock()
+	if pc.closed {
+		pc.mu.Unlock()
+		return nil, nil, errors.New("probe coordinator closed")
+	}
+	pc.wg.Add(1)
+	pc.mu.Unlock()
+
+	raceCtx, cancel := context.WithCancel(ctx)
+	stopCoordinatorCancel := context.AfterFunc(pc.ctx, cancel)
+	done := func() {
+		stopCoordinatorCancel()
+		cancel()
+		pc.wg.Done()
+	}
+	return raceCtx, done, nil
+}
+
 // Discover runs a discovery for the given route key and normalized domain.
 // If another goroutine is discovering that pair, the caller waits. Otherwise,
 // this goroutine becomes the leader and probes the top-K proxies concurrently,

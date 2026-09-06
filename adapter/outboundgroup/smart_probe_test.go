@@ -28,6 +28,13 @@ type stubProxy struct {
 	dial  func(context.Context, *C.Metadata) (C.Conn, error)
 }
 
+type nilPacketProxy struct{ *stubProxy }
+
+func (p *nilPacketProxy) SupportUDP() bool { return true }
+func (p *nilPacketProxy) ListenPacketContext(context.Context, *C.Metadata) (C.PacketConn, error) {
+	return nil, nil
+}
+
 func (s *stubProxy) Name() string              { return s.name }
 func (s *stubProxy) Type() C.AdapterType       { return C.Direct }
 func (s *stubProxy) Addr() string              { return "" }
@@ -1407,5 +1414,63 @@ func TestStaggerTagUsesCandidateOrder(t *testing.T) {
 	}
 	if got := staggerTag(staggerOnly, "second", ""); got != "Stagger#2" {
 		t.Fatalf("second stagger-only tag = %q, want Stagger#2", got)
+	}
+}
+
+func TestRaceStaggeredRejectsNilConnectionWinner(t *testing.T) {
+	proxy := &stubProxy{name: "nil-winner"}
+	failed := false
+	winner, conn, _, err := raceStaggered(context.Background(), []C.Proxy{proxy}, nil, 0,
+		func(context.Context, C.Proxy) (C.Conn, int64, error) { return nil, 1, nil },
+		func(string, int64) { t.Fatal("nil connection was recorded as connected") },
+		func(C.Proxy, error) { failed = true },
+		func(C.Proxy, int64) { t.Fatal("nil connection was selected as winner") },
+	)
+	if err != nil || winner != nil || conn != nil {
+		t.Fatalf("race result = (%v, %v, %v), want no winner and no fatal error", winner, conn, err)
+	}
+	if !failed {
+		t.Fatal("nil connection result did not enter failure handling")
+	}
+}
+
+func TestRawDialPathsRejectNilConnections(t *testing.T) {
+	rt := smart.NewRouteTable(10)
+	s := &Smart{testUrl: "test", routeTable: rt}
+	metadata := &C.Metadata{Host: "example.com"}
+	key, domain := routeKey(metadata), routeDomain(metadata)
+
+	tcpProxy := &stubProxy{name: "nil-tcp", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return nil, nil
+	}}
+	if conn, _, err := s.dialTCP(context.Background(), tcpProxy, metadata, key); err == nil || conn != nil {
+		t.Fatalf("dialTCP = (%v, %v), want nil connection and explicit error", conn, err)
+	}
+
+	udpProxy := &nilPacketProxy{stubProxy: &stubProxy{name: "nil-udp"}}
+	if conn, err := s.dialUDPAndWrap(context.Background(), udpProxy, metadata, key, domain); err == nil || conn != nil {
+		t.Fatalf("dialUDPAndWrap = (%v, %v), want nil connection and explicit error", conn, err)
+	}
+	if best, ok := rt.GetUDPBestProxyIfFresh(key, domain, time.Minute); ok {
+		t.Fatalf("nil UDP connection was recorded as best %q", best)
+	}
+}
+
+func TestTCPRouteMissingManualSelectionReturnsError(t *testing.T) {
+	available := &stubProxy{name: "automatic-fallback"}
+	base := NewGroupBase(GroupBaseOption{Name: "smart", Type: C.Smart})
+	base.providerProxies = []C.Proxy{available}
+	s := &Smart{
+		GroupBase:        base,
+		selected:         "removed-fixed-proxy",
+		testUrl:          "test",
+		routeTable:       smart.NewRouteTable(10),
+		probeCoordinator: NewProbeCoordinator(),
+	}
+	defer s.probeCoordinator.Close()
+
+	conn, err := s.tcpRoute(context.Background(), &C.Metadata{Host: "example.com"})
+	if err == nil || conn != nil {
+		t.Fatalf("tcpRoute = (%v, %v), want explicit missing-selection error", conn, err)
 	}
 }

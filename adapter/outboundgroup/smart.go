@@ -132,6 +132,43 @@ func (s *Smart) restoreRouteTable(rt *smart.RouteTable, configName string) {
 		return
 	}
 
+	// Restore row metadata first. Besides routing state, its domain map is the
+	// authoritative live set after LRU eviction; route-cell records are
+	// append/update based and may still contain domains evicted in a prior run.
+	rawRows, rowErr := store.LoadRouteRows(configName, s.Name())
+	rowMeta := make(map[string]smart.PersistedRow, len(rawRows))
+	var liveRows map[string]struct{}
+	if rowErr == nil {
+		if data, ok := rawRows[smart.RouteTableMetaKey]; ok {
+			var tableMeta smart.PersistedTable
+			if json.Unmarshal(data, &tableMeta) == nil {
+				liveRows = make(map[string]struct{}, len(tableMeta.Rows))
+				for _, key := range tableMeta.Rows {
+					liveRows[key] = struct{}{}
+				}
+			}
+			delete(rawRows, smart.RouteTableMetaKey)
+		}
+		for key, data := range rawRows {
+			if liveRows != nil {
+				if _, live := liveRows[key]; !live {
+					continue
+				}
+			}
+			var pr smart.PersistedRow
+			if json.Unmarshal(data, &pr) != nil {
+				continue
+			}
+			rowMeta[key] = pr
+			rt.RestoreRowMeta(key, pr)
+		}
+		if len(rowMeta) > 0 {
+			log.Infoln("[Smart] Restored %d route rows (best proxy) for group [%s]", len(rowMeta), s.Name())
+		}
+	} else {
+		log.Debugln("[Smart] No persisted route rows for group [%s]: %v", s.Name(), rowErr)
+	}
+
 	rawCells, err := store.LoadRouteCells(configName, s.Name())
 	if err != nil {
 		log.Debugln("[Smart] No persisted route data for group [%s]: %v", s.Name(), err)
@@ -163,6 +200,9 @@ func (s *Smart) restoreRouteTable(rt *smart.RouteTable, configName string) {
 			}
 			key := rest[:secondSlash]
 			domain := rest[secondSlash+1:]
+			if !shouldRestoreRouteCell(liveRows, rowMeta, key, domain) {
+				continue
+			}
 			rt.RestoreRow(key, domain, proxy, pc)
 			loaded++
 		}
@@ -171,25 +211,20 @@ func (s *Smart) restoreRouteTable(rt *smart.RouteTable, configName string) {
 		}
 	}
 
-	// Restore per-row routing state so a known route can take the fast path
-	// immediately after restart instead of re-running full discovery.
-	rawRows, err := store.LoadRouteRows(configName, s.Name())
-	if err != nil {
-		log.Debugln("[Smart] No persisted route rows for group [%s]: %v", s.Name(), err)
-		return
-	}
-	rowLoaded := 0
-	for key, data := range rawRows {
-		var pr smart.PersistedRow
-		if json.Unmarshal(data, &pr) != nil {
-			continue
+}
+
+func shouldRestoreRouteCell(liveRows map[string]struct{}, rowMeta map[string]smart.PersistedRow, key, domain string) bool {
+	if liveRows != nil {
+		if _, live := liveRows[key]; !live {
+			return false
 		}
-		rt.RestoreRowMeta(key, pr)
-		rowLoaded++
 	}
-	if rowLoaded > 0 {
-		log.Infoln("[Smart] Restored %d route rows (best proxy) for group [%s]", rowLoaded, s.Name())
+	pr, ok := rowMeta[key]
+	if !ok || len(pr.Domains) == 0 {
+		return true
 	}
+	_, live := pr.Domains[domain]
+	return live
 }
 
 func (s *Smart) GetConfigFilename() string {
@@ -538,7 +573,8 @@ func (s *Smart) cleanupOrphanedNodeCache() {
 func (s *Smart) persistRouteTable() {
 	dirty := s.routeTable.SnapshotAndClearDirty()
 	dirtyRows := s.routeTable.SnapshotAndClearDirtyRows()
-	if len(dirty) == 0 && len(dirtyRows) == 0 {
+	tableMeta, tableDirty := s.routeTable.SnapshotAndClearTableMeta()
+	if len(dirty) == 0 && len(dirtyRows) == 0 && !tableDirty {
 		return
 	}
 
@@ -556,6 +592,12 @@ func (s *Smart) persistRouteTable() {
 		for routeKey := range dirtyRows {
 			s.routeTable.MarkRowDirty(routeKey)
 		}
+		// Rebuilding a row after an unavailable persistence attempt marks the
+		// table catalog dirty again on the next mutation. Preserve it explicitly
+		// here so a pure eviction is also retried.
+		if tableDirty {
+			s.routeTable.MarkTableDirty()
+		}
 		log.Infoln("[Smart] DB unavailable, re-marked %d dirty route cells and %d rows for group [%s]", len(dirty), len(dirtyRows), s.Name())
 		return
 	}
@@ -563,7 +605,7 @@ func (s *Smart) persistRouteTable() {
 	// Collect all operations into a single slice and append them in one call.
 	// AppendToGlobalQueue rebuilds the whole queue on every call, so enqueuing
 	// N operations one-by-one is O(N * queueLen); batching makes it one pass.
-	ops := make([]smart.StoreOperation, 0, len(dirty)+len(dirtyRows))
+	ops := make([]smart.StoreOperation, 0, len(dirty)+len(dirtyRows)+1)
 
 	for cellKey, pc := range dirty {
 		// cellKey format: {routeKey}\x00{domain}\x00{proxyName}
@@ -599,6 +641,18 @@ func (s *Smart) persistRouteTable() {
 			Target: routeKey,
 			Data:   data,
 		})
+	}
+
+	if tableDirty {
+		if data, err := json.Marshal(tableMeta); err == nil {
+			ops = append(ops, smart.StoreOperation{
+				Type:   smart.OpSaveRouteMeta,
+				Group:  s.Name(),
+				Config: s.configName,
+				Target: smart.RouteTableMetaKey,
+				Data:   data,
+			})
+		}
 	}
 
 	if len(ops) > 0 {

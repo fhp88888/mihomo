@@ -35,6 +35,27 @@ func TestSmartSampleRate(t *testing.T) {
 	}
 }
 
+func TestShouldRestoreRouteCellFiltersEvictedDomains(t *testing.T) {
+	meta := map[string]smart.PersistedRow{
+		"ASN:64512": {Domains: map[string]smart.PersistedDomain{
+			"live.example.com": {},
+		}},
+	}
+	liveRows := map[string]struct{}{"ASN:64512": {}}
+	if !shouldRestoreRouteCell(liveRows, meta, "ASN:64512", "live.example.com") {
+		t.Fatal("live domain was filtered during restore")
+	}
+	if shouldRestoreRouteCell(liveRows, meta, "ASN:64512", "evicted.example.com") {
+		t.Fatal("evicted domain was restored from a stale route-cell record")
+	}
+	if shouldRestoreRouteCell(liveRows, meta, "ASN:evicted", "old.example.com") {
+		t.Fatal("evicted row was restored from stale metadata")
+	}
+	if !shouldRestoreRouteCell(nil, meta, "TARGET:legacy.example.com", "legacy.example.com") {
+		t.Fatal("legacy row without metadata should remain restorable")
+	}
+}
+
 // Drive the actual read/close callbacks: unselected connections must still
 // penalize resets, while only selected connections contribute TTFB samples.
 func TestSmartSampledConnectionFeedback(t *testing.T) {

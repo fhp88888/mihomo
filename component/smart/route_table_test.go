@@ -576,26 +576,46 @@ func TestSetBestProxyAndTCPProbed(t *testing.T) {
 	}
 }
 
-func TestSetBestProxyPreserveTCPProbed(t *testing.T) {
+func TestTCPAndUDPBestAreIndependent(t *testing.T) {
 	rt := NewRouteTable(10)
 	key := "TARGET:example.com"
 
 	rt.SetBestProxyAndTCPProbed(key, testDomain, "tcp-proxy")
-	rt.SetBestProxyPreserveTCPProbed(key, testDomain, "udp-proxy")
+	rt.SetUDPBestProxy(key, testDomain, "udp-proxy")
 
 	best, ok := rt.GetBestProxy(key, testDomain)
-	if !ok || best != "udp-proxy" {
-		t.Fatalf("best proxy = %q, %v; want udp-proxy, true", best, ok)
+	if !ok || best != "tcp-proxy" {
+		t.Fatalf("TCP best proxy = %q, %v; want tcp-proxy, true", best, ok)
 	}
 	if !rt.IsTCPProbed(key, testDomain) {
-		t.Fatal("UDP best update cleared existing TCP-probed state")
+		t.Fatal("UDP best update cleared TCP-probed state")
+	}
+	udpBest, ok := rt.GetUDPBestProxyIfFresh(key, testDomain, time.Minute)
+	if !ok || udpBest != "udp-proxy" {
+		t.Fatalf("UDP best proxy = %q, %v; want udp-proxy, true", udpBest, ok)
 	}
 
-	// Preserving false is equally important: a UDP-only success must not claim
-	// that TCP discovery has happened.
-	rt.SetBestProxyPreserveTCPProbed("TARGET:new.example.com", "new.example.com", "udp-proxy")
+	rt.SetUDPBestProxy("TARGET:new.example.com", "new.example.com", "udp-proxy")
 	if rt.IsTCPProbed("TARGET:new.example.com", "new.example.com") {
 		t.Fatal("UDP-only best update incorrectly marked TCP as probed")
+	}
+}
+
+func TestTableMetaTracksLiveRowsAfterLRUEviction(t *testing.T) {
+	rt := NewRouteTable(2)
+	rt.SetBestProxy("ASN:1", testDomain, "p1")
+	rt.SetBestProxy("ASN:2", testDomain, "p2")
+	rt.SetBestProxy("ASN:3", testDomain, "p3")
+
+	meta, dirty := rt.SnapshotAndClearTableMeta()
+	if !dirty {
+		t.Fatal("row membership changes did not dirty table metadata")
+	}
+	if len(meta.Rows) != 2 || meta.Rows[0] != "ASN:2" || meta.Rows[1] != "ASN:3" {
+		t.Fatalf("live row catalog = %v, want [ASN:2 ASN:3]", meta.Rows)
+	}
+	if _, dirty = rt.SnapshotAndClearTableMeta(); dirty {
+		t.Fatal("unchanged table metadata remained dirty after snapshot")
 	}
 }
 
@@ -628,7 +648,7 @@ func TestGetBestProxyIfFresh(t *testing.T) {
 	}
 
 	rt.mu.Lock()
-	rt.rows[key].domainTable[testDomain].lastUsed = time.Now().Add(-21 * time.Second).Unix()
+	rt.rows[key].domainTable[testDomain].tcpLastUsed = time.Now().Add(-21 * time.Second).Unix()
 	rt.mu.Unlock()
 
 	if name, ok := rt.GetBestProxyIfFresh(key, testDomain, 20*time.Second); ok {

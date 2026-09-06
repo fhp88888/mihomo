@@ -14,6 +14,8 @@ import (
 
 const DefaultMaxRows = 200
 
+const RouteTableMetaKey = "__table__"
+
 // MaxDomainsPerNormalASRow caps the per-row domain table (LRU) for a normal
 // ASN or TARGET row: each tracks at most this many distinct effective domains
 // by connection size.
@@ -85,9 +87,12 @@ type rowEntry struct {
 // sibling domains in the same row.
 type domainCell struct {
 	domainName        string
-	bestProxy         string
+	tcpBestProxy      string
+	udpBestProxy      string
 	tcpProbed         bool
 	lastUsed          int64 // last time this domain's best was used; freshness window
+	tcpLastUsed       int64
+	udpLastUsed       int64
 	connSize          float64
 	hasConnSizeSample bool
 	proxies           map[string]*proxyCell
@@ -146,12 +151,13 @@ func hasDirtyCell(row *rowEntry) bool {
 
 // DomainSnapshot is a read-only copy of one domain's routing state for the REST API.
 type DomainSnapshot struct {
-	Name      string                 `json:"name"`
-	BestProxy string                 `json:"best_proxy"`
-	TCPProbed bool                   `json:"tcp_probed"`
-	LastUsed  int64                  `json:"last_used"`
-	ConnSize  float64                `json:"conn_size"`
-	Proxies   map[string]ProxyRecord `json:"proxies"`
+	Name         string                 `json:"name"`
+	BestProxy    string                 `json:"best_proxy"` // TCP best; retained for API compatibility
+	UDPBestProxy string                 `json:"udp_best_proxy"`
+	TCPProbed    bool                   `json:"tcp_probed"`
+	LastUsed     int64                  `json:"last_used"`
+	ConnSize     float64                `json:"conn_size"`
+	Proxies      map[string]ProxyRecord `json:"proxies"`
 }
 
 // RowSnapshot is a read-only copy of a row for the REST API.
@@ -185,6 +191,7 @@ type RouteTable struct {
 	// snapshot.  It is NOT part of calculateScore, which uses only the
 	// per-target (cell) view.  A missing proxy means "no aggregation yet".
 	proxyAttrs map[string]ProxyAttributes
+	tableDirty bool
 }
 
 // NewRouteTable creates a new RouteTable with the given capacity.
@@ -224,6 +231,7 @@ func (rt *RouteTable) getOrCreateRow(key string) *rowEntry {
 		evictKey := rt.lruOrder[evictIdx]
 		rt.lruOrder = append(rt.lruOrder[:evictIdx], rt.lruOrder[evictIdx+1:]...)
 		delete(rt.rows, evictKey)
+		rt.tableDirty = true
 	}
 
 	row = &rowEntry{
@@ -233,6 +241,7 @@ func (rt *RouteTable) getOrCreateRow(key string) *rowEntry {
 	}
 	rt.rows[key] = row
 	rt.lruOrder = append(rt.lruOrder, key)
+	rt.tableDirty = true
 	log.Debugln("[Smart] LRU create key=%s size=%d capacity=%d", key, len(rt.rows), rt.maxRows)
 	return row
 }
@@ -294,11 +303,13 @@ func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domai
 		evictKey := row.domainOrder[evictIdx]
 		row.domainOrder = append(row.domainOrder[:evictIdx], row.domainOrder[evictIdx+1:]...)
 		delete(row.domainTable, evictKey)
+		row.rowDirty = true
 	}
 
 	cell := &domainCell{domainName: domain, connSize: 100, proxies: make(map[string]*proxyCell)}
 	row.domainTable[domain] = cell
 	row.domainOrder = append(row.domainOrder, domain)
+	row.rowDirty = true
 	log.Debugln("[Smart] LRU create domain key=%s domain=%s size=%d capacity=%d", row.key, domain, len(row.domainTable), capacity)
 	return cell
 }
@@ -318,10 +329,10 @@ func (rt *RouteTable) GetBestProxy(key, domain string) (string, bool) {
 		return "", false
 	}
 	cell, ok := row.domainTable[domain]
-	if !ok || cell.bestProxy == "" {
+	if !ok || cell.tcpBestProxy == "" {
 		return "", false
 	}
-	return cell.bestProxy, true
+	return cell.tcpBestProxy, true
 }
 
 // GetBestProxyIfFresh returns the current best proxy for a route key's domain
@@ -334,13 +345,32 @@ func (rt *RouteTable) GetBestProxyIfFresh(key, domain string, maxAge time.Durati
 		return "", false
 	}
 	cell, ok := row.domainTable[domain]
-	if !ok || cell.bestProxy == "" {
+	if !ok || cell.tcpBestProxy == "" {
 		return "", false
 	}
-	if time.Since(time.Unix(cell.lastUsed, 0)) >= maxAge {
+	if time.Since(time.Unix(cell.tcpLastUsed, 0)) >= maxAge {
 		return "", false
 	}
-	return cell.bestProxy, true
+	return cell.tcpBestProxy, true
+}
+
+// GetUDPBestProxyIfFresh returns the current UDP best for a route key's domain
+// when it was used within maxAge.
+func (rt *RouteTable) GetUDPBestProxyIfFresh(key, domain string, maxAge time.Duration) (string, bool) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return "", false
+	}
+	cell, ok := row.domainTable[domain]
+	if !ok || cell.udpBestProxy == "" {
+		return "", false
+	}
+	if time.Since(time.Unix(cell.udpLastUsed, 0)) >= maxAge {
+		return "", false
+	}
+	return cell.udpBestProxy, true
 }
 
 // IsTCPProbed returns whether the route key's domain has completed TCP discovery.
@@ -360,10 +390,11 @@ func (rt *RouteTable) setDomainState(key, domain, proxy string, setBest, tcpProb
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateDomainCell(row, domain)
 	if setBest {
-		cell.bestProxy = proxy
+		cell.tcpBestProxy = proxy
 	}
 	cell.tcpProbed = tcpProbed
 	cell.lastUsed = time.Now().Unix()
+	cell.tcpLastUsed = cell.lastUsed
 	row.lastUsed = time.Now().Unix()
 	row.rowDirty = true
 	rt.touchDomainLRU(row, domain)
@@ -377,15 +408,19 @@ func (rt *RouteTable) SetBestProxy(key, domain, proxy string) {
 	rt.setDomainState(key, domain, proxy, true, false)
 }
 
-// SetBestProxyPreserveTCPProbed updates the best proxy without changing whether
-// TCP discovery has completed. UDP uses this because a successful packet
-// connection must not invalidate the TCP routing state for the same domain.
-func (rt *RouteTable) SetBestProxyPreserveTCPProbed(key, domain, proxy string) {
+// SetUDPBestProxy updates UDP routing state without modifying TCP best/probed.
+func (rt *RouteTable) SetUDPBestProxy(key, domain, proxy string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateDomainCell(row, domain)
-	rt.setDomainState(key, domain, proxy, true, cell.tcpProbed)
+	cell.udpBestProxy = proxy
+	cell.lastUsed = time.Now().Unix()
+	cell.udpLastUsed = cell.lastUsed
+	row.lastUsed = cell.lastUsed
+	row.rowDirty = true
+	rt.touchDomainLRU(row, domain)
+	rt.touchLRU(key)
 }
 
 // SetTCPProbed marks a route key's domain as having completed TCP discovery.
@@ -847,9 +882,28 @@ func (rt *RouteTable) MarkFailed(key, proxy, domain string, penalty float64) {
 	cell.FailedCount = math.Min(cell.FailedCount+penalty, maxFailedCount)
 	cell.Dirty = true
 
-	if dc.bestProxy == proxy {
-		dc.bestProxy = ""
+	if dc.tcpBestProxy == proxy {
+		dc.tcpBestProxy = ""
 		dc.tcpProbed = false
+		row.rowDirty = true
+	}
+}
+
+// MarkUDPFailed records the shared quality penalty and clears only UDP routing
+// state. A UDP failure must not invalidate a separately learned TCP best.
+func (rt *RouteTable) MarkUDPFailed(key, proxy, domain string, penalty float64) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return
+	}
+	dc := rt.getOrCreateDomainCell(row, domain)
+	cell := rt.getOrCreateCell(dc, proxy)
+	cell.FailedCount = math.Min(cell.FailedCount+penalty, maxFailedCount)
+	cell.Dirty = true
+	if dc.udpBestProxy == proxy {
+		dc.udpBestProxy = ""
 		row.rowDirty = true
 	}
 }
@@ -990,7 +1044,9 @@ func (rt *RouteTable) RestoreRow(key, domain, proxy string, pc PersistedCell) {
 // state (bestProxy, tcpProbed) plus its connection-size EMA so the connSize
 // gating in calculateScore survives a restart.
 type PersistedDomain struct {
-	BestProxy         string  `json:"best_proxy"`
+	BestProxy         string  `json:"best_proxy,omitempty"` // legacy and TCP best compatibility
+	TCPBestProxy      string  `json:"tcp_best_proxy,omitempty"`
+	UDPBestProxy      string  `json:"udp_best_proxy,omitempty"`
 	TCPProbed         bool    `json:"tcp_probed"`
 	ConnSize          float64 `json:"conn_size"`
 	HasConnSizeSample bool    `json:"has_conn_size_sample"`
@@ -1004,6 +1060,31 @@ type PersistedRow struct {
 	Domains   map[string]PersistedDomain `json:"domains,omitempty"`
 	BestProxy string                     `json:"best_proxy,omitempty"`
 	TCPProbed bool                       `json:"tcp_probed,omitempty"`
+}
+
+// PersistedTable identifies the authoritative live row set. Individual row
+// records are update-based and can outlive an in-memory LRU eviction.
+type PersistedTable struct {
+	Rows []string `json:"rows"`
+}
+
+// SnapshotAndClearTableMeta returns the current live row set when row
+// membership changed since the last snapshot.
+func (rt *RouteTable) SnapshotAndClearTableMeta() (PersistedTable, bool) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if !rt.tableDirty {
+		return PersistedTable{}, false
+	}
+	rows := append([]string(nil), rt.lruOrder...)
+	rt.tableDirty = false
+	return PersistedTable{Rows: rows}, true
+}
+
+func (rt *RouteTable) MarkTableDirty() {
+	rt.mu.Lock()
+	rt.tableDirty = true
+	rt.mu.Unlock()
 }
 
 // RestoreRowMeta restores a row's per-domain routing state (bestProxy,
@@ -1023,11 +1104,21 @@ func (rt *RouteTable) RestoreRowMeta(key string, pr PersistedRow) {
 	if len(pr.Domains) > 0 {
 		for domain, pd := range pr.Domains {
 			cell := rt.getOrCreateDomainCell(row, domain)
-			cell.bestProxy = pd.BestProxy
+			cell.tcpBestProxy = pd.TCPBestProxy
+			if cell.tcpBestProxy == "" {
+				cell.tcpBestProxy = pd.BestProxy
+			}
+			cell.udpBestProxy = pd.UDPBestProxy
 			cell.tcpProbed = pd.TCPProbed
 			cell.connSize = pd.ConnSize
 			cell.hasConnSizeSample = pd.HasConnSizeSample
 			cell.lastUsed = now
+			if cell.tcpBestProxy != "" {
+				cell.tcpLastUsed = now
+			}
+			if cell.udpBestProxy != "" {
+				cell.udpLastUsed = now
+			}
 		}
 	} else if pr.BestProxy != "" {
 		// Legacy row-level best: only a TARGET row can reconstruct its domain
@@ -1035,9 +1126,10 @@ func (rt *RouteTable) RestoreRowMeta(key string, pr PersistedRow) {
 		// re-learn per-domain on the next discovery.
 		if domain, ok := strings.CutPrefix(key, "TARGET:"); ok {
 			cell := rt.getOrCreateDomainCell(row, domain)
-			cell.bestProxy = pr.BestProxy
+			cell.tcpBestProxy = pr.BestProxy
 			cell.tcpProbed = pr.TCPProbed
 			cell.lastUsed = now
+			cell.tcpLastUsed = now
 		}
 	}
 
@@ -1059,7 +1151,9 @@ func (rt *RouteTable) SnapshotAndClearDirtyRows() map[string]PersistedRow {
 			domains := make(map[string]PersistedDomain, len(row.domainTable))
 			for domain, cell := range row.domainTable {
 				domains[domain] = PersistedDomain{
-					BestProxy:         cell.bestProxy,
+					BestProxy:         cell.tcpBestProxy,
+					TCPBestProxy:      cell.tcpBestProxy,
+					UDPBestProxy:      cell.udpBestProxy,
 					TCPProbed:         cell.tcpProbed,
 					ConnSize:          cell.connSize,
 					HasConnSizeSample: cell.hasConnSizeSample,
@@ -1092,9 +1186,13 @@ func (rt *RouteTable) RemoveProxy(name string) {
 	for _, row := range rt.rows {
 		for _, dc := range row.domainTable {
 			delete(dc.proxies, name)
-			if dc.bestProxy == name {
-				dc.bestProxy = ""
+			if dc.tcpBestProxy == name {
+				dc.tcpBestProxy = ""
 				dc.tcpProbed = false
+				row.rowDirty = true
+			}
+			if dc.udpBestProxy == name {
+				dc.udpBestProxy = ""
 				row.rowDirty = true
 			}
 		}
@@ -1159,16 +1257,17 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 				}
 			}
 			domains = append(domains, DomainSnapshot{
-				Name:      dc.domainName,
-				BestProxy: dc.bestProxy,
-				TCPProbed: dc.tcpProbed,
-				LastUsed:  dc.lastUsed,
-				ConnSize:  dc.connSize,
-				Proxies:   proxies,
+				Name:         dc.domainName,
+				BestProxy:    dc.tcpBestProxy,
+				UDPBestProxy: dc.udpBestProxy,
+				TCPProbed:    dc.tcpProbed,
+				LastUsed:     dc.lastUsed,
+				ConnSize:     dc.connSize,
+				Proxies:      proxies,
 			})
-			if dc.bestProxy != "" && dc.lastUsed > bestLastUsed {
+			if dc.tcpBestProxy != "" && dc.lastUsed > bestLastUsed {
 				bestLastUsed = dc.lastUsed
-				bestBestProxy = dc.bestProxy
+				bestBestProxy = dc.tcpBestProxy
 				bestTCPProbed = dc.tcpProbed
 			}
 		}
@@ -1266,7 +1365,7 @@ func (rt *RouteTable) DebugDumpRow(key string) string {
 				e.name, e.latency, e.ttfb, e.use, e.fail, e.loss, e.jitter, e.speed, e.score))
 		}
 
-		sb.WriteString(fmt.Sprintf("%s(best=%s,tcpProbed=%v,proxies=[%s])", d, dc.bestProxy, dc.tcpProbed, pb.String()))
+		sb.WriteString(fmt.Sprintf("%s(tcpBest=%s,udpBest=%s,tcpProbed=%v,proxies=[%s])", d, dc.tcpBestProxy, dc.udpBestProxy, dc.tcpProbed, pb.String()))
 	}
 	sb.WriteString("]")
 	return sb.String()

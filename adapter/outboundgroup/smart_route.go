@@ -78,6 +78,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 				return s.dialAndWrap(dialCtx, p, metadata, key, domain)
 			}
 		}
+		return nil, fmt.Errorf("selected proxy %q not found", s.selected)
 	}
 
 	// Fast path: known route with TCP-probed best proxy.  Skip it for 1 in
@@ -104,8 +105,20 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key, do
 				// candidates as a staggered fallback race.  The best remains in
 				// flight and can still win after the fallback has started.
 				ordered := s.rankCandidates(key, domain, proxies, p)
-				conn, err := s.raceAndWrap(ctx, metadata, key, domain, ordered,
-					smartBestExclusiveWindow, &s.probeCoordinator.wg, bestName)
+				raceCtx, finishRace, trackErr := s.probeCoordinator.TrackRace(ctx)
+				if trackErr != nil {
+					return nil, trackErr
+				}
+				var drainWG sync.WaitGroup
+				conn, err := s.raceAndWrap(raceCtx, metadata, key, domain, ordered,
+					smartBestExclusiveWindow, &drainWG, bestName)
+				// raceAndWrap registers any asynchronous loser drain before it
+				// returns. Keep the coordinator registration alive until that local
+				// drain settles, then release its context and WaitGroup slot.
+				go func() {
+					drainWG.Wait()
+					finishRace()
+				}()
 				if conn != nil || err != nil {
 					return conn, err
 				}
@@ -325,6 +338,9 @@ func raceStaggered(ctx context.Context, ordered []C.Proxy, wg *sync.WaitGroup,
 		select {
 		case result := <-results:
 			received++
+			if result.err == nil && result.conn == nil {
+				result.err = errors.New("proxy dial returned nil connection without error")
+			}
 			if result.err == nil {
 				onConnect(result.proxy.Name(), result.connectTime)
 				if onWinner != nil {
@@ -396,6 +412,9 @@ func (s *Smart) dialTCP(ctx context.Context, proxy C.Proxy, metadata *C.Metadata
 		connectTime = 1
 	}
 
+	if err == nil && conn == nil {
+		err = errors.New("proxy dial returned nil connection without error")
+	}
 	if err != nil {
 		log.Debugln("[Smart] route key=%s dial %s failed after %dms: %v",
 			key, proxy.Name(), connectTime, err)
@@ -464,6 +483,9 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key,
 			conn, err := p.DialContext(dialCtx, m)
 			dialCancel()
 			elapsed := time.Since(start).Milliseconds()
+			if err == nil && conn == nil {
+				err = errors.New("proxy dial returned nil connection without error")
+			}
 			if conn != nil && err == nil {
 				conn = &tcpTimingConn{Conn: conn, tcpConnectTime: timer.Duration()}
 			}
@@ -800,7 +822,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	}
 
 	// Try fresh best proxy first
-	if bestName, ok := s.routeTable.GetBestProxyIfFresh(key, domain, smartBestProxyFreshness); ok {
+	if bestName, ok := s.routeTable.GetUDPBestProxyIfFresh(key, domain, smartBestProxyFreshness); ok {
 		for _, p := range udpProxies {
 			if p.Name() == bestName {
 				dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultUDPTimeout)
@@ -812,7 +834,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 				if tunnel.ShouldStopRetry(err) {
 					return nil, err
 				}
-				s.routeTable.MarkFailed(key, bestName, domain, 1.0)
+				s.routeTable.MarkUDPFailed(key, bestName, domain, 1.0)
 				break
 			}
 		}
@@ -850,13 +872,16 @@ func (s *Smart) dialUDPAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.M
 	pc, err := proxy.ListenPacketContext(ctx, metadata)
 	connectTime := time.Since(start).Milliseconds()
 
+	if err == nil && pc == nil {
+		err = errors.New("proxy packet listen returned nil connection without error")
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	s.routeTable.UpdateLatency(key, domain, proxy.Name(), connectTime)
 	s.routeTable.IncrementUseCount(key, domain, proxy.Name())
-	s.routeTable.SetBestProxyPreserveTCPProbed(key, domain, proxy.Name())
+	s.routeTable.SetUDPBestProxy(key, domain, proxy.Name())
 
 	return s.wrapUDPConn(pc, proxy, metadata), nil
 }
