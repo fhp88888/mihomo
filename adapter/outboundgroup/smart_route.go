@@ -826,6 +826,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	}
 
 	// Try fresh best proxy first
+	failedBest := ""
 	if bestName, ok := s.routeTable.GetUDPBestProxyIfFresh(key, domain, smartBestProxyFreshness); ok {
 		for _, p := range udpProxies {
 			if p.Name() == bestName {
@@ -839,6 +840,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 					return nil, err
 				}
 				s.routeTable.MarkUDPFailed(key, bestName, domain, 1.0)
+				failedBest = bestName
 				break
 			}
 		}
@@ -855,6 +857,9 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	// Serial try
 	var lastErr error
 	for _, p := range ordered {
+		if p.Name() == failedBest {
+			continue
+		}
 		dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultUDPTimeout)
 		pc, err := s.dialUDPAndWrap(dialCtx, p, metadata, key, domain, true)
 		dialCancel()

@@ -35,6 +35,17 @@ func (p *nilPacketProxy) ListenPacketContext(context.Context, *C.Metadata) (C.Pa
 	return nil, nil
 }
 
+type udpErrorProxy struct {
+	*stubProxy
+	calls int
+}
+
+func (p *udpErrorProxy) SupportUDP() bool { return true }
+func (p *udpErrorProxy) ListenPacketContext(context.Context, *C.Metadata) (C.PacketConn, error) {
+	p.calls++
+	return nil, errors.New("udp dial failed")
+}
+
 func (s *stubProxy) Name() string              { return s.name }
 func (s *stubProxy) Type() C.AdapterType       { return C.Direct }
 func (s *stubProxy) Addr() string              { return "" }
@@ -1453,6 +1464,29 @@ func TestRawDialPathsRejectNilConnections(t *testing.T) {
 	}
 	if best, ok := rt.GetUDPBestProxyIfFresh(key, domain, time.Minute); ok {
 		t.Fatalf("nil UDP connection was recorded as best %q", best)
+	}
+}
+
+func TestUDPRouteDoesNotRetryFailedBestInFallback(t *testing.T) {
+	best := &udpErrorProxy{stubProxy: &stubProxy{name: "best", delay: 1}}
+	fallback := &udpErrorProxy{stubProxy: &stubProxy{name: "fallback", delay: 2}}
+	base := NewGroupBase(GroupBaseOption{Name: "smart", Type: C.Smart})
+	base.providerProxies = []C.Proxy{best, fallback}
+	rt := smart.NewRouteTable(10)
+	s := &Smart{GroupBase: base, testUrl: "test", routeTable: rt}
+	metadata := &C.Metadata{Host: "example.com"}
+	key, domain := routeKey(metadata), routeDomain(metadata)
+	rt.SetUDPBestProxy(key, domain, best.Name(), true)
+
+	conn, err := s.udpRoute(context.Background(), metadata)
+	if err == nil || conn != nil {
+		t.Fatalf("udpRoute = (%v, %v), want all-proxies-failed error", conn, err)
+	}
+	if best.calls != 1 {
+		t.Fatalf("failed UDP best dialed %d times, want exactly once", best.calls)
+	}
+	if fallback.calls != 1 {
+		t.Fatalf("fallback dialed %d times, want once", fallback.calls)
 	}
 }
 
