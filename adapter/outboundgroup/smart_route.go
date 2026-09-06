@@ -840,7 +840,7 @@ func (s *Smart) dialUDPAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.M
 
 	s.routeTable.UpdateLatency(key, domain, proxy.Name(), connectTime)
 	s.routeTable.IncrementUseCount(key, domain, proxy.Name())
-	s.routeTable.SetBestProxy(key, domain, proxy.Name())
+	s.routeTable.SetBestProxyPreserveTCPProbed(key, domain, proxy.Name())
 
 	return s.wrapUDPConn(pc, proxy, metadata), nil
 }

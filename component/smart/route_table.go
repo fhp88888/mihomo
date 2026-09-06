@@ -377,6 +377,17 @@ func (rt *RouteTable) SetBestProxy(key, domain, proxy string) {
 	rt.setDomainState(key, domain, proxy, true, false)
 }
 
+// SetBestProxyPreserveTCPProbed updates the best proxy without changing whether
+// TCP discovery has completed. UDP uses this because a successful packet
+// connection must not invalidate the TCP routing state for the same domain.
+func (rt *RouteTable) SetBestProxyPreserveTCPProbed(key, domain, proxy string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row := rt.getOrCreateRow(key)
+	cell := rt.getOrCreateDomainCell(row, domain)
+	rt.setDomainState(key, domain, proxy, true, cell.tcpProbed)
+}
+
 // SetTCPProbed marks a route key's domain as having completed TCP discovery.
 func (rt *RouteTable) SetTCPProbed(key, domain string) {
 	rt.mu.Lock()

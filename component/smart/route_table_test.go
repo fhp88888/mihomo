@@ -576,6 +576,29 @@ func TestSetBestProxyAndTCPProbed(t *testing.T) {
 	}
 }
 
+func TestSetBestProxyPreserveTCPProbed(t *testing.T) {
+	rt := NewRouteTable(10)
+	key := "TARGET:example.com"
+
+	rt.SetBestProxyAndTCPProbed(key, testDomain, "tcp-proxy")
+	rt.SetBestProxyPreserveTCPProbed(key, testDomain, "udp-proxy")
+
+	best, ok := rt.GetBestProxy(key, testDomain)
+	if !ok || best != "udp-proxy" {
+		t.Fatalf("best proxy = %q, %v; want udp-proxy, true", best, ok)
+	}
+	if !rt.IsTCPProbed(key, testDomain) {
+		t.Fatal("UDP best update cleared existing TCP-probed state")
+	}
+
+	// Preserving false is equally important: a UDP-only success must not claim
+	// that TCP discovery has happened.
+	rt.SetBestProxyPreserveTCPProbed("TARGET:new.example.com", "new.example.com", "udp-proxy")
+	if rt.IsTCPProbed("TARGET:new.example.com", "new.example.com") {
+		t.Fatal("UDP-only best update incorrectly marked TCP as probed")
+	}
+}
+
 func TestSnapshotIncludesScore(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
