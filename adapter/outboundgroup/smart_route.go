@@ -208,7 +208,11 @@ func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, doma
 			tag := staggerTag(ordered, proxy.Name(), bestName)
 			log.Infoln("[Smart] route key=%s routed via %s (%dms, %s)", key, proxy.Name(), connectTime, tag)
 			s.routeTable.IncrementUseCount(key, domain, proxy.Name())
-			s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
+			if bestName != "" && proxy.Name() == bestName {
+				s.routeTable.SetBestProxyAndTCPProbedPreserveEvaluation(key, domain, proxy.Name())
+			} else {
+				s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
+			}
 		},
 	)
 	if err != nil {
@@ -804,7 +808,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 			if p.Name() == s.selected && p.SupportUDP() {
 				dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultUDPTimeout)
 				defer dialCancel()
-				return s.dialUDPAndWrap(dialCtx, p, metadata, key, domain)
+				return s.dialUDPAndWrap(dialCtx, p, metadata, key, domain, true)
 			}
 		}
 		return nil, errors.New("selected proxy not found or does not support UDP")
@@ -826,7 +830,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 		for _, p := range udpProxies {
 			if p.Name() == bestName {
 				dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultUDPTimeout)
-				pc, err := s.dialUDPAndWrap(dialCtx, p, metadata, key, domain)
+				pc, err := s.dialUDPAndWrap(dialCtx, p, metadata, key, domain, false)
 				dialCancel()
 				if err == nil {
 					return pc, nil
@@ -852,7 +856,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 	var lastErr error
 	for _, p := range ordered {
 		dialCtx, dialCancel := context.WithTimeout(ctx, C.DefaultUDPTimeout)
-		pc, err := s.dialUDPAndWrap(dialCtx, p, metadata, key, domain)
+		pc, err := s.dialUDPAndWrap(dialCtx, p, metadata, key, domain, true)
 		dialCancel()
 		if err == nil {
 			return pc, nil
@@ -867,7 +871,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 }
 
 // dialUDPAndWrap dials a UDP proxy and wraps the packet conn for latency collection.
-func (s *Smart) dialUDPAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Metadata, key, domain string) (C.PacketConn, error) {
+func (s *Smart) dialUDPAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.Metadata, key, domain string, evaluated bool) (C.PacketConn, error) {
 	start := time.Now()
 	pc, err := proxy.ListenPacketContext(ctx, metadata)
 	connectTime := time.Since(start).Milliseconds()
@@ -881,7 +885,7 @@ func (s *Smart) dialUDPAndWrap(ctx context.Context, proxy C.Proxy, metadata *C.M
 
 	s.routeTable.UpdateLatency(key, domain, proxy.Name(), connectTime)
 	s.routeTable.IncrementUseCount(key, domain, proxy.Name())
-	s.routeTable.SetUDPBestProxy(key, domain, proxy.Name())
+	s.routeTable.SetUDPBestProxy(key, domain, proxy.Name(), evaluated)
 
 	return s.wrapUDPConn(pc, proxy, metadata), nil
 }

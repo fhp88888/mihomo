@@ -1448,7 +1448,7 @@ func TestRawDialPathsRejectNilConnections(t *testing.T) {
 	}
 
 	udpProxy := &nilPacketProxy{stubProxy: &stubProxy{name: "nil-udp"}}
-	if conn, err := s.dialUDPAndWrap(context.Background(), udpProxy, metadata, key, domain); err == nil || conn != nil {
+	if conn, err := s.dialUDPAndWrap(context.Background(), udpProxy, metadata, key, domain, true); err == nil || conn != nil {
 		t.Fatalf("dialUDPAndWrap = (%v, %v), want nil connection and explicit error", conn, err)
 	}
 	if best, ok := rt.GetUDPBestProxyIfFresh(key, domain, time.Minute); ok {

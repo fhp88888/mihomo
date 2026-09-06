@@ -90,9 +90,9 @@ type domainCell struct {
 	tcpBestProxy      string
 	udpBestProxy      string
 	tcpProbed         bool
-	lastUsed          int64 // last time this domain's best was used; freshness window
-	tcpLastUsed       int64
-	udpLastUsed       int64
+	lastUsed          int64 // domain LRU/activity timestamp
+	tcpEvaluatedAt    int64 // last time TCP best was evaluated, not merely reused
+	udpEvaluatedAt    int64 // last time UDP best was evaluated, not merely reused
 	connSize          float64
 	hasConnSizeSample bool
 	proxies           map[string]*proxyCell
@@ -348,7 +348,7 @@ func (rt *RouteTable) GetBestProxyIfFresh(key, domain string, maxAge time.Durati
 	if !ok || cell.tcpBestProxy == "" {
 		return "", false
 	}
-	if time.Since(time.Unix(cell.tcpLastUsed, 0)) >= maxAge {
+	if time.Since(time.Unix(cell.tcpEvaluatedAt, 0)) >= maxAge {
 		return "", false
 	}
 	return cell.tcpBestProxy, true
@@ -367,7 +367,7 @@ func (rt *RouteTable) GetUDPBestProxyIfFresh(key, domain string, maxAge time.Dur
 	if !ok || cell.udpBestProxy == "" {
 		return "", false
 	}
-	if time.Since(time.Unix(cell.udpLastUsed, 0)) >= maxAge {
+	if time.Since(time.Unix(cell.udpEvaluatedAt, 0)) >= maxAge {
 		return "", false
 	}
 	return cell.udpBestProxy, true
@@ -386,7 +386,7 @@ func (rt *RouteTable) IsTCPProbed(key, domain string) bool {
 }
 
 // setDomainState updates a domain's routing state.  Caller holds mu.
-func (rt *RouteTable) setDomainState(key, domain, proxy string, setBest, tcpProbed bool) {
+func (rt *RouteTable) setDomainState(key, domain, proxy string, setBest, tcpProbed, evaluated bool) {
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateDomainCell(row, domain)
 	if setBest {
@@ -394,7 +394,9 @@ func (rt *RouteTable) setDomainState(key, domain, proxy string, setBest, tcpProb
 	}
 	cell.tcpProbed = tcpProbed
 	cell.lastUsed = time.Now().Unix()
-	cell.tcpLastUsed = cell.lastUsed
+	if evaluated {
+		cell.tcpEvaluatedAt = cell.lastUsed
+	}
 	row.lastUsed = time.Now().Unix()
 	row.rowDirty = true
 	rt.touchDomainLRU(row, domain)
@@ -405,18 +407,20 @@ func (rt *RouteTable) setDomainState(key, domain, proxy string, setBest, tcpProb
 func (rt *RouteTable) SetBestProxy(key, domain, proxy string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	rt.setDomainState(key, domain, proxy, true, false)
+	rt.setDomainState(key, domain, proxy, true, false, true)
 }
 
 // SetUDPBestProxy updates UDP routing state without modifying TCP best/probed.
-func (rt *RouteTable) SetUDPBestProxy(key, domain, proxy string) {
+func (rt *RouteTable) SetUDPBestProxy(key, domain, proxy string, evaluated bool) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	row := rt.getOrCreateRow(key)
 	cell := rt.getOrCreateDomainCell(row, domain)
 	cell.udpBestProxy = proxy
 	cell.lastUsed = time.Now().Unix()
-	cell.udpLastUsed = cell.lastUsed
+	if evaluated {
+		cell.udpEvaluatedAt = cell.lastUsed
+	}
 	row.lastUsed = cell.lastUsed
 	row.rowDirty = true
 	rt.touchDomainLRU(row, domain)
@@ -427,7 +431,7 @@ func (rt *RouteTable) SetUDPBestProxy(key, domain, proxy string) {
 func (rt *RouteTable) SetTCPProbed(key, domain string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	rt.setDomainState(key, domain, "", false, true)
+	rt.setDomainState(key, domain, "", false, true, true)
 }
 
 // SetBestProxyAndTCPProbed sets the domain's best proxy and TCP-probed flag
@@ -436,7 +440,15 @@ func (rt *RouteTable) SetTCPProbed(key, domain string) {
 func (rt *RouteTable) SetBestProxyAndTCPProbed(key, domain, proxy string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	rt.setDomainState(key, domain, proxy, true, true)
+	rt.setDomainState(key, domain, proxy, true, true, true)
+}
+
+// SetBestProxyAndTCPProbedPreserveEvaluation records a successful reuse of the
+// current TCP best without extending its evaluation freshness window.
+func (rt *RouteTable) SetBestProxyAndTCPProbedPreserveEvaluation(key, domain, proxy string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.setDomainState(key, domain, proxy, true, true, false)
 }
 
 // getOrCreateCell returns the proxy cell within a domain, creating it if needed.
@@ -1047,6 +1059,8 @@ type PersistedDomain struct {
 	BestProxy         string  `json:"best_proxy,omitempty"` // legacy and TCP best compatibility
 	TCPBestProxy      string  `json:"tcp_best_proxy,omitempty"`
 	UDPBestProxy      string  `json:"udp_best_proxy,omitempty"`
+	TCPEvaluatedAt    int64   `json:"tcp_evaluated_at,omitempty"`
+	UDPEvaluatedAt    int64   `json:"udp_evaluated_at,omitempty"`
 	TCPProbed         bool    `json:"tcp_probed"`
 	ConnSize          float64 `json:"conn_size"`
 	HasConnSizeSample bool    `json:"has_conn_size_sample"`
@@ -1113,11 +1127,13 @@ func (rt *RouteTable) RestoreRowMeta(key string, pr PersistedRow) {
 			cell.connSize = pd.ConnSize
 			cell.hasConnSizeSample = pd.HasConnSizeSample
 			cell.lastUsed = now
-			if cell.tcpBestProxy != "" {
-				cell.tcpLastUsed = now
+			cell.tcpEvaluatedAt = pd.TCPEvaluatedAt
+			if cell.tcpBestProxy != "" && cell.tcpEvaluatedAt == 0 {
+				cell.tcpEvaluatedAt = now
 			}
-			if cell.udpBestProxy != "" {
-				cell.udpLastUsed = now
+			cell.udpEvaluatedAt = pd.UDPEvaluatedAt
+			if cell.udpBestProxy != "" && cell.udpEvaluatedAt == 0 {
+				cell.udpEvaluatedAt = now
 			}
 		}
 	} else if pr.BestProxy != "" {
@@ -1129,7 +1145,7 @@ func (rt *RouteTable) RestoreRowMeta(key string, pr PersistedRow) {
 			cell.tcpBestProxy = pr.BestProxy
 			cell.tcpProbed = pr.TCPProbed
 			cell.lastUsed = now
-			cell.tcpLastUsed = now
+			cell.tcpEvaluatedAt = now
 		}
 	}
 
@@ -1154,6 +1170,8 @@ func (rt *RouteTable) SnapshotAndClearDirtyRows() map[string]PersistedRow {
 					BestProxy:         cell.tcpBestProxy,
 					TCPBestProxy:      cell.tcpBestProxy,
 					UDPBestProxy:      cell.udpBestProxy,
+					TCPEvaluatedAt:    cell.tcpEvaluatedAt,
+					UDPEvaluatedAt:    cell.udpEvaluatedAt,
 					TCPProbed:         cell.tcpProbed,
 					ConnSize:          cell.connSize,
 					HasConnSizeSample: cell.hasConnSizeSample,

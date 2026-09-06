@@ -581,7 +581,7 @@ func TestTCPAndUDPBestAreIndependent(t *testing.T) {
 	key := "TARGET:example.com"
 
 	rt.SetBestProxyAndTCPProbed(key, testDomain, "tcp-proxy")
-	rt.SetUDPBestProxy(key, testDomain, "udp-proxy")
+	rt.SetUDPBestProxy(key, testDomain, "udp-proxy", true)
 
 	best, ok := rt.GetBestProxy(key, testDomain)
 	if !ok || best != "tcp-proxy" {
@@ -595,7 +595,7 @@ func TestTCPAndUDPBestAreIndependent(t *testing.T) {
 		t.Fatalf("UDP best proxy = %q, %v; want udp-proxy, true", udpBest, ok)
 	}
 
-	rt.SetUDPBestProxy("TARGET:new.example.com", "new.example.com", "udp-proxy")
+	rt.SetUDPBestProxy("TARGET:new.example.com", "new.example.com", "udp-proxy", true)
 	if rt.IsTCPProbed("TARGET:new.example.com", "new.example.com") {
 		t.Fatal("UDP-only best update incorrectly marked TCP as probed")
 	}
@@ -648,11 +648,43 @@ func TestGetBestProxyIfFresh(t *testing.T) {
 	}
 
 	rt.mu.Lock()
-	rt.rows[key].domainTable[testDomain].tcpLastUsed = time.Now().Add(-21 * time.Second).Unix()
+	rt.rows[key].domainTable[testDomain].tcpEvaluatedAt = time.Now().Add(-21 * time.Second).Unix()
 	rt.mu.Unlock()
 
 	if name, ok := rt.GetBestProxyIfFresh(key, testDomain, 20*time.Second); ok {
 		t.Fatalf("expected stale best proxy to be unavailable, got %s", name)
+	}
+}
+
+func TestBestReuseDoesNotRefreshEvaluationTime(t *testing.T) {
+	rt := NewRouteTable(10)
+	key := "TARGET:example.com"
+	rt.SetBestProxyAndTCPProbed(key, testDomain, "tcp-proxy")
+	rt.SetUDPBestProxy(key, testDomain, "udp-proxy", true)
+
+	stale := time.Now().Add(-10 * time.Second).Unix()
+	rt.mu.Lock()
+	cell := rt.rows[key].domainTable[testDomain]
+	cell.tcpEvaluatedAt = stale
+	cell.udpEvaluatedAt = stale
+	rt.mu.Unlock()
+
+	rt.SetBestProxyAndTCPProbedPreserveEvaluation(key, testDomain, "tcp-proxy")
+	rt.SetUDPBestProxy(key, testDomain, "udp-proxy", false)
+	if _, ok := rt.GetBestProxyIfFresh(key, testDomain, 5*time.Second); ok {
+		t.Fatal("TCP best reuse refreshed its evaluation time")
+	}
+	if _, ok := rt.GetUDPBestProxyIfFresh(key, testDomain, 5*time.Second); ok {
+		t.Fatal("UDP best reuse refreshed its evaluation time")
+	}
+
+	rt.SetBestProxyAndTCPProbed(key, testDomain, "tcp-proxy")
+	rt.SetUDPBestProxy(key, testDomain, "udp-proxy", true)
+	if _, ok := rt.GetBestProxyIfFresh(key, testDomain, 5*time.Second); !ok {
+		t.Fatal("TCP re-evaluation did not refresh freshness")
+	}
+	if _, ok := rt.GetUDPBestProxyIfFresh(key, testDomain, 5*time.Second); !ok {
+		t.Fatal("UDP re-evaluation did not refresh freshness")
 	}
 }
 
