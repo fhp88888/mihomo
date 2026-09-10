@@ -19,12 +19,12 @@ const RouteTableMetaKey = "__table__"
 // MaxDomainsPerNormalASRow caps the per-row domain table (LRU) for a normal
 // ASN or TARGET row: each tracks at most this many distinct effective domains
 // by connection size.
-const MaxDomainsPerNormalASRow = 40
+const MaxDomainsPerNormalASRow = 50
 
 // MaxDomainsPerCDNASRow caps the per-row domain table (LRU) for a CDN ASN row.
 // A CDN ASN (see CdnASNs in common.go) fronts many distinct sites behind one
 // ASN, so its row gets a larger domain table to avoid thrashing the LRU.
-const MaxDomainsPerCDNASRow = 200
+const MaxDomainsPerCDNASRow = 300
 
 // MaxTTFBProxiesPerRank caps how many TTFB-group proxies RankByScore keeps.
 // Even when many proxies have a TTFB sample, only the top-N by score survive;
@@ -67,16 +67,8 @@ type ProxyRecord struct {
 type rowEntry struct {
 	key      string
 	lastUsed int64
-	// domainTable records per-domain routing state, connection sizes (kB) and
-	// proxy quality metrics observed under this CDN/ASN row, keyed by the
-	// connection's effective target (see GetEffectiveTarget).  Bounded to
-	// maxDomainsForRow(key) entries via LRU.
 	domainTable map[string]*domainCell
-	// domainOrder is the LRU order of domainTable keys: index 0 is the least
-	// recently used and is evicted first when the table is full.
 	domainOrder []string
-	// rowDirty is true when any domain's routing state (bestProxy, tcpProbed)
-	// has changed and the row snapshot has not been persisted yet.
 	rowDirty bool
 }
 
@@ -532,6 +524,44 @@ func (rt *RouteTable) UpdateLatency(key, domain, proxy string, latency int64) {
 	rt.touchDomainLRU(row, domain)
 	row.lastUsed = time.Now().Unix()
 	rt.touchLRU(key)
+}
+
+// ProxyDialLatency returns the historical TCP dial-latency EMA for one
+// (route key, domain, proxy) tuple. The boolean is false until at least one
+// successful dial has contributed a latency sample.
+func (rt *RouteTable) ProxyDialLatency(key, domain, proxy string) (int64, bool) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return 0, false
+	}
+	dc, ok := row.domainTable[domain]
+	if !ok {
+		return 0, false
+	}
+	cell, ok := dc.proxies[proxy]
+	if !ok || !cell.HasLatencySample {
+		return 0, false
+	}
+	return cell.Latency, true
+}
+
+// ProxyHasTTFBSample reports whether a proxy has an end-to-end first-byte
+// sample for this route key and domain.
+func (rt *RouteTable) ProxyHasTTFBSample(key, domain, proxy string) bool {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return false
+	}
+	dc, ok := row.domainTable[domain]
+	if !ok {
+		return false
+	}
+	cell, ok := dc.proxies[proxy]
+	return ok && cell.HasTTFBSample
 }
 
 // UpdateTTFB updates the EMA time-to-first-byte for a (key, domain, proxy)

@@ -1056,13 +1056,184 @@ func TestBestFirstRace_BestWinsWithinWindow(t *testing.T) {
 		t.Fatal("serialTcpConn returned nil connection")
 	}
 	elapsed := time.Since(start)
-	if elapsed > smartBestExclusiveWindow {
-		t.Fatalf("best win took %v, want within %v", elapsed, smartBestExclusiveWindow)
+	if elapsed > smartDefaultDialWindow {
+		t.Fatalf("best win took %v, want within %v", elapsed, smartDefaultDialWindow)
 	}
 	if bestConn.CloseCount() != 0 {
 		t.Fatalf("winner conn closed %d times", bestConn.CloseCount())
 	}
 	_ = conn.Close()
+}
+
+func TestAdaptiveDialWindow(t *testing.T) {
+	const (
+		key    = "TARGET:example.com"
+		domain = "example.com"
+	)
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	if got := s.adaptiveDialWindow(key, domain, "unsampled"); got != smartDefaultDialWindow {
+		t.Fatalf("unsampled window = %v, want %v", got, smartDefaultDialWindow)
+	}
+	rt.UpdateLatency(key, domain, "normal", 100)
+	if got := s.adaptiveDialWindow(key, domain, "normal"); got != 150*time.Millisecond {
+		t.Fatalf("sampled window = %v, want 150ms", got)
+	}
+	rt.UpdateLatency(key, domain, "tiny", 1)
+	if got := s.adaptiveDialWindow(key, domain, "tiny"); got != smartMinDialWindow {
+		t.Fatalf("minimum-clamped window = %v, want %v", got, smartMinDialWindow)
+	}
+	rt.UpdateLatency(key, domain, "huge", 2000)
+	if got := s.adaptiveDialWindow(key, domain, "huge"); got != smartMaxDialWindow {
+		t.Fatalf("maximum-clamped window = %v, want %v", got, smartMaxDialWindow)
+	}
+}
+
+// Explicit exploration must give one low-latency, TTFB-untested challenger a
+// head start instead of letting the sampled incumbent win every re-evaluation.
+func TestSmartExploration_UntestedLowLatencyChallengerPrecedesBest(t *testing.T) {
+	const (
+		key    = "TARGET:example.com"
+		domain = "example.com"
+	)
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	best := &stubProxy{
+		name:  "best",
+		delay: 170,
+		dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+			return &stubConn{}, nil
+		},
+	}
+	fastUntested := &stubProxy{
+		name:  "untested-fast",
+		delay: 108,
+		dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+			return &stubConn{}, nil
+		},
+	}
+	slowUntested := &stubProxy{name: "untested-slow", delay: 150}
+	tested := &stubProxy{name: "tested", delay: 80}
+
+	rt.UpdateLatency(key, domain, best.Name(), 100)
+	rt.UpdateTTFB(key, domain, best.Name(), 300)
+	rt.UpdateLatency(key, domain, tested.Name(), 80)
+	rt.UpdateTTFB(key, domain, tested.Name(), 200)
+	rt.SetBestProxyAndTCPProbed(key, domain, best.Name())
+
+	ordered, bestName := s.explorationCallSequence(key, domain, []C.Proxy{slowUntested, best, tested, fastUntested})
+	got := namesOf(ordered)
+	if bestName != best.Name() {
+		t.Fatalf("best name = %q, want %q", bestName, best.Name())
+	}
+	if len(got) < 2 || got[0] != fastUntested.Name() || got[1] != best.Name() {
+		t.Fatalf("exploration sequence = %v, want [untested-fast best ...]", got)
+	}
+	countBeforeBest := 0
+	for _, name := range got {
+		if name == best.Name() {
+			break
+		}
+		countBeforeBest++
+	}
+	if countBeforeBest != 1 {
+		t.Fatalf("challengers before best = %d, want exactly 1 (sequence %v)", countBeforeBest, got)
+	}
+	seen := make(map[string]bool, len(got))
+	for _, name := range got {
+		if seen[name] {
+			t.Fatalf("exploration sequence contains duplicate %q: %v", name, got)
+		}
+		seen[name] = true
+	}
+}
+
+func TestSmartExploration_ChallengerFailureFallsBackToBestImmediately(t *testing.T) {
+	const key, domain = "TARGET:example.com", "example.com"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	challenger := &stubProxy{name: "challenger", delay: 10, dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return nil, syscall.ECONNREFUSED
+	}}
+	bestCalls := 0
+	best := &stubProxy{name: "best", delay: 100, dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		bestCalls++
+		return &stubConn{}, nil
+	}}
+	rt.UpdateLatency(key, domain, best.Name(), 100)
+	rt.UpdateTTFB(key, domain, best.Name(), 150)
+	rt.SetBestProxyAndTCPProbed(key, domain, best.Name())
+
+	start := time.Now()
+	conn, err := s.exploreTcpConn(context.Background(), &C.Metadata{Host: domain}, key, domain, []C.Proxy{best, challenger})
+	if err != nil || conn == nil {
+		t.Fatalf("exploreTcpConn = (%v, %v), want best connection", conn, err)
+	}
+	defer conn.Close()
+	if bestCalls != 1 {
+		t.Fatalf("best dial calls = %d, want 1", bestCalls)
+	}
+	if elapsed := time.Since(start); elapsed >= smartDefaultDialWindow {
+		t.Fatalf("failure fallback took %v, want immediate", elapsed)
+	}
+}
+
+func TestSmartExploration_SlowChallengerFallsBackAfterAdaptiveWindow(t *testing.T) {
+	const key, domain = "TARGET:example.com", "example.com"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	challengerStarted := make(chan struct{})
+	challengerUnblock := make(chan struct{})
+	challenger := blockingProxy("challenger", challengerUnblock, &stubConn{}, challengerStarted)
+	challenger.delay = 40
+	best := &stubProxy{name: "best", delay: 100, dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return &stubConn{}, nil
+	}}
+	rt.UpdateLatency(key, domain, challenger.Name(), 40)
+	rt.UpdateLatency(key, domain, best.Name(), 100)
+	rt.UpdateTTFB(key, domain, best.Name(), 150)
+	rt.SetBestProxyAndTCPProbed(key, domain, best.Name())
+
+	start := time.Now()
+	conn, err := s.exploreTcpConn(context.Background(), &C.Metadata{Host: domain}, key, domain, []C.Proxy{best, challenger})
+	if err != nil || conn == nil {
+		t.Fatalf("exploreTcpConn = (%v, %v), want best connection", conn, err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 50*time.Millisecond || elapsed >= 250*time.Millisecond {
+		t.Fatalf("best fallback started after %v, want approximately 60ms", elapsed)
+	}
+	close(challengerUnblock)
+	pc.wg.Wait()
+	_ = conn.Close()
+}
+
+func TestSmartExploration_ColdStartUsesLowLatencyTopK(t *testing.T) {
+	const key, domain = "TARGET:example.com", "example.com"
+	s, _, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	proxies := make([]C.Proxy, 0, topK+3)
+	for i := topK + 3; i >= 1; i-- {
+		proxies = append(proxies, &stubProxy{name: fmt.Sprintf("p-%02d", i), delay: uint16(i)})
+	}
+	ordered, bestName := s.explorationCallSequence(key, domain, proxies)
+	if bestName != "" {
+		t.Fatalf("cold-start best = %q, want empty", bestName)
+	}
+	if len(ordered) != topK {
+		t.Fatalf("cold-start sequence length = %d, want topK=%d", len(ordered), topK)
+	}
+	for i, p := range ordered {
+		want := fmt.Sprintf("p-%02d", i+1)
+		if p.Name() != want {
+			t.Fatalf("cold-start sequence[%d] = %q, want %q", i, p.Name(), want)
+		}
+	}
 }
 
 func TestBestFirstRace_StaleBestYieldsToFasterFallback(t *testing.T) {
@@ -1080,7 +1251,9 @@ func TestBestFirstRace_StaleBestYieldsToFasterFallback(t *testing.T) {
 		return &stubConn{}, nil
 	}}
 
+	rt.UpdateLatency(key, "example.com", "best", 100)
 	rt.SetBestProxy(key, "example.com", "best")
+	wantWindow := 150 * time.Millisecond
 
 	start := time.Now()
 	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, second})
@@ -1094,10 +1267,10 @@ func TestBestFirstRace_StaleBestYieldsToFasterFallback(t *testing.T) {
 	// second must not be launched before the exclusive window elapses.
 	select {
 	case <-secondStarted:
-		if time.Since(start) < smartBestExclusiveWindow {
+		if time.Since(start) < wantWindow {
 			t.Fatal("second launched before exclusive window elapsed")
 		}
-	case <-time.After(2 * smartBestExclusiveWindow):
+	case <-time.After(2 * wantWindow):
 		t.Fatal("second proxy never launched")
 	}
 
@@ -1143,10 +1316,10 @@ func TestBestFirstRace_BestFailEarlyStartsFallbackImmediately(t *testing.T) {
 	select {
 	case <-secondStarted:
 		elapsed := time.Since(start)
-		if elapsed >= smartBestExclusiveWindow {
+		if elapsed >= smartDefaultDialWindow {
 			t.Fatalf("second launched after %v, want immediate (best failed early)", elapsed)
 		}
-	case <-time.After(smartBestExclusiveWindow):
+	case <-time.After(smartDefaultDialWindow):
 		t.Fatal("second proxy never launched after best failed early")
 	}
 
@@ -1280,7 +1453,7 @@ func TestSmartPolicy_LogSequence_BestWinsAfterFallbackStarts(t *testing.T) {
 	select {
 	case <-secondStarted:
 		// The exclusive window elapsed and the fallback is now in flight.
-	case <-time.After(2 * smartBestExclusiveWindow):
+	case <-time.After(2 * smartDefaultDialWindow):
 		t.Fatal("fallback did not start after the best exclusive window")
 	}
 	close(bestUnblock)
