@@ -61,6 +61,15 @@ type TTFBPrior struct {
 	Samples int
 }
 
+// ExplorationRisk is the observed request-level cost of trying a challenger.
+// Positive regret means the served request was slower than the incumbent's
+// historical TTFB; negative regret means exploration improved it.
+type ExplorationRisk struct {
+	Mean    float64
+	StdDev  float64
+	Samples int64
+}
+
 // ProxyRecord is the per-proxy entry in a route table row.
 type ProxyRecord struct {
 	Name       string          `json:"name"`
@@ -92,6 +101,7 @@ type domainCell struct {
 	udpBestProxy      string
 	tcpProbed         bool
 	lastUsed          int64 // domain LRU/activity timestamp
+	firstUsed         int64 // first observation in this process
 	tcpEvaluatedAt    int64 // last time TCP best was evaluated, not merely reused
 	udpEvaluatedAt    int64 // last time UDP best was evaluated, not merely reused
 	connSize          float64
@@ -100,21 +110,24 @@ type domainCell struct {
 }
 
 type proxyCell struct {
-	Name             string
-	UseCount         int64
-	FailedCount      float64
-	Latency          int64   // EMA, 0 means no sample yet
-	TTFB             int64   // EMA of time-to-first-byte (ms), 0 means no sample yet
-	PkgLoss          float64 // EMA
-	Speed            float64 // EMA
-	Jitter           float64 // EMA of |sample - previous TTFB EMA|, 0 means no sample yet
-	Score            float64 // non-EMA score derived from latency, speed, pkgLoss and failedCount
-	HasLatencySample bool
-	HasTTFBSample    bool
-	HasPkgLossSample bool
-	HasSpeedSample   bool
-	HasJitterSample  bool
-	Dirty            bool // true when cell has unsaved changes
+	Name                  string
+	UseCount              int64
+	FailedCount           float64
+	Latency               int64   // EMA, 0 means no sample yet
+	TTFB                  int64   // EMA of time-to-first-byte (ms), 0 means no sample yet
+	PkgLoss               float64 // EMA
+	Speed                 float64 // EMA
+	Jitter                float64 // EMA of |sample - previous TTFB EMA|, 0 means no sample yet
+	Score                 float64 // non-EMA score derived from latency, speed, pkgLoss and failedCount
+	HasLatencySample      bool
+	HasTTFBSample         bool
+	HasPkgLossSample      bool
+	HasSpeedSample        bool
+	HasJitterSample       bool
+	ExplorationRegretMean float64
+	ExplorationRegretM2   float64
+	ExplorationSamples    int64
+	Dirty                 bool // true when cell has unsaved changes
 }
 
 func (c *proxyCell) hasSample() bool {
@@ -307,7 +320,8 @@ func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domai
 		row.rowDirty = true
 	}
 
-	cell := &domainCell{domainName: domain, connSize: 100, proxies: make(map[string]*proxyCell)}
+	now := time.Now().Unix()
+	cell := &domainCell{domainName: domain, connSize: 100, firstUsed: now, lastUsed: now, proxies: make(map[string]*proxyCell)}
 	row.domainTable[domain] = cell
 	row.domainOrder = append(row.domainOrder, domain)
 	row.rowDirty = true
@@ -571,6 +585,161 @@ func (rt *RouteTable) ProxyHasTTFBSample(key, domain, proxy string) bool {
 	}
 	cell, ok := dc.proxies[proxy]
 	return ok && cell.HasTTFBSample
+}
+
+// RouteFamily groups numbered sibling origins, including fake-IP wildcard
+// targets such as *.eu-target-1.test and *.eu-target-4.test.
+func RouteFamily(domain string) string {
+	prefix, rest := "", domain
+	if strings.HasPrefix(rest, "*.") {
+		prefix, rest = "*.", rest[2:]
+	}
+	labelEnd := strings.IndexByte(rest, '.')
+	if labelEnd < 0 {
+		labelEnd = len(rest)
+	}
+	label := rest[:labelEnd]
+	dash := strings.LastIndexByte(label, '-')
+	if dash < 0 || dash == len(label)-1 {
+		return domain
+	}
+	for _, ch := range label[dash+1:] {
+		if ch < '0' || ch > '9' {
+			return domain
+		}
+	}
+	return prefix + rest[:dash+1] + "*" + rest[labelEnd:]
+}
+
+func summarizeValues(values []float64, floorFraction float64) (TTFBPrior, bool) {
+	if len(values) == 0 {
+		return TTFBPrior{}, false
+	}
+	mean := 0.0
+	for _, value := range values {
+		mean += value
+	}
+	mean /= float64(len(values))
+	variance := 0.0
+	for _, value := range values {
+		delta := value - mean
+		variance += delta * delta
+	}
+	variance /= float64(len(values))
+	stddev := math.Sqrt(variance)
+	if floor := mean * floorFraction; stddev < floor {
+		stddev = floor
+	}
+	return TTFBPrior{Mean: mean, StdDev: stddev, Samples: len(values)}, true
+}
+
+// SimilarTTFBPrior returns route-family evidence first, then same-ASN-row
+// evidence. It deliberately excludes the global fallback used by
+// ProxyTTFBPrior so callers can distinguish genuine network similarity.
+func (rt *RouteTable) SimilarTTFBPrior(key, domain, proxy string) (TTFBPrior, bool) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	family := RouteFamily(domain)
+	values := make([]float64, 0)
+	for _, row := range rt.rows {
+		for name, dc := range row.domainTable {
+			if name == domain || RouteFamily(name) != family {
+				continue
+			}
+			if cell, ok := dc.proxies[proxy]; ok && cell.HasTTFBSample {
+				values = append(values, float64(cell.TTFB))
+			}
+		}
+	}
+	if prior, ok := summarizeValues(values, .20); ok {
+		return prior, true
+	}
+	values = values[:0]
+	if row, ok := rt.rows[key]; ok && strings.HasPrefix(key, "ASN:") {
+		for name, dc := range row.domainTable {
+			if name == domain {
+				continue
+			}
+			if cell, ok := dc.proxies[proxy]; ok && cell.HasTTFBSample {
+				values = append(values, float64(cell.TTFB))
+			}
+		}
+	}
+	return summarizeValues(values, .30)
+}
+
+// ExpectedFutureRequests estimates near-term demand for sibling routes from
+// their observed request rate, bounded to prevent a burst from creating an
+// unlimited exploration budget.
+func (rt *RouteTable) ExpectedFutureRequests(domain string, horizon time.Duration) float64 {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	family := RouteFamily(domain)
+	uses, first := int64(0), int64(0)
+	for _, row := range rt.rows {
+		for name, dc := range row.domainTable {
+			if RouteFamily(name) != family {
+				continue
+			}
+			if first == 0 || dc.firstUsed < first {
+				first = dc.firstUsed
+			}
+			for _, cell := range dc.proxies {
+				uses += cell.UseCount
+			}
+		}
+	}
+	if uses <= 1 || first == 0 {
+		return 1
+	}
+	elapsed := math.Max(time.Since(time.Unix(first, 0)).Seconds(), 1)
+	estimate := float64(uses) / elapsed * horizon.Seconds()
+	return math.Max(1, math.Min(estimate, 32))
+}
+
+func (rt *RouteTable) UpdateExplorationRegret(key, domain, challenger string, regret float64) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row := rt.getOrCreateRow(key)
+	dc := rt.getOrCreateDomainCell(row, domain)
+	cell := rt.getOrCreateCell(dc, challenger)
+	cell.ExplorationSamples++
+	delta := regret - cell.ExplorationRegretMean
+	cell.ExplorationRegretMean += delta / float64(cell.ExplorationSamples)
+	cell.ExplorationRegretM2 += delta * (regret - cell.ExplorationRegretMean)
+}
+
+func (rt *RouteTable) ExplorationRisk(domain, challenger string) (ExplorationRisk, bool) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	family := RouteFamily(domain)
+	count, mean, m2 := int64(0), 0.0, 0.0
+	for _, row := range rt.rows {
+		for name, dc := range row.domainTable {
+			if RouteFamily(name) != family {
+				continue
+			}
+			cell, ok := dc.proxies[challenger]
+			if !ok || cell.ExplorationSamples == 0 {
+				continue
+			}
+			// Merge each cell's Welford accumulator without losing its within-cell variance.
+			n := cell.ExplorationSamples
+			delta := cell.ExplorationRegretMean - mean
+			newCount := count + n
+			mean += delta * float64(n) / float64(newCount)
+			m2 += cell.ExplorationRegretM2 + delta*delta*float64(count*n)/float64(newCount)
+			count = newCount
+		}
+	}
+	if count == 0 {
+		return ExplorationRisk{}, false
+	}
+	variance := 0.0
+	if count > 1 {
+		variance = m2 / float64(count-1)
+	}
+	return ExplorationRisk{Mean: mean, StdDev: math.Sqrt(variance), Samples: count}, true
 }
 
 // ProxyTTFBPrior returns a proxy's current-domain observation when available;

@@ -186,6 +186,38 @@ func TestIncrementUseCount(t *testing.T) {
 	}
 }
 
+func TestRouteFamilyHandlesFakeIPWildcard(t *testing.T) {
+	if got := RouteFamily("*.eu-target-4.test"); got != "*.eu-target-*.test" {
+		t.Fatalf("family = %q", got)
+	}
+	if got := RouteFamily("api-v2.test"); got != "api-v2.test" {
+		t.Fatalf("non-numeric hostname changed to %q", got)
+	}
+}
+
+func TestSimilarPriorFutureDemandAndExplorationRisk(t *testing.T) {
+	rt := NewRouteTable(100)
+	k1, d1 := "TARGET:*.eu-target-1.test", "*.eu-target-1.test"
+	k2, d2 := "TARGET:*.eu-target-2.test", "*.eu-target-2.test"
+	rt.UpdateTTFB(k1, d1, "eu", 200)
+	prior, ok := rt.SimilarTTFBPrior(k2, d2, "eu")
+	if !ok || prior.Mean != 200 {
+		t.Fatalf("similar prior = %+v, %v", prior, ok)
+	}
+	for i := 0; i < 8; i++ {
+		rt.IncrementUseCount(k1, d1, "eu")
+	}
+	if future := rt.ExpectedFutureRequests(d2, 30*time.Second); future <= 1 || future > 32 {
+		t.Fatalf("future requests = %v", future)
+	}
+	rt.UpdateExplorationRegret(k1, d1, "challenger", 100)
+	rt.UpdateExplorationRegret(k1, d1, "challenger", 300)
+	risk, ok := rt.ExplorationRisk(d2, "challenger")
+	if !ok || risk.Samples != 2 || math.Abs(risk.Mean-200) > .001 || math.Abs(risk.StdDev-math.Sqrt(20000)) > .001 {
+		t.Fatalf("risk = %+v, %v", risk, ok)
+	}
+}
+
 func TestCalculateScore(t *testing.T) {
 	cases := []struct {
 		latency     int64

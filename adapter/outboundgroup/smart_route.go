@@ -302,7 +302,7 @@ func (s *Smart) exploreTcpConn(ctx context.Context, metadata *C.Metadata, key, d
 	}
 	var drainWG sync.WaitGroup
 	firstWindow := s.adaptiveDialWindow(key, domain, ordered[0].Name())
-	conn, err := s.raceAndWrap(raceCtx, metadata, key, domain, ordered, firstWindow, &drainWG, bestName)
+	conn, err := s.raceAndWrapExploration(raceCtx, metadata, key, domain, ordered, firstWindow, &drainWG, bestName)
 	go func() {
 		drainWG.Wait()
 		finishRace()
@@ -357,6 +357,20 @@ func (s *Smart) rankCandidates(key, domain string, proxies []C.Proxy, best C.Pro
 // background.
 func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, domain string,
 	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, bestName string) (C.Conn, error) {
+	return s.raceAndWrapPolicy(ctx, metadata, key, domain, ordered, firstStagger, wg, bestName, "")
+}
+
+func (s *Smart) raceAndWrapExploration(ctx context.Context, metadata *C.Metadata, key, domain string,
+	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, bestName string) (C.Conn, error) {
+	challenger := ""
+	if len(ordered) > 0 && bestName != "" && ordered[0].Name() != bestName {
+		challenger = ordered[0].Name()
+	}
+	return s.raceAndWrapPolicy(ctx, metadata, key, domain, ordered, firstStagger, wg, bestName, challenger)
+}
+
+func (s *Smart) raceAndWrapPolicy(ctx context.Context, metadata *C.Metadata, key, domain string,
+	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, bestName, challenger string) (C.Conn, error) {
 	winner, conn, connectTime, err := raceStaggered(ctx, ordered, wg, firstStagger,
 		// Race dials go through dialTCP, which records a genuine dial failure
 		// as MarkFailed.
@@ -390,7 +404,7 @@ func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, doma
 	if conn == nil {
 		return nil, nil
 	}
-	return s.wrapTCPConn(conn, winner, metadata, connectTime), nil
+	return s.wrapTCPConnWithExploration(conn, winner, metadata, connectTime, bestName, challenger), nil
 }
 
 // staggerTag identifies the winner by its position in this race. When a best
@@ -832,6 +846,10 @@ func (t *tcpTimingConn) Upstream() any { return t.Conn }
 // and speed, and penalize RST / early-death failures.  Latency (dial connectTime)
 // is recorded at dial time by the callers, not here.
 func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64) C.Conn {
+	return s.wrapTCPConnWithExploration(c, proxy, metadata, connectTime, "", "")
+}
+
+func (s *Smart) wrapTCPConnWithExploration(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, incumbent, challenger string) C.Conn {
 	key := routeKey(metadata)
 	domain := routeDomain(metadata)
 
@@ -869,8 +887,18 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, conne
 		if err != nil {
 			firstReadErr.Store(err)
 		}
+		baseline, baselineOK := smart.TTFBPrior{}, false
+		if challenger != "" && incumbent != "" {
+			baseline, baselineOK = s.routeTable.ProxyTTFBPrior(key, domain, incumbent)
+		}
 		if sampled {
 			s.routeTable.UpdateTTFB(key, domain, proxy.Name(), ttfb)
+		}
+		if err == nil && baselineOK {
+			regret := float64(ttfb) - baseline.Mean
+			s.routeTable.UpdateExplorationRegret(key, domain, challenger, regret)
+			log.Infoln("[Smart] exploration outcome key=%s challenger=%s incumbent=%s winner=%s ttfb=%dms baseline=%.0fms regret=%.0fms",
+				key, challenger, incumbent, proxy.Name(), ttfb, baseline.Mean, regret)
 		}
 		log.Infoln("[Smart] established key=%s target=%s proxy=%s latency=%dms tcp_connect=%dms ttfb=%dms",
 			key, domain, proxy.Name(), connectTime, tcpConnectTime.Milliseconds(), ttfb)
