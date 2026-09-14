@@ -52,6 +52,15 @@ type ProxyAttributes struct {
 	Jitter      float64 `json:"jitter"`
 }
 
+// TTFBPrior summarizes end-to-end TTFB observations for one proxy. Mean and
+// StdDev are in milliseconds. Samples counts independent route/domain cells,
+// not raw requests, because each cell already stores an EMA.
+type TTFBPrior struct {
+	Mean    float64
+	StdDev  float64
+	Samples int
+}
+
 // ProxyRecord is the per-proxy entry in a route table row.
 type ProxyRecord struct {
 	Name       string          `json:"name"`
@@ -65,11 +74,11 @@ type ProxyRecord struct {
 // target-dependent (TTFB especially), so sharing them across every domain
 // behind an ASN would blend unrelated sites' behavior into one noisy signal.
 type rowEntry struct {
-	key      string
-	lastUsed int64
+	key         string
+	lastUsed    int64
 	domainTable map[string]*domainCell
 	domainOrder []string
-	rowDirty bool
+	rowDirty    bool
 }
 
 // domainCell is the per-domain entry in a row's domainTable.  bestProxy and
@@ -562,6 +571,59 @@ func (rt *RouteTable) ProxyHasTTFBSample(key, domain, proxy string) bool {
 	}
 	cell, ok := dc.proxies[proxy]
 	return ok && cell.HasTTFBSample
+}
+
+// ProxyTTFBPrior returns a proxy's current-domain observation when available;
+// otherwise it pools observations from other route/domain cells as a prior.
+// The current cell is deliberately preferred so mature per-target knowledge
+// is never diluted by unrelated destinations.
+func (rt *RouteTable) ProxyTTFBPrior(key, domain, proxy string) (TTFBPrior, bool) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if row, ok := rt.rows[key]; ok {
+		if dc, ok := row.domainTable[domain]; ok {
+			if cell, ok := dc.proxies[proxy]; ok && cell.HasTTFBSample {
+				stddev := cell.Jitter
+				if !cell.HasJitterSample {
+					stddev = float64(cell.TTFB) * 0.15
+				}
+				return TTFBPrior{Mean: float64(cell.TTFB), StdDev: stddev, Samples: 1}, true
+			}
+		}
+	}
+
+	values := make([]float64, 0)
+	for rowKey, row := range rt.rows {
+		for domainName, dc := range row.domainTable {
+			if rowKey == key && domainName == domain {
+				continue
+			}
+			if cell, ok := dc.proxies[proxy]; ok && cell.HasTTFBSample {
+				values = append(values, float64(cell.TTFB))
+			}
+		}
+	}
+	if len(values) == 0 {
+		return TTFBPrior{}, false
+	}
+	var mean float64
+	for _, value := range values {
+		mean += value
+	}
+	mean /= float64(len(values))
+	var variance float64
+	for _, value := range values {
+		delta := value - mean
+		variance += delta * delta
+	}
+	variance /= float64(len(values))
+	// A single aggregate cell has no between-domain variance. Preserve enough
+	// uncertainty to allow a plausibly better proxy to be explored.
+	stddev := math.Sqrt(variance)
+	if floor := mean * 0.15; stddev < floor {
+		stddev = floor
+	}
+	return TTFBPrior{Mean: mean, StdDev: stddev, Samples: len(values)}, true
 }
 
 // UpdateTTFB updates the EMA time-to-first-byte for a (key, domain, proxy)

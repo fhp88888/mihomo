@@ -23,7 +23,7 @@ import (
 
 // stubProxy implements C.Proxy with minimal behavior for testing.
 type stubProxy struct {
-	name string
+	name  string
 	delay uint16
 	dial  func(context.Context, *C.Metadata) (C.Conn, error)
 }
@@ -46,11 +46,11 @@ func (p *udpErrorProxy) ListenPacketContext(context.Context, *C.Metadata) (C.Pac
 	return nil, errors.New("udp dial failed")
 }
 
-func (s *stubProxy) Name() string              { return s.name }
-func (s *stubProxy) Type() C.AdapterType       { return C.Direct }
-func (s *stubProxy) Addr() string              { return "" }
-func (s *stubProxy) SupportUDP() bool          { return false }
-func (s *stubProxy) ProxyInfo() C.ProxyInfo    { return C.ProxyInfo{} }
+func (s *stubProxy) Name() string           { return s.name }
+func (s *stubProxy) Type() C.AdapterType    { return C.Direct }
+func (s *stubProxy) Addr() string           { return "" }
+func (s *stubProxy) SupportUDP() bool       { return false }
+func (s *stubProxy) ProxyInfo() C.ProxyInfo { return C.ProxyInfo{} }
 func (s *stubProxy) MarshalJSON() ([]byte, error) {
 	return []byte(`"` + s.name + `"`), nil
 }
@@ -63,13 +63,13 @@ func (s *stubProxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Co
 func (s *stubProxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
 	return nil, errors.New("stub: ListenPacketContext not implemented")
 }
-func (s *stubProxy) SupportUOT() bool                      { return false }
-func (s *stubProxy) IsL3Protocol(metadata *C.Metadata) bool { return false }
-func (s *stubProxy) Unwrap(metadata *C.Metadata, touch bool) C.Proxy { return nil }
-func (s *stubProxy) Close() error                          { return nil }
-func (s *stubProxy) Adapter() C.ProxyAdapter               { return s }
-func (s *stubProxy) AliveForTestUrl(url string) bool       { return true }
-func (s *stubProxy) DelayHistory() []C.DelayHistory        { return nil }
+func (s *stubProxy) SupportUOT() bool                                   { return false }
+func (s *stubProxy) IsL3Protocol(metadata *C.Metadata) bool             { return false }
+func (s *stubProxy) Unwrap(metadata *C.Metadata, touch bool) C.Proxy    { return nil }
+func (s *stubProxy) Close() error                                       { return nil }
+func (s *stubProxy) Adapter() C.ProxyAdapter                            { return s }
+func (s *stubProxy) AliveForTestUrl(url string) bool                    { return true }
+func (s *stubProxy) DelayHistory() []C.DelayHistory                     { return nil }
 func (s *stubProxy) DelayHistoryForTestUrl(url string) []C.DelayHistory { return nil }
 func (s *stubProxy) ExtraDelayHistories() map[string]C.ProxyState       { return nil }
 func (s *stubProxy) LastDelayForTestUrl(url string) uint16              { return s.delay }
@@ -229,8 +229,8 @@ type stubConn struct {
 	closes int
 }
 
-func (s *stubConn) Read(b []byte) (n int, err error)            { return 0, io.EOF }
-func (s *stubConn) Write(b []byte) (n int, err error)           { return len(b), nil }
+func (s *stubConn) Read(b []byte) (n int, err error)  { return 0, io.EOF }
+func (s *stubConn) Write(b []byte) (n int, err error) { return len(b), nil }
 func (s *stubConn) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -242,21 +242,21 @@ func (s *stubConn) CloseCount() int {
 	defer s.mu.Unlock()
 	return s.closes
 }
-func (s *stubConn) LocalAddr() net.Addr                         { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
-func (s *stubConn) RemoteAddr() net.Addr                        { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443} }
-func (s *stubConn) SetDeadline(t time.Time) error               { return nil }
-func (s *stubConn) SetReadDeadline(t time.Time) error           { return nil }
-func (s *stubConn) SetWriteDeadline(t time.Time) error          { return nil }
-func (s *stubConn) ReadBuffer(buffer *buf.Buffer) error         { return io.EOF }
-func (s *stubConn) WriteBuffer(buffer *buf.Buffer) error        { return nil }
-func (s *stubConn) Upstream() any                               { return nil }
-func (s *stubConn) NeedHandshake() bool                         { return false }
-func (s *stubConn) ReaderReplaceable() bool                     { return false }
-func (s *stubConn) WriterReplaceable() bool                     { return false }
-func (s *stubConn) Chains() C.Chain                             { return nil }
-func (s *stubConn) ProviderChains() C.Chain                     { return nil }
-func (s *stubConn) AppendToChains(adapter C.ProxyAdapter)       {}
-func (s *stubConn) RemoteDestination() string                   { return "" }
+func (s *stubConn) LocalAddr() net.Addr                   { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
+func (s *stubConn) RemoteAddr() net.Addr                  { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443} }
+func (s *stubConn) SetDeadline(t time.Time) error         { return nil }
+func (s *stubConn) SetReadDeadline(t time.Time) error     { return nil }
+func (s *stubConn) SetWriteDeadline(t time.Time) error    { return nil }
+func (s *stubConn) ReadBuffer(buffer *buf.Buffer) error   { return io.EOF }
+func (s *stubConn) WriteBuffer(buffer *buf.Buffer) error  { return nil }
+func (s *stubConn) Upstream() any                         { return nil }
+func (s *stubConn) NeedHandshake() bool                   { return false }
+func (s *stubConn) ReaderReplaceable() bool               { return false }
+func (s *stubConn) WriterReplaceable() bool               { return false }
+func (s *stubConn) Chains() C.Chain                       { return nil }
+func (s *stubConn) ProviderChains() C.Chain               { return nil }
+func (s *stubConn) AppendToChains(adapter C.ProxyAdapter) {}
+func (s *stubConn) RemoteDestination() string             { return "" }
 
 var _ C.Conn = (*stubConn)(nil)
 
@@ -1003,6 +1003,7 @@ func TestProbeBatch_KeepsLosersAliveThroughDiscover(t *testing.T) {
 		t.Fatalf("loser latency = %dms, want 42ms (sampled via onConnect)", loserLat)
 	}
 }
+
 // =========================================================================
 // best-first race tests (serialTcpConn fast-path)
 // =========================================================================
@@ -1147,6 +1148,40 @@ func TestSmartExploration_UntestedLowLatencyChallengerPrecedesBest(t *testing.T)
 			t.Fatalf("exploration sequence contains duplicate %q: %v", name, got)
 		}
 		seen[name] = true
+	}
+}
+
+func TestSmartExploration_AggregatePriorRejectsHighDamageChallenger(t *testing.T) {
+	const key, domain = "TARGET:hk-target-4.test", "hk-target-4.test"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	rt.UpdateTTFB(key, domain, "hk-best", 800)
+	// The challenger is untested for this target, but consistently slow on
+	// other targets. Its optimistic estimate remains well behind the best.
+	rt.UpdateTTFB("TARGET:hk-target-1.test", "hk-target-1.test", "eu-risky", 1700)
+	rt.UpdateTTFB("TARGET:hk-target-2.test", "hk-target-2.test", "eu-risky", 1800)
+	rt.UpdateTTFB("TARGET:hk-target-3.test", "hk-target-3.test", "eu-risky", 1900)
+
+	if s.explorationWorthRisk(key, domain, "hk-best", "eu-risky") {
+		t.Fatal("high-damage challenger accepted despite strong aggregate prior")
+	}
+}
+
+func TestSmartExploration_AggregatePriorKeepsPlausibleAndUnknownChallengers(t *testing.T) {
+	const key, domain = "TARGET:hk-target-4.test", "hk-target-4.test"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	rt.UpdateTTFB(key, domain, "hk-best", 800)
+	rt.UpdateTTFB("TARGET:hk-target-1.test", "hk-target-1.test", "hk-plausible", 760)
+	rt.UpdateTTFB("TARGET:hk-target-2.test", "hk-target-2.test", "hk-plausible", 880)
+
+	if !s.explorationWorthRisk(key, domain, "hk-best", "hk-plausible") {
+		t.Fatal("plausibly better challenger rejected")
+	}
+	if !s.explorationWorthRisk(key, domain, "hk-best", "never-seen") {
+		t.Fatal("fully unknown challenger rejected")
 	}
 }
 

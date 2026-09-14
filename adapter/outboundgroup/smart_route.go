@@ -34,6 +34,12 @@ const (
 	smartDefaultDialWindow = 400 * time.Millisecond
 	smartMinDialWindow     = 20 * time.Millisecond
 	smartMaxDialWindow     = 2 * time.Second
+	// Explicit exploration is suppressed only when aggregate TTFB evidence says
+	// the challenger is both materially harmful and unable to beat the current
+	// best even at one standard deviation below its mean.
+	smartExploreMinGainMs       = 25.0
+	smartExploreMinDamageBudget = 250.0
+	smartExploreDamageFraction  = 0.35
 	// smartEarlyDeathLatencyLimit: a connection that fails before its first
 	// byte within this window is treated as a dead proxy, not a slow target.
 	smartEarlyDeathLatencyLimit = 5 * time.Second
@@ -186,6 +192,9 @@ func (s *Smart) challengerSequence(key, domain string, proxies []C.Proxy, bestNa
 		if p.Name() == bestName || !p.AliveForTestUrl(s.testUrl) {
 			continue
 		}
+		if bestName != "" && !s.explorationWorthRisk(key, domain, bestName, p.Name()) {
+			continue
+		}
 		if s.routeTable.ProxyHasTTFBSample(key, domain, p.Name()) {
 			tested = append(tested, p)
 		} else {
@@ -211,6 +220,37 @@ func (s *Smart) challengerSequence(key, domain string, proxies []C.Proxy, bestNa
 	})
 	tested = s.rankCandidates(key, domain, tested, nil)
 	return append(untested, tested...)
+}
+
+// explorationWorthRisk compares optimistic discovery gain with expected
+// request damage. Missing evidence remains explorable. A challenger is pruned
+// only when its expected TTFB exceeds a conservative damage budget and its
+// one-sigma optimistic estimate still offers no meaningful gain.
+func (s *Smart) explorationWorthRisk(key, domain, bestName, challengerName string) bool {
+	best, bestOK := s.routeTable.ProxyTTFBPrior(key, domain, bestName)
+	challenger, challengerOK := s.routeTable.ProxyTTFBPrior(key, domain, challengerName)
+	if !bestOK || !challengerOK {
+		return true
+	}
+	optimisticChallenger := challenger.Mean - challenger.StdDev
+	potentialGain := best.Mean - optimisticChallenger
+	if potentialGain < 0 {
+		potentialGain = 0
+	}
+	potentialDamage := challenger.Mean - best.Mean
+	if potentialDamage < 0 {
+		potentialDamage = 0
+	}
+	damageBudget := best.Mean * smartExploreDamageFraction
+	if damageBudget < smartExploreMinDamageBudget {
+		damageBudget = smartExploreMinDamageBudget
+	}
+	allowed := potentialDamage <= damageBudget || potentialGain >= smartExploreMinGainMs
+	if !allowed {
+		log.Debugln("[Smart] skip challenger %s for %s: prior mean=%.0fms stddev=%.0fms best=%.0fms gain=%.0fms damage=%.0fms budget=%.0fms samples=%d",
+			challengerName, domain, challenger.Mean, challenger.StdDev, best.Mean, potentialGain, potentialDamage, damageBudget, challenger.Samples)
+	}
+	return allowed
 }
 
 // explorationCallSequence builds one exploration race. With a known best it
