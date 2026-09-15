@@ -109,6 +109,20 @@ type domainCell struct {
 	proxies           map[string]*proxyCell
 }
 
+// ShouldExplore advances the route-family request counter and returns true
+// once every N known-route requests. Sibling resources share discoveries, so
+// they also share the budget that pays for them.
+func (rt *RouteTable) ShouldExplore(key, domain string, every uint64) bool {
+	if every == 0 {
+		return false
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	family := RouteFamily(domain)
+	rt.exploreCounts[family]++
+	return rt.exploreCounts[family]%every == 0
+}
+
 type proxyCell struct {
 	Name                  string
 	UseCount              int64
@@ -204,8 +218,9 @@ type RouteTable struct {
 	// It backs discovery ordering (exploreOrder) and the REST aggregation
 	// snapshot.  It is NOT part of calculateScore, which uses only the
 	// per-target (cell) view.  A missing proxy means "no aggregation yet".
-	proxyAttrs map[string]ProxyAttributes
-	tableDirty bool
+	proxyAttrs    map[string]ProxyAttributes
+	exploreCounts map[string]uint64
+	tableDirty    bool
 }
 
 // NewRouteTable creates a new RouteTable with the given capacity.
@@ -214,10 +229,11 @@ func NewRouteTable(maxRows int) *RouteTable {
 		maxRows = DefaultMaxRows
 	}
 	return &RouteTable{
-		rows:       make(map[string]*rowEntry),
-		maxRows:    maxRows,
-		lruOrder:   make([]string, 0, maxRows),
-		proxyAttrs: make(map[string]ProxyAttributes),
+		rows:          make(map[string]*rowEntry),
+		maxRows:       maxRows,
+		lruOrder:      make([]string, 0, maxRows),
+		proxyAttrs:    make(map[string]ProxyAttributes),
+		exploreCounts: make(map[string]uint64),
 	}
 }
 
@@ -666,6 +682,29 @@ func (rt *RouteTable) SimilarTTFBPrior(key, domain, proxy string) (TTFBPrior, bo
 		}
 	}
 	return summarizeValues(values, .30)
+}
+
+// RouteFamilyTTFBProxyCount returns how many distinct proxies have a TTFB
+// observation on this route family. It is used to distinguish initial
+// coverage from steady-state rediscovery.
+func (rt *RouteTable) RouteFamilyTTFBProxyCount(domain string) int {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	family := RouteFamily(domain)
+	seen := make(map[string]struct{})
+	for _, row := range rt.rows {
+		for name, dc := range row.domainTable {
+			if RouteFamily(name) != family {
+				continue
+			}
+			for proxy, cell := range dc.proxies {
+				if cell.HasTTFBSample {
+					seen[proxy] = struct{}{}
+				}
+			}
+		}
+	}
+	return len(seen)
 }
 
 // ExpectedFutureRequests estimates near-term demand for sibling routes from

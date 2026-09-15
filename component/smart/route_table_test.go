@@ -200,6 +200,9 @@ func TestSimilarPriorFutureDemandAndExplorationRisk(t *testing.T) {
 	k1, d1 := "TARGET:*.eu-target-1.test", "*.eu-target-1.test"
 	k2, d2 := "TARGET:*.eu-target-2.test", "*.eu-target-2.test"
 	rt.UpdateTTFB(k1, d1, "eu", 200)
+	if got := rt.RouteFamilyTTFBProxyCount(d2); got != 1 {
+		t.Fatalf("family TTFB proxy count = %d", got)
+	}
 	prior, ok := rt.SimilarTTFBPrior(k2, d2, "eu")
 	if !ok || prior.Mean != 200 {
 		t.Fatalf("similar prior = %+v, %v", prior, ok)
@@ -215,6 +218,26 @@ func TestSimilarPriorFutureDemandAndExplorationRisk(t *testing.T) {
 	risk, ok := rt.ExplorationRisk(d2, "challenger")
 	if !ok || risk.Samples != 2 || math.Abs(risk.Mean-200) > .001 || math.Abs(risk.StdDev-math.Sqrt(20000)) > .001 {
 		t.Fatalf("risk = %+v, %v", risk, ok)
+	}
+}
+
+func TestShouldExploreUsesExactRouteFamilyCadence(t *testing.T) {
+	rt := NewRouteTable(100)
+	for i := 1; i <= 50; i++ {
+		domain := "*.eu-target-1.test"
+		if i%2 == 0 {
+			domain = "*.eu-target-2.test"
+		}
+		got := rt.ShouldExplore("TARGET:"+domain, domain, 25)
+		if got != (i == 25 || i == 50) {
+			t.Fatalf("request %d: explore=%v", i, got)
+		}
+	}
+	if rt.ShouldExplore("TARGET:*.hk-target-1.test", "*.hk-target-1.test", 25) {
+		t.Fatal("a different route family inherited the first family's counter")
+	}
+	if rt.ShouldExplore("TARGET:a", "a", 0) {
+		t.Fatal("disabled cadence explored")
 	}
 }
 
