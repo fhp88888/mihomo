@@ -186,25 +186,32 @@ func TestIncrementUseCount(t *testing.T) {
 	}
 }
 
-func TestRouteFamilyHandlesFakeIPWildcard(t *testing.T) {
-	if got := RouteFamily("*.eu-target-4.test"); got != "*.eu-target-*.test" {
+func TestRouteFamilyUsesRegistrableDomain(t *testing.T) {
+	if got := RouteFamily("*.img2.eu-example.test"); got != "eu-example.test" {
 		t.Fatalf("family = %q", got)
 	}
-	if got := RouteFamily("api-v2.test"); got != "api-v2.test" {
-		t.Fatalf("non-numeric hostname changed to %q", got)
+	if got := RouteFamily("www.eu-example.test"); got != "eu-example.test" {
+		t.Fatalf("family = %q", got)
+	}
+	if DomainTreeSimilarity("www.example.com", "img1.example.com") >=
+		DomainTreeSimilarity("img2.example.com", "*.img2.example.com") {
+		t.Fatal("a parent/child pair should be closer than sibling hosts")
+	}
+	if got := DomainTreeSimilarity("www.example.com", "www.example.net"); got != 0 {
+		t.Fatalf("unrelated registrable domains have similarity %v", got)
 	}
 }
 
 func TestSimilarPriorFutureDemandAndExplorationRisk(t *testing.T) {
 	rt := NewRouteTable(100)
-	k1, d1 := "TARGET:*.eu-target-1.test", "*.eu-target-1.test"
-	k2, d2 := "TARGET:*.eu-target-2.test", "*.eu-target-2.test"
+	k1, d1 := "TARGET:www.eu-example.test", "www.eu-example.test"
+	k2, d2 := "TARGET:img1.eu-example.test", "img1.eu-example.test"
 	rt.UpdateTTFB(k1, d1, "eu", 200)
 	if got := rt.RouteFamilyTTFBProxyCount(d2); got != 1 {
 		t.Fatalf("family TTFB proxy count = %d", got)
 	}
 	prior, ok := rt.SimilarTTFBPrior(k2, d2, "eu")
-	if !ok || prior.Mean != 200 {
+	if !ok || math.Abs(prior.Mean-200) > .001 {
 		t.Fatalf("similar prior = %+v, %v", prior, ok)
 	}
 	for i := 0; i < 8; i++ {
@@ -224,20 +231,38 @@ func TestSimilarPriorFutureDemandAndExplorationRisk(t *testing.T) {
 func TestShouldExploreUsesExactRouteFamilyCadence(t *testing.T) {
 	rt := NewRouteTable(100)
 	for i := 1; i <= 50; i++ {
-		domain := "*.eu-target-1.test"
+		domain := "www.eu-example.test"
 		if i%2 == 0 {
-			domain = "*.eu-target-2.test"
+			domain = "img1.eu-example.test"
 		}
 		got := rt.ShouldExplore("TARGET:"+domain, domain, 25)
 		if got != (i == 25 || i == 50) {
 			t.Fatalf("request %d: explore=%v", i, got)
 		}
 	}
-	if rt.ShouldExplore("TARGET:*.hk-target-1.test", "*.hk-target-1.test", 25) {
+	if rt.ShouldExplore("TARGET:www.hk-example.test", "www.hk-example.test", 25) {
 		t.Fatal("a different route family inherited the first family's counter")
 	}
 	if rt.ShouldExplore("TARGET:a", "a", 0) {
 		t.Fatal("disabled cadence explored")
+	}
+}
+
+func TestSimilarPriorUsesPerformanceSignature(t *testing.T) {
+	rt := NewRouteTable(100)
+	current := "img2.example.com"
+	positive := "img1.example.com"
+	negative := "www.example.com"
+	for i, proxy := range []string{"p1", "p2", "p3"} {
+		rt.UpdateTTFB("TARGET:"+current, current, proxy, int64(100+i*100))
+		rt.UpdateTTFB("TARGET:"+positive, positive, proxy, int64(110+i*100))
+		rt.UpdateTTFB("TARGET:"+negative, negative, proxy, int64(310-i*100))
+	}
+	rt.UpdateTTFB("TARGET:"+positive, positive, "challenger", 150)
+	rt.UpdateTTFB("TARGET:"+negative, negative, "challenger", 900)
+	prior, ok := rt.SimilarTTFBPrior("TARGET:"+current, current, "challenger")
+	if !ok || prior.Mean >= 300 {
+		t.Fatalf("performance posterior did not favor matching signature: %+v, %v", prior, ok)
 	}
 }
 

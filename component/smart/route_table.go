@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/log"
+	"golang.org/x/net/publicsuffix"
 )
 
 const DefaultMaxRows = 200
@@ -603,28 +604,96 @@ func (rt *RouteTable) ProxyHasTTFBSample(key, domain, proxy string) bool {
 	return ok && cell.HasTTFBSample
 }
 
-// RouteFamily groups numbered sibling origins, including fake-IP wildcard
-// targets such as *.eu-target-1.test and *.eu-target-4.test.
+// RouteFamily returns the registrable-domain root of the domain suffix tree.
+// A leading fake-IP wildcard describes a deeper hostname and does not change
+// that root. Public suffixes alone never form a family.
 func RouteFamily(domain string) string {
-	prefix, rest := "", domain
-	if strings.HasPrefix(rest, "*.") {
-		prefix, rest = "*.", rest[2:]
+	host := strings.TrimPrefix(strings.ToLower(strings.TrimSuffix(domain, ".")), "*.")
+	if root, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
+		return root
 	}
-	labelEnd := strings.IndexByte(rest, '.')
-	if labelEnd < 0 {
-		labelEnd = len(rest)
+	parts := strings.Split(host, ".")
+	if len(parts) >= 2 {
+		return strings.Join(parts[len(parts)-2:], ".")
 	}
-	label := rest[:labelEnd]
-	dash := strings.LastIndexByte(label, '-')
-	if dash < 0 || dash == len(label)-1 {
-		return domain
-	}
-	for _, ch := range label[dash+1:] {
-		if ch < '0' || ch > '9' {
-			return domain
+	return host
+}
+
+// DomainTreeSimilarity measures proximity in a reversed, public-suffix-aware
+// domain tree. Siblings under one registrable domain are related; an ancestor
+// and descendant sharing a longer private suffix are closer. A public suffix
+// by itself contributes no similarity.
+func DomainTreeSimilarity(a, b string) float64 {
+	labels := func(domain string) (string, []string) {
+		host := strings.TrimPrefix(strings.ToLower(strings.TrimSuffix(domain, ".")), "*.")
+		root := RouteFamily(host)
+		if root == "" || !strings.HasSuffix(host, root) {
+			return root, nil
 		}
+		rootLabels := strings.Split(root, ".")
+		public, _ := publicsuffix.PublicSuffix(root)
+		publicLabels := 0
+		if public != "" {
+			publicLabels = len(strings.Split(public, "."))
+		}
+		privateCount := len(rootLabels) - publicLabels
+		if privateCount < 1 {
+			privateCount = 1
+		}
+		privateRoot := rootLabels[:privateCount]
+		sub := strings.TrimSuffix(host, "."+root)
+		parts := append([]string{}, privateRoot...)
+		if sub != host && sub != "" {
+			subLabels := strings.Split(sub, ".")
+			for i := len(subLabels) - 1; i >= 0; i-- {
+				parts = append(parts, subLabels[i])
+			}
+		}
+		return root, parts
 	}
-	return prefix + rest[:dash+1] + "*" + rest[labelEnd:]
+	rootA, aParts := labels(a)
+	rootB, bParts := labels(b)
+	if rootA == "" || rootA != rootB {
+		return 0
+	}
+	shared := 0
+	for shared < len(aParts) && shared < len(bParts) && aParts[shared] == bParts[shared] {
+		shared++
+	}
+	if shared == 0 {
+		return 0
+	}
+	distance := len(aParts) + len(bParts) - 2*shared
+	return 1 / float64(1+distance)
+}
+
+func performanceSignatureSimilarity(a, b *domainCell) float64 {
+	x, y := make([]float64, 0), make([]float64, 0)
+	for proxy, ac := range a.proxies {
+		bc, ok := b.proxies[proxy]
+		if !ok || !ac.HasTTFBSample || !bc.HasTTFBSample {
+			continue
+		}
+		x, y = append(x, float64(ac.TTFB)), append(y, float64(bc.TTFB))
+	}
+	if len(x) < 3 {
+		return 1
+	}
+	mx, my := 0.0, 0.0
+	for i := range x {
+		mx, my = mx+x[i], my+y[i]
+	}
+	mx, my = mx/float64(len(x)), my/float64(len(y))
+	cov, vx, vy := 0.0, 0.0, 0.0
+	for i := range x {
+		dx, dy := x[i]-mx, y[i]-my
+		cov, vx, vy = cov+dx*dy, vx+dx*dx, vy+dy*dy
+	}
+	if vx == 0 || vy == 0 {
+		return 1
+	}
+	correlation := cov / math.Sqrt(vx*vy)
+	return math.Max(0, math.Min(1, (correlation+1)/2))
 }
 
 func summarizeValues(values []float64, floorFraction float64) (TTFBPrior, bool) {
@@ -649,39 +718,59 @@ func summarizeValues(values []float64, floorFraction float64) (TTFBPrior, bool) 
 	return TTFBPrior{Mean: mean, StdDev: stddev, Samples: len(values)}, true
 }
 
-// SimilarTTFBPrior returns route-family evidence first, then same-ASN-row
-// evidence. It deliberately excludes the global fallback used by
-// ProxyTTFBPrior so callers can distinguish genuine network similarity.
+// SimilarTTFBPrior combines the nearest domains under the same registrable
+// root. Domain-tree proximity is the prior weight; once both domains have at
+// least three common proxy observations, their performance-signature
+// correlation becomes a posterior correction. ASN is deliberately excluded.
 func (rt *RouteTable) SimilarTTFBPrior(key, domain, proxy string) (TTFBPrior, bool) {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
-	family := RouteFamily(domain)
-	values := make([]float64, 0)
+	type neighbor struct{ value, weight float64 }
+	neighbors := make([]neighbor, 0)
+	var current *domainCell
+	if row, ok := rt.rows[key]; ok {
+		current = row.domainTable[domain]
+	}
 	for _, row := range rt.rows {
-		for name, dc := range row.domainTable {
-			if name == domain || RouteFamily(name) != family {
-				continue
-			}
-			if cell, ok := dc.proxies[proxy]; ok && cell.HasTTFBSample {
-				values = append(values, float64(cell.TTFB))
-			}
-		}
-	}
-	if prior, ok := summarizeValues(values, .20); ok {
-		return prior, true
-	}
-	values = values[:0]
-	if row, ok := rt.rows[key]; ok && strings.HasPrefix(key, "ASN:") {
 		for name, dc := range row.domainTable {
 			if name == domain {
 				continue
 			}
-			if cell, ok := dc.proxies[proxy]; ok && cell.HasTTFBSample {
-				values = append(values, float64(cell.TTFB))
+			weight := DomainTreeSimilarity(domain, name)
+			if weight == 0 {
+				continue
+			}
+			if current != nil {
+				weight *= performanceSignatureSimilarity(current, dc)
+			}
+			if cell, ok := dc.proxies[proxy]; ok && cell.HasTTFBSample && weight > 0 {
+				neighbors = append(neighbors, neighbor{float64(cell.TTFB), weight})
 			}
 		}
 	}
-	return summarizeValues(values, .30)
+	if len(neighbors) == 0 {
+		return TTFBPrior{}, false
+	}
+	sort.Slice(neighbors, func(i, j int) bool { return neighbors[i].weight > neighbors[j].weight })
+	if len(neighbors) > 8 {
+		neighbors = neighbors[:8]
+	}
+	total, mean := 0.0, 0.0
+	for _, n := range neighbors {
+		total, mean = total+n.weight, mean+n.value*n.weight
+	}
+	mean /= total
+	variance := 0.0
+	for _, n := range neighbors {
+		variance += n.weight * (n.value - mean) * (n.value - mean)
+	}
+	variance /= total
+	stddev := math.Sqrt(variance)
+	avgWeight := total / float64(len(neighbors))
+	if floor := mean * (.20 + .20*(1-avgWeight)); stddev < floor {
+		stddev = floor
+	}
+	return TTFBPrior{Mean: mean, StdDev: stddev, Samples: len(neighbors)}, true
 }
 
 // RouteFamilyTTFBProxyCount returns how many distinct proxies have a TTFB

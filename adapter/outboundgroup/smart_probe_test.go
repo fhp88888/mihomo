@@ -1152,16 +1152,16 @@ func TestSmartExploration_UntestedLowLatencyChallengerPrecedesBest(t *testing.T)
 }
 
 func TestSmartExploration_AggregatePriorRejectsHighDamageChallenger(t *testing.T) {
-	const key, domain = "TARGET:hk-target-4.test", "hk-target-4.test"
+	const key, domain = "TARGET:preview.img2.hk-example.test", "preview.img2.hk-example.test"
 	s, rt, pc := newBestRaceSmart()
 	defer pc.Close()
 
 	rt.UpdateTTFB(key, domain, "hk-best", 800)
 	// The challenger is untested for this target, but consistently slow on
 	// other targets. Its optimistic estimate remains well behind the best.
-	rt.UpdateTTFB("TARGET:hk-target-1.test", "hk-target-1.test", "eu-risky", 1700)
-	rt.UpdateTTFB("TARGET:hk-target-2.test", "hk-target-2.test", "eu-risky", 1800)
-	rt.UpdateTTFB("TARGET:hk-target-3.test", "hk-target-3.test", "eu-risky", 1900)
+	rt.UpdateTTFB("TARGET:www.hk-example.test", "www.hk-example.test", "eu-risky", 1700)
+	rt.UpdateTTFB("TARGET:img1.hk-example.test", "img1.hk-example.test", "eu-risky", 1800)
+	rt.UpdateTTFB("TARGET:img2.hk-example.test", "img2.hk-example.test", "eu-risky", 1900)
 
 	if s.explorationWorthRisk(key, domain, "hk-best", "eu-risky") {
 		t.Fatal("high-damage challenger accepted despite strong aggregate prior")
@@ -1169,13 +1169,13 @@ func TestSmartExploration_AggregatePriorRejectsHighDamageChallenger(t *testing.T
 }
 
 func TestSmartExploration_AggregatePriorKeepsPlausibleAndUnknownChallengers(t *testing.T) {
-	const key, domain = "TARGET:hk-target-4.test", "hk-target-4.test"
+	const key, domain = "TARGET:preview.img2.hk-example.test", "preview.img2.hk-example.test"
 	s, rt, pc := newBestRaceSmart()
 	defer pc.Close()
 
 	rt.UpdateTTFB(key, domain, "hk-best", 800)
-	rt.UpdateTTFB("TARGET:hk-target-1.test", "hk-target-1.test", "hk-plausible", 760)
-	rt.UpdateTTFB("TARGET:hk-target-2.test", "hk-target-2.test", "hk-plausible", 880)
+	rt.UpdateTTFB("TARGET:www.hk-example.test", "www.hk-example.test", "hk-plausible", 760)
+	rt.UpdateTTFB("TARGET:img1.hk-example.test", "img1.hk-example.test", "hk-plausible", 880)
 
 	if !s.explorationWorthRisk(key, domain, "hk-best", "hk-plausible") {
 		t.Fatal("plausibly better challenger rejected")
