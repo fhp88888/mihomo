@@ -261,8 +261,23 @@ func TestSimilarPriorUsesPerformanceSignature(t *testing.T) {
 	rt.UpdateTTFB("TARGET:"+positive, positive, "challenger", 150)
 	rt.UpdateTTFB("TARGET:"+negative, negative, "challenger", 900)
 	prior, ok := rt.SimilarTTFBPrior("TARGET:"+current, current, "challenger")
-	if !ok || prior.Mean >= 300 {
+	if !ok || prior.Mean >= 525 {
 		t.Fatalf("performance posterior did not favor matching signature: %+v, %v", prior, ok)
+	}
+}
+
+func TestSimilarPriorKeepsSiblingEvidenceDespiteOppositeSignature(t *testing.T) {
+	rt := NewRouteTable(100)
+	current := "img2.example.com"
+	sibling := "www.example.com"
+	for i, proxy := range []string{"p1", "p2", "p3"} {
+		rt.UpdateTTFB("TARGET:"+current, current, proxy, int64(100+i*100))
+		rt.UpdateTTFB("TARGET:"+sibling, sibling, proxy, int64(300-i*100))
+	}
+	rt.UpdateTTFB("TARGET:"+sibling, sibling, "challenger", 500)
+	prior, ok := rt.SimilarTTFBPrior("TARGET:"+current, current, "challenger")
+	if !ok || math.Abs(prior.Mean-500) > .001 {
+		t.Fatalf("posterior discarded same-site evidence: %+v, %v", prior, ok)
 	}
 }
 

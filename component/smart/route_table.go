@@ -736,12 +736,16 @@ func (rt *RouteTable) SimilarTTFBPrior(key, domain, proxy string) (TTFBPrior, bo
 			if name == domain {
 				continue
 			}
-			weight := DomainTreeSimilarity(domain, name)
-			if weight == 0 {
+			treeSimilarity := DomainTreeSimilarity(domain, name)
+			if treeSimilarity == 0 {
 				continue
 			}
+			// Keep most of the registrable-domain prior so a shallow tree does
+			// not discard useful sibling evidence. Tree distance and the
+			// posterior signature refine that prior instead of replacing it.
+			weight := .75 + .25*treeSimilarity
 			if current != nil {
-				weight *= performanceSignatureSimilarity(current, dc)
+				weight *= .75 + .25*performanceSignatureSimilarity(current, dc)
 			}
 			if cell, ok := dc.proxies[proxy]; ok && cell.HasTTFBSample && weight > 0 {
 				neighbors = append(neighbors, neighbor{float64(cell.TTFB), weight})
