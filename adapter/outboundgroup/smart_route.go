@@ -100,9 +100,17 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 	if s.routeTable.IsTCPProbed(key, domain) {
 		exploreEvery := uint64(rediscoverEvery)
 		covered := s.routeTable.RouteFamilyTTFBProxyCount(domain)
-		if covered < len(proxies) {
+		// Detailed per-domain observations are intentionally capped. Initial
+		// coverage is complete once that many distinct proxies have evidence;
+		// comparing against the full provider forever would keep large groups in
+		// aggressive exploration after the cache has reached its designed size.
+		targetCoverage := len(proxies)
+		if targetCoverage > smart.MaxProxyCellsPerDomain {
+			targetCoverage = smart.MaxProxyCellsPerDomain
+		}
+		if covered < targetCoverage {
 			exploreEvery = initialExploreEvery
-			remaining := len(proxies) - covered
+			remaining := targetCoverage - covered
 			if s.routeTable.ExpectedFutureRequests(domain, 30*time.Second) >= float64(remaining*4) {
 				exploreEvery = fastExploreEvery
 			}

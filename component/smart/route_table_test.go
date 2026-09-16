@@ -924,6 +924,76 @@ func TestRemoveProxy(t *testing.T) {
 	}
 }
 
+func TestProxyCellLRUEvictionProtectsBest(t *testing.T) {
+	rt := NewRouteTable(10)
+	key, domain := "ASN:64512", "example.com"
+	for i := 0; i < MaxProxyCellsPerDomain; i++ {
+		rt.UpdateLatency(key, domain, fmt.Sprintf("proxy-%02d", i), int64(10+i))
+	}
+	rt.SetBestProxyAndTCPProbed(key, domain, "proxy-00")
+	rt.SetUDPBestProxy(key, domain, "proxy-01", true)
+
+	// All cells are dirty, so the hard-bound fallback must evict the oldest
+	// non-best observation (proxy-02), not either protected best.
+	rt.UpdateLatency(key, domain, "proxy-new", 5)
+
+	proxies := domainProxies(rt.Snapshot("test").Rows[0], domain)
+	if len(proxies) != MaxProxyCellsPerDomain {
+		t.Fatalf("proxy cells = %d, want %d", len(proxies), MaxProxyCellsPerDomain)
+	}
+	for _, protected := range []string{"proxy-00", "proxy-01"} {
+		if _, ok := proxies[protected]; !ok {
+			t.Fatalf("protected best %s was evicted", protected)
+		}
+	}
+	if _, ok := proxies["proxy-02"]; ok {
+		t.Fatal("oldest non-best proxy-02 should have been evicted")
+	}
+	if _, ok := proxies["proxy-new"]; !ok {
+		t.Fatal("new proxy cell was not inserted")
+	}
+}
+
+func TestProxyCellLRUTouchMovesToBack(t *testing.T) {
+	rt := NewRouteTable(10)
+	key, domain := "ASN:64512", "example.com"
+	for i := 0; i < MaxProxyCellsPerDomain; i++ {
+		rt.UpdateLatency(key, domain, fmt.Sprintf("proxy-%02d", i), int64(10+i))
+	}
+	// Clear dirty flags so clean-cell preference follows pure observation LRU.
+	rt.SnapshotAndClearDirty()
+	rt.UpdateLatency(key, domain, "proxy-00", 20) // touch oldest
+	rt.UpdateLatency(key, domain, "proxy-new", 5)
+
+	proxies := domainProxies(rt.Snapshot("test").Rows[0], domain)
+	if _, ok := proxies["proxy-00"]; !ok {
+		t.Fatal("recently observed proxy-00 was evicted")
+	}
+	if _, ok := proxies["proxy-01"]; ok {
+		t.Fatal("least-recent clean proxy-01 should have been evicted")
+	}
+}
+
+func TestExploreCountsBoundedLRU(t *testing.T) {
+	rt := NewRouteTable(10)
+	for i := 0; i <= MaxExploreFamilies; i++ {
+		domain := fmt.Sprintf("family-%d.example", i)
+		rt.ShouldExplore("", domain, 2)
+	}
+
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if len(rt.exploreCounts) != MaxExploreFamilies {
+		t.Fatalf("exploreCounts = %d, want %d", len(rt.exploreCounts), MaxExploreFamilies)
+	}
+	if _, ok := rt.exploreCounts["family-0.example"]; ok {
+		t.Fatal("least-recent exploration family was not evicted")
+	}
+	if _, ok := rt.exploreCounts[fmt.Sprintf("family-%d.example", MaxExploreFamilies)]; !ok {
+		t.Fatal("newest exploration family is missing")
+	}
+}
+
 func TestMarkFailed(t *testing.T) {
 	rt := NewRouteTable(100)
 	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 42)

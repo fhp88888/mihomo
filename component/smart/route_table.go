@@ -32,6 +32,15 @@ const MaxDomainsPerCDNASRow = 300
 // the rest of the candidate list is filled by the latency (non-TTFB) group.
 const MaxTTFBProxiesPerRank = 6
 
+// MaxProxyCellsPerDomain bounds detailed, domain-specific observations.
+// Ranking is score-based, but storage eviction is recency-based so an early
+// high score cannot occupy a slot forever and starve new proxies of samples.
+const MaxProxyCellsPerDomain = 12
+
+// MaxExploreFamilies bounds exploration cadence counters whose route families
+// may otherwise outlive the bounded row/domain tables indefinitely.
+const MaxExploreFamilies = 1024
+
 // minConnSizeForSpeedKB gates the speed term in calculateScore: smaller
 // connections transfer too little data for a reliable throughput reading.
 const minConnSizeForSpeedKB = 4.0
@@ -108,6 +117,8 @@ type domainCell struct {
 	connSize          float64
 	hasConnSizeSample bool
 	proxies           map[string]*proxyCell
+	// Observation LRU; current TCP and UDP bests are protected on eviction.
+	proxyOrder []string
 }
 
 // ShouldExplore advances the route-family request counter and returns true
@@ -120,6 +131,16 @@ func (rt *RouteTable) ShouldExplore(key, domain string, every uint64) bool {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	family := RouteFamily(domain)
+	if _, exists := rt.exploreCounts[family]; !exists && len(rt.exploreCounts) >= MaxExploreFamilies {
+		evict := rt.exploreOrder[0]
+		rt.exploreOrder = rt.exploreOrder[1:]
+		delete(rt.exploreCounts, evict)
+	}
+	if _, exists := rt.exploreCounts[family]; exists {
+		rt.exploreOrder = moveToBack(rt.exploreOrder, family)
+	} else {
+		rt.exploreOrder = append(rt.exploreOrder, family)
+	}
 	rt.exploreCounts[family]++
 	return rt.exploreCounts[family]%every == 0
 }
@@ -221,6 +242,7 @@ type RouteTable struct {
 	// per-target (cell) view.  A missing proxy means "no aggregation yet".
 	proxyAttrs    map[string]ProxyAttributes
 	exploreCounts map[string]uint64
+	exploreOrder  []string
 	tableDirty    bool
 }
 
@@ -235,6 +257,7 @@ func NewRouteTable(maxRows int) *RouteTable {
 		lruOrder:      make([]string, 0, maxRows),
 		proxyAttrs:    make(map[string]ProxyAttributes),
 		exploreCounts: make(map[string]uint64),
+		exploreOrder:  make([]string, 0, MaxExploreFamilies),
 	}
 }
 
@@ -338,7 +361,14 @@ func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domai
 	}
 
 	now := time.Now().Unix()
-	cell := &domainCell{domainName: domain, connSize: 100, firstUsed: now, lastUsed: now, proxies: make(map[string]*proxyCell)}
+	cell := &domainCell{
+		domainName: domain,
+		connSize:   100,
+		firstUsed:  now,
+		lastUsed:   now,
+		proxies:    make(map[string]*proxyCell),
+		proxyOrder: make([]string, 0, MaxProxyCellsPerDomain),
+	}
 	row.domainTable[domain] = cell
 	row.domainOrder = append(row.domainOrder, domain)
 	row.rowDirty = true
@@ -487,10 +517,44 @@ func (rt *RouteTable) SetBestProxyAndTCPProbedPreserveEvaluation(key, domain, pr
 // Must be called with mu held.
 func (rt *RouteTable) getOrCreateCell(dc *domainCell, proxy string) *proxyCell {
 	cell, ok := dc.proxies[proxy]
-	if !ok {
-		cell = &proxyCell{Name: proxy}
-		dc.proxies[proxy] = cell
+	if ok {
+		dc.proxyOrder = moveToBack(dc.proxyOrder, proxy)
+		return cell
 	}
+
+	if len(dc.proxies) >= MaxProxyCellsPerDomain {
+		evictIdx := -1
+		// Prefer a clean LRU cell. Best proxies are routing state rather than
+		// disposable observations and must remain resident.
+		for i, name := range dc.proxyOrder {
+			if name == dc.tcpBestProxy || name == dc.udpBestProxy {
+				continue
+			}
+			if existing := dc.proxies[name]; existing != nil && !existing.Dirty {
+				evictIdx = i
+				break
+			}
+		}
+		// Preserve the hard bound even when every cell changed since the last
+		// persistence pass; the oldest non-best observation is least valuable.
+		if evictIdx < 0 {
+			for i, name := range dc.proxyOrder {
+				if name != dc.tcpBestProxy && name != dc.udpBestProxy {
+					evictIdx = i
+					break
+				}
+			}
+		}
+		if evictIdx >= 0 {
+			evict := dc.proxyOrder[evictIdx]
+			dc.proxyOrder = append(dc.proxyOrder[:evictIdx], dc.proxyOrder[evictIdx+1:]...)
+			delete(dc.proxies, evict)
+		}
+	}
+
+	cell = &proxyCell{Name: proxy}
+	dc.proxies[proxy] = cell
+	dc.proxyOrder = append(dc.proxyOrder, proxy)
 	return cell
 }
 
@@ -1597,6 +1661,12 @@ func (rt *RouteTable) RemoveProxy(name string) {
 	for _, row := range rt.rows {
 		for _, dc := range row.domainTable {
 			delete(dc.proxies, name)
+			for i, proxyName := range dc.proxyOrder {
+				if proxyName == name {
+					dc.proxyOrder = append(dc.proxyOrder[:i], dc.proxyOrder[i+1:]...)
+					break
+				}
+			}
 			if dc.tcpBestProxy == name {
 				dc.tcpBestProxy = ""
 				dc.tcpProbed = false
