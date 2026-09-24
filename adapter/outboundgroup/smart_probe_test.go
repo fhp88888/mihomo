@@ -1151,6 +1151,39 @@ func TestSmartExploration_UntestedLowLatencyChallengerPrecedesBest(t *testing.T)
 	}
 }
 
+func TestSmartExploration_SiblingPriorPrunesWithoutMarkingTested(t *testing.T) {
+	const key, domain = "TARGET:page.example.test", "page.example.test"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	best := &stubProxy{name: "best", delay: 90}
+	exactTested := &stubProxy{name: "exact-tested", delay: 70}
+	siblingOnly := &stubProxy{name: "sibling-only", delay: 80}
+	riskySibling := &stubProxy{name: "risky-sibling", delay: 60}
+
+	rt.UpdateTTFB(key, domain, best.Name(), 300)
+	rt.UpdateTTFB(key, domain, exactTested.Name(), 200)
+	rt.UpdateTTFB("TARGET:other.example.test", "other.example.test", siblingOnly.Name(), 350)
+	rt.UpdateTTFB("TARGET:other.example.test", "other.example.test", riskySibling.Name(), 1500)
+	rt.SetBestProxyAndTCPProbed(key, domain, best.Name())
+
+	ordered, bestName := s.explorationCallSequence(key, domain,
+		[]C.Proxy{best, exactTested, siblingOnly, riskySibling})
+	got := namesOf(ordered)
+	if bestName != best.Name() {
+		t.Fatalf("best name = %q, want %q", bestName, best.Name())
+	}
+	if len(got) == 0 || got[0] != siblingOnly.Name() {
+		t.Fatalf("exploration sequence = %v, want sibling-only before locally tested proxy", got)
+	}
+	for _, name := range namesOf(s.challengerSequence(key, domain,
+		[]C.Proxy{best, exactTested, siblingOnly, riskySibling}, best.Name())) {
+		if name == riskySibling.Name() {
+			t.Fatalf("risky sibling was not pruned from challengers: %v", got)
+		}
+	}
+}
+
 func TestSmartExploration_AggregatePriorRejectsHighDamageChallenger(t *testing.T) {
 	const key, domain = "TARGET:preview.img2.hk-example.test", "preview.img2.hk-example.test"
 	s, rt, pc := newBestRaceSmart()

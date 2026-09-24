@@ -18,7 +18,7 @@ const DefaultMaxRows = 200
 const RouteTableMetaKey = "__table__"
 
 // MaxDomainsPerNormalASRow caps the per-row domain table (LRU) for a normal
-// ASN or TARGET row: each tracks at most this many distinct effective domains
+// ASN or TARGET row: each tracks at most this many distinct hostnames or IPs
 // by connection size.
 const MaxDomainsPerNormalASRow = 50
 
@@ -37,9 +37,9 @@ const MaxTTFBProxiesPerRank = 6
 // high score cannot occupy a slot forever and starve new proxies of samples.
 const MaxProxyCellsPerDomain = 12
 
-// MaxExploreFamilies bounds exploration cadence counters whose route families
-// may otherwise outlive the bounded row/domain tables indefinitely.
-const MaxExploreFamilies = 1024
+// MaxExploreRoutes bounds exploration cadence counters whose routes may
+// otherwise outlive the bounded row/domain tables indefinitely.
+const MaxExploreRoutes = 1024
 
 // minConnSizeForSpeedKB gates the speed term in calculateScore: smaller
 // connections transfer too little data for a reliable throughput reading.
@@ -121,28 +121,31 @@ type domainCell struct {
 	proxyOrder []string
 }
 
-// ShouldExplore advances the route-family request counter and returns true
-// once every N known-route requests. Sibling resources share discoveries, so
-// they also share the budget that pays for them.
+// ShouldExplore advances this route's request counter and returns true once
+// every N known-route requests. Sibling observations inform risk pruning, but
+// must not consume this route's opportunities to gather its own TTFB samples.
 func (rt *RouteTable) ShouldExplore(key, domain string, every uint64) bool {
 	if every == 0 {
 		return false
 	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	family := RouteFamily(domain)
-	if _, exists := rt.exploreCounts[family]; !exists && len(rt.exploreCounts) >= MaxExploreFamilies {
+	route := domain
+	if key != "" {
+		route = key + "\x00" + domain
+	}
+	if _, exists := rt.exploreCounts[route]; !exists && len(rt.exploreCounts) >= MaxExploreRoutes {
 		evict := rt.exploreOrder[0]
 		rt.exploreOrder = rt.exploreOrder[1:]
 		delete(rt.exploreCounts, evict)
 	}
-	if _, exists := rt.exploreCounts[family]; exists {
-		rt.exploreOrder = moveToBack(rt.exploreOrder, family)
+	if _, exists := rt.exploreCounts[route]; exists {
+		rt.exploreOrder = moveToBack(rt.exploreOrder, route)
 	} else {
-		rt.exploreOrder = append(rt.exploreOrder, family)
+		rt.exploreOrder = append(rt.exploreOrder, route)
 	}
-	rt.exploreCounts[family]++
-	return rt.exploreCounts[family]%every == 0
+	rt.exploreCounts[route]++
+	return rt.exploreCounts[route]%every == 0
 }
 
 type proxyCell struct {
@@ -257,7 +260,7 @@ func NewRouteTable(maxRows int) *RouteTable {
 		lruOrder:      make([]string, 0, maxRows),
 		proxyAttrs:    make(map[string]ProxyAttributes),
 		exploreCounts: make(map[string]uint64),
-		exploreOrder:  make([]string, 0, MaxExploreFamilies),
+		exploreOrder:  make([]string, 0, MaxExploreRoutes),
 	}
 }
 
@@ -841,9 +844,30 @@ func (rt *RouteTable) SimilarTTFBPrior(key, domain, proxy string) (TTFBPrior, bo
 	return TTFBPrior{Mean: mean, StdDev: stddev, Samples: len(neighbors)}, true
 }
 
-// RouteFamilyTTFBProxyCount returns how many distinct proxies have a TTFB
-// observation on this route family. It is used to distinguish initial
-// coverage from steady-state rediscovery.
+// RouteTTFBProxyCount returns how many proxies have a TTFB observation on
+// this exact route. Sibling observations must not count as local coverage.
+func (rt *RouteTable) RouteTTFBProxyCount(key, domain string) int {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return 0
+	}
+	dc, ok := row.domainTable[domain]
+	if !ok {
+		return 0
+	}
+	count := 0
+	for _, cell := range dc.proxies {
+		if cell.HasTTFBSample {
+			count++
+		}
+	}
+	return count
+}
+
+// RouteFamilyTTFBProxyCount reports distinct proxies observed across a route
+// family. It does not measure the coverage of an individual route.
 func (rt *RouteTable) RouteFamilyTTFBProxyCount(domain string) int {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
@@ -864,9 +888,33 @@ func (rt *RouteTable) RouteFamilyTTFBProxyCount(domain string) int {
 	return len(seen)
 }
 
+// ExpectedRouteFutureRequests estimates demand for this exact route when
+// deciding whether to accelerate its own initial exploration.
+func (rt *RouteTable) ExpectedRouteFutureRequests(key, domain string, horizon time.Duration) float64 {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return 1
+	}
+	dc, ok := row.domainTable[domain]
+	if !ok {
+		return 1
+	}
+	uses := int64(0)
+	for _, cell := range dc.proxies {
+		uses += cell.UseCount
+	}
+	if uses <= 1 || dc.firstUsed == 0 {
+		return 1
+	}
+	elapsed := math.Max(time.Since(time.Unix(dc.firstUsed, 0)).Seconds(), 1)
+	estimate := float64(uses) / elapsed * horizon.Seconds()
+	return math.Max(1, math.Min(estimate, 32))
+}
+
 // ExpectedFutureRequests estimates near-term demand for sibling routes from
-// their observed request rate, bounded to prevent a burst from creating an
-// unlimited exploration budget.
+// their observed request rate. It is used only to budget risk pruning.
 func (rt *RouteTable) ExpectedFutureRequests(domain string, horizon time.Duration) float64 {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()

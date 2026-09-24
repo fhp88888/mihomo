@@ -244,8 +244,8 @@ func TestRouteKey(t *testing.T) {
 	})
 }
 
-// TestRouteDomain verifies that the per-domain key is the effective target,
-// not the rule descriptor the tunnel pre-populates into metadata.SmartTarget.
+// TestRouteDomain verifies that the per-domain key is the full hostname,
+// not the broader effective target or the rule descriptor in SmartTarget.
 // This must match the conn-size bucket written by wrapTCPConn's close callback
 // so routing state and conn-size land in the same domainCell.
 func TestRouteDomain(t *testing.T) {
@@ -255,10 +255,37 @@ func TestRouteDomain(t *testing.T) {
 	}
 
 	// Rule-matched traffic: SmartTarget is a rule descriptor, but the domain
-	// key must still be the effective target.
+	// key remains the actual hostname.
 	m := &C.Metadata{Host: "www.example.com", DstIP: ip, SmartTarget: "DomainSuffix [example.com]"}
 	if got := routeDomain(m); got != "www.example.com" {
 		t.Fatalf("routeDomain = %q, want %q", got, "www.example.com")
+	}
+
+	// Hosts that share an effective target must retain independent Best cells.
+	rt := smart.NewRouteTable(10)
+	key := "TARGET:*.gov-tw.test"
+	for host, best := range map[string]string{
+		"gov-tw.test":             "tw-ss-1",
+		"WWW.gov-tw.test.":        "sg-ss-2",
+		"data.gov-tw.test":        "tw-ss-2",
+		"www.service.gov-tw.test": "jp-ss-1",
+	} {
+		m.Host = host
+		rt.SetBestProxy(key, routeDomain(m), best)
+	}
+	for host, want := range map[string]string{
+		"gov-tw.test":             "tw-ss-1",
+		"www.gov-tw.test":         "sg-ss-2",
+		"data.gov-tw.test":        "tw-ss-2",
+		"www.service.gov-tw.test": "jp-ss-1",
+	} {
+		m.Host = host
+		if got, ok := rt.GetBestProxy(key, routeDomain(m)); !ok || got != want {
+			t.Fatalf("Best for %s = %q, %v; want %q", host, got, ok, want)
+		}
+	}
+	if smart.DomainTreeSimilarity("www.gov-tw.test", "data.gov-tw.test") == 0 {
+		t.Fatal("related hosts should still share domain-tree prior evidence")
 	}
 
 	// IP-only traffic falls back to the IP.
@@ -299,9 +326,9 @@ func hasDupNames(names []string) bool {
 func TestExploreOrder_DeferredLast(t *testing.T) {
 	rt := smart.NewRouteTable(10)
 	rt.SetProxyAttrs(map[string]smart.ProxyAttributes{
-		"good":    {Score: 5.0},
+		"good":     {Score: 5.0},
 		"deferred": {Score: 6.0, FailedCount: 1.0}, // high score but failed
-		"lossy":   {Score: 4.0, PkgLoss: 0.3},      // high pkg loss
+		"lossy":    {Score: 4.0, PkgLoss: 0.3},     // high pkg loss
 	})
 	s := &Smart{routeTable: rt, testUrl: "test"}
 

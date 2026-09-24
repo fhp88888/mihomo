@@ -210,6 +210,12 @@ func TestSimilarPriorFutureDemandAndExplorationRisk(t *testing.T) {
 	if got := rt.RouteFamilyTTFBProxyCount(d2); got != 1 {
 		t.Fatalf("family TTFB proxy count = %d", got)
 	}
+	if got := rt.RouteTTFBProxyCount(k2, d2); got != 0 {
+		t.Fatalf("sibling observation counted as local coverage: %d", got)
+	}
+	if got := rt.RouteTTFBProxyCount(k1, d1); got != 1 {
+		t.Fatalf("local TTFB proxy count = %d, want 1", got)
+	}
 	prior, ok := rt.SimilarTTFBPrior(k2, d2, "eu")
 	if !ok || math.Abs(prior.Mean-200) > .001 {
 		t.Fatalf("similar prior = %+v, %v", prior, ok)
@@ -220,6 +226,12 @@ func TestSimilarPriorFutureDemandAndExplorationRisk(t *testing.T) {
 	if future := rt.ExpectedFutureRequests(d2, 30*time.Second); future <= 1 || future > 32 {
 		t.Fatalf("future requests = %v", future)
 	}
+	if future := rt.ExpectedRouteFutureRequests(k2, d2, 30*time.Second); future != 1 {
+		t.Fatalf("sibling demand counted as local demand: %v", future)
+	}
+	if future := rt.ExpectedRouteFutureRequests(k1, d1, 30*time.Second); future <= 1 || future > 32 {
+		t.Fatalf("local future requests = %v", future)
+	}
 	rt.UpdateExplorationRegret(k1, d1, "challenger", 100)
 	rt.UpdateExplorationRegret(k1, d1, "challenger", 300)
 	risk, ok := rt.ExplorationRisk(d2, "challenger")
@@ -228,7 +240,7 @@ func TestSimilarPriorFutureDemandAndExplorationRisk(t *testing.T) {
 	}
 }
 
-func TestShouldExploreUsesExactRouteFamilyCadence(t *testing.T) {
+func TestShouldExploreUsesExactRouteCadence(t *testing.T) {
 	rt := NewRouteTable(100)
 	for i := 1; i <= 50; i++ {
 		domain := "www.eu-example.test"
@@ -236,12 +248,15 @@ func TestShouldExploreUsesExactRouteFamilyCadence(t *testing.T) {
 			domain = "img1.eu-example.test"
 		}
 		got := rt.ShouldExplore("TARGET:"+domain, domain, 25)
-		if got != (i == 25 || i == 50) {
+		if got != (i == 49 || i == 50) {
 			t.Fatalf("request %d: explore=%v", i, got)
 		}
 	}
+	if rt.ShouldExplore("ASN:other", "www.eu-example.test", 25) {
+		t.Fatal("same domain under a different route key inherited the counter")
+	}
 	if rt.ShouldExplore("TARGET:www.hk-example.test", "www.hk-example.test", 25) {
-		t.Fatal("a different route family inherited the first family's counter")
+		t.Fatal("a different route inherited the first route's counter")
 	}
 	if rt.ShouldExplore("TARGET:a", "a", 0) {
 		t.Fatal("disabled cadence explored")
@@ -976,21 +991,21 @@ func TestProxyCellLRUTouchMovesToBack(t *testing.T) {
 
 func TestExploreCountsBoundedLRU(t *testing.T) {
 	rt := NewRouteTable(10)
-	for i := 0; i <= MaxExploreFamilies; i++ {
+	for i := 0; i <= MaxExploreRoutes; i++ {
 		domain := fmt.Sprintf("family-%d.example", i)
 		rt.ShouldExplore("", domain, 2)
 	}
 
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
-	if len(rt.exploreCounts) != MaxExploreFamilies {
-		t.Fatalf("exploreCounts = %d, want %d", len(rt.exploreCounts), MaxExploreFamilies)
+	if len(rt.exploreCounts) != MaxExploreRoutes {
+		t.Fatalf("exploreCounts = %d, want %d", len(rt.exploreCounts), MaxExploreRoutes)
 	}
 	if _, ok := rt.exploreCounts["family-0.example"]; ok {
-		t.Fatal("least-recent exploration family was not evicted")
+		t.Fatal("least-recent exploration route was not evicted")
 	}
-	if _, ok := rt.exploreCounts[fmt.Sprintf("family-%d.example", MaxExploreFamilies)]; !ok {
-		t.Fatal("newest exploration family is missing")
+	if _, ok := rt.exploreCounts[fmt.Sprintf("family-%d.example", MaxExploreRoutes)]; !ok {
+		t.Fatal("newest exploration route is missing")
 	}
 }
 
