@@ -3,6 +3,7 @@ package smart
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -585,6 +586,37 @@ func TestRankByScoreSkipsProxiesSlowerThanMinTTFB(t *testing.T) {
 	// TTFB group (proxy-a) first, then the latency group by score.
 	if ranked[0] != "proxy-a" || ranked[1] != "proxy-c" || ranked[2] != "proxy-d" {
 		t.Fatalf("unexpected order: %v", ranked)
+	}
+}
+
+func TestRankByScoreURLTestDelayOnlyRanksUnknownProxies(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	proxies := []string{"unknown-slow", "sampled", "unknown-fast", "dial-slow"}
+	urlTest := func(name string) uint16 {
+		switch name {
+		case "unknown-slow":
+			return 1200
+		case "unknown-fast":
+			return 300
+		case "dial-slow":
+			return 1 // URL-test cannot override a measured dial latency.
+		default:
+			return 0xffff
+		}
+	}
+
+	// Before any local TTFB sample, URL-test orders the unknown proxies.
+	if got := rt.RankByScore(proxies[:3], urlTest, key, testDomain); !slices.Equal(got, []string{"unknown-fast", "unknown-slow", "sampled"}) {
+		t.Fatalf("cold-start URL-test ranking: got %v", got)
+	}
+
+	rt.UpdateTTFB(key, testDomain, "sampled", 100)
+	rt.UpdateLatency(key, testDomain, "dial-slow", 200)
+	got := rt.RankByScore(proxies, urlTest, key, testDomain)
+	want := []string{"sampled", "unknown-fast", "unknown-slow"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("URL-test delays must not prune unknown proxies; got %v, want %v", got, want)
 	}
 }
 

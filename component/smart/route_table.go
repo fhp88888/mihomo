@@ -1266,13 +1266,13 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 //     latency as the response-time term; at most MaxTTFBProxiesPerRank of them
 //     survive (the top-scored ones), so a crowded TTFB group cannot crowd out
 //     the latency-ranked fallbacks;
-//   - proxies without a TTFB sample whose latency already exceeds the domain's
-//     minimum TTFB (a known-faster first-byte makes them hopeless) are skipped;
-//     the rest are ranked after the TTFB group by latency-derived score.
+//   - proxies without a TTFB sample whose measured dial latency already exceeds
+//     the domain's minimum TTFB are skipped; the rest are ranked after the TTFB
+//     group. URL-test delay is only a ranking fallback, never a pruning bound.
 //
 // With no TTFB sample at all (cold start for this domain) it falls back to
 // latency-derived scores as before.
-func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(string) uint16, key, domain string) []string {
+func (rt *RouteTable) RankByScore(proxies []string, urlTestDelay func(string) uint16, key, domain string) []string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
@@ -1328,32 +1328,33 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 			continue
 		}
 
-		// No TTFB sample: resolve a latency — cell EMA when the cell has any
-		// data (a failed-only cell keeps latency 0 so its failure penalty still
-		// drives it to the back), otherwise the health-check fallback.
-		var latency int64
+		// No TTFB sample: use the dial-latency EMA when the cell has data,
+		// otherwise use URL-test only to order cold candidates. A failed-only
+		// cell keeps rankingDelay 0 so its failure penalty drives it back.
+		var rankingDelay int64
 		var speed, pkgLoss, failedCount, jitter float64
 		if cell != nil && cell.hasData() {
-			latency = cell.Latency
+			rankingDelay = cell.Latency
 			speed = cell.Speed
 			pkgLoss = cell.PkgLoss
 			failedCount = cell.FailedCount
 			jitter = cell.Jitter
-		} else if healthCheckLatency != nil {
-			if hc := healthCheckLatency(proxy); hc != 0 && hc != 0xffff {
-				latency = int64(hc)
+		} else if urlTestDelay != nil {
+			if delay := urlTestDelay(proxy); delay != 0 && delay != 0xffff {
+				rankingDelay = int64(delay)
 			}
 		}
 
-		// Once any proxy has a TTFB sample, a proxy whose latency already
-		// exceeds the known minimum first-byte time cannot win — skip it.
-		if hasTTFB && latency > minTTFB {
+		// Only a measured dial latency can bound this proxy's first-byte time.
+		// The URL-test fallback includes a request to another target and
+		// must never be used as a pruning bound.
+		if hasTTFB && cell != nil && cell.HasLatencySample && cell.Latency > minTTFB {
 			continue
 		}
 
 		cands = append(cands, candidate{
 			name:  proxy,
-			score: calculateScore(latency, speed, pkgLoss, failedCount, jitter, connSizeKB),
+			score: calculateScore(rankingDelay, speed, pkgLoss, failedCount, jitter, connSizeKB),
 			ttfb:  false,
 		})
 	}
