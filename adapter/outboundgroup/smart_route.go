@@ -980,8 +980,8 @@ func (s *Smart) wrapTCPConnWithExploration(c C.Conn, proxy C.Proxy, metadata *C.
 					proxy.Name(), domain, baseline.Mean, ttfb)
 			}
 			candidate, _ := s.routeTable.ProxyTTFBPrior(key, domain, proxy.Name())
-			log.Infoln("[Smart] exploration outcome key=%s target=%s challenger=%s incumbent=%s winner=%s ttfb=%dms baseline=%.0fms candidate_ema=%.0fms regret=%.0fms",
-				key, domain, challenger, incumbent, proxy.Name(), ttfb, baseline.Mean, candidate.Mean, regret)
+			log.Infoln("[Smart] exploration outcome key=%s target=%s challenger=%s incumbent=%s ttfb=%dms baseline=%.0fms candidate_ema=%.0fms regret=%.0fms",
+				key, domain, challenger, incumbent, ttfb, baseline.Mean, candidate.Mean, regret)
 		}
 		if err == nil && refreshAfterSample {
 			// A stale-route recheck has completed even if its candidate did not
