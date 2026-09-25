@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	smartBestProxyFreshness = 5 * time.Second
+	smartBestProxyFreshness = 1 * time.Second
 	smartTCPFallbackStagger = 200 * time.Millisecond
 	// smartDefaultDialWindow is used until a candidate has a historical dial
 	// sample. Once sampled, its head start is 1.5x the dial-latency EMA, clamped
