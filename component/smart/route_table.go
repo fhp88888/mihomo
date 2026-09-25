@@ -499,6 +499,42 @@ func (rt *RouteTable) SetTCPProbed(key, domain string) {
 	rt.setDomainState(key, domain, "", false, true, true)
 }
 
+// SetTCPProbedPreserveEvaluation records a successful exploration dial without
+// replacing the best or refreshing its evaluation time. Another in-flight
+// request may already have promoted a new best since this dial began.
+func (rt *RouteTable) SetTCPProbedPreserveEvaluation(key, domain string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.setDomainState(key, domain, "", false, true, false)
+}
+
+// PromoteTCPBestIfCurrent prevents a late dial or exploration result from
+// replacing a best that changed after the request captured its incumbent.
+func (rt *RouteTable) PromoteTCPBestIfCurrent(key, domain, incumbent, challenger string) bool {
+	return rt.promoteTCPBestIfCurrent(key, domain, incumbent, challenger, false)
+}
+
+// PromoteTCPBestAfterFallback also accepts an empty best: a failed dial may
+// have cleared the incumbent before the fallback connected.
+func (rt *RouteTable) PromoteTCPBestAfterFallback(key, domain, incumbent, fallback string) bool {
+	return rt.promoteTCPBestIfCurrent(key, domain, incumbent, fallback, true)
+}
+
+func (rt *RouteTable) promoteTCPBestIfCurrent(key, domain, incumbent, challenger string, allowEmpty bool) bool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return false
+	}
+	cell, ok := row.domainTable[domain]
+	if !ok || cell.tcpBestProxy != incumbent && (!allowEmpty || cell.tcpBestProxy != "") {
+		return false
+	}
+	rt.setDomainState(key, domain, challenger, true, true, true)
+	return true
+}
+
 // SetBestProxyAndTCPProbed sets the domain's best proxy and TCP-probed flag
 // atomically, so a MarkFailed interleaving cannot leave bestProxy empty with
 // tcpProbed set.

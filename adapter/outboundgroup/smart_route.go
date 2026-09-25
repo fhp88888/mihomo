@@ -139,7 +139,12 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 				exploreEvery = fastExploreEvery
 			}
 		}
-		if s.routeTable.ShouldExplore(key, domain, exploreEvery) {
+		shouldExplore := s.routeTable.ShouldExplore(key, domain, exploreEvery)
+		bestName, _ := s.routeTable.GetBestProxy(key, domain)
+		log.Debugln("[SmartTrace] decision key=%s target=%s best=%s coverage=%d/%d eligible_remaining=%d cadence=%d explore=%t",
+			key, domain, bestName,
+			covered, targetCoverage, remaining, exploreEvery, shouldExplore)
+		if shouldExplore {
 			conn, err := s.exploreTcpConn(ctx, metadata, key, domain, proxies)
 			if conn != nil || err != nil {
 				return conn, err
@@ -200,6 +205,7 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key, do
 	}
 	firstWindow := s.adaptiveDialWindow(key, domain, ordered[0].Name())
 	incumbent, _ := s.routeTable.GetBestProxy(key, domain)
+	log.Debugln("[SmartTrace] stale-rerank key=%s target=%s best=%s first=%s", key, domain, incumbent, ordered[0].Name())
 	incumbentAlive := false
 	for _, proxy := range proxies {
 		if proxy.Name() == incumbent && proxy.AliveForTestUrl(s.testUrl) {
@@ -211,7 +217,7 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key, do
 		incumbent = ""
 	}
 	conn, err := s.raceAndWrapExploration(ctx, metadata, key, domain, ordered, firstWindow, nil,
-		incumbent)
+		incumbent, true)
 	if conn != nil || err != nil {
 		return conn, err
 	}
@@ -345,6 +351,8 @@ func (s *Smart) explorationCallSequence(key, domain string, proxies []C.Proxy) (
 		return bestSequence, bestName
 	}
 	challenger := challengers[0]
+	log.Debugln("[SmartTrace] challenger key=%s target=%s best=%s chosen=%s eligible=%d exact_sample=%t",
+		key, domain, bestName, challenger.Name(), len(challengers), s.routeTable.ProxyHasTTFBSample(key, domain, challenger.Name()))
 	callSequence := make([]C.Proxy, 0, len(bestSequence)+1)
 	callSequence = append(callSequence, challenger)
 	for _, p := range bestSequence {
@@ -366,7 +374,7 @@ func (s *Smart) exploreTcpConn(ctx context.Context, metadata *C.Metadata, key, d
 	}
 	var drainWG sync.WaitGroup
 	firstWindow := s.adaptiveDialWindow(key, domain, ordered[0].Name())
-	conn, err := s.raceAndWrapExploration(raceCtx, metadata, key, domain, ordered, firstWindow, &drainWG, bestName)
+	conn, err := s.raceAndWrapExploration(raceCtx, metadata, key, domain, ordered, firstWindow, &drainWG, bestName, false)
 	go func() {
 		drainWG.Wait()
 		finishRace()
@@ -421,20 +429,20 @@ func (s *Smart) rankCandidates(key, domain string, proxies []C.Proxy, best C.Pro
 // background.
 func (s *Smart) raceAndWrap(ctx context.Context, metadata *C.Metadata, key, domain string,
 	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, bestName string) (C.Conn, error) {
-	return s.raceAndWrapPolicy(ctx, metadata, key, domain, ordered, firstStagger, wg, bestName, "")
+	return s.raceAndWrapPolicy(ctx, metadata, key, domain, ordered, firstStagger, wg, bestName, "", false)
 }
 
 func (s *Smart) raceAndWrapExploration(ctx context.Context, metadata *C.Metadata, key, domain string,
-	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, bestName string) (C.Conn, error) {
+	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, bestName string, refreshAfterSample bool) (C.Conn, error) {
 	challenger := ""
 	if len(ordered) > 0 && bestName != "" && ordered[0].Name() != bestName {
 		challenger = ordered[0].Name()
 	}
-	return s.raceAndWrapPolicy(ctx, metadata, key, domain, ordered, firstStagger, wg, bestName, challenger)
+	return s.raceAndWrapPolicy(ctx, metadata, key, domain, ordered, firstStagger, wg, bestName, challenger, refreshAfterSample)
 }
 
 func (s *Smart) raceAndWrapPolicy(ctx context.Context, metadata *C.Metadata, key, domain string,
-	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, bestName, challenger string) (C.Conn, error) {
+	ordered []C.Proxy, firstStagger time.Duration, wg *sync.WaitGroup, bestName, challenger string, refreshAfterSample bool) (C.Conn, error) {
 	winner, conn, connectTime, err := raceStaggered(ctx, ordered, wg, firstStagger,
 		// Race dials go through dialTCP, which records a genuine dial failure
 		// as MarkFailed.
@@ -454,12 +462,14 @@ func (s *Smart) raceAndWrapPolicy(ctx context.Context, metadata *C.Metadata, key
 		// that the challenger improved the end-to-end request.
 		func(proxy C.Proxy, connectTime int64) {
 			tag := staggerTag(ordered, proxy.Name(), bestName)
-			log.Infoln("[Smart] route key=%s routed via %s (%dms, %s)", key, proxy.Name(), connectTime, tag)
+			log.Infoln("[Smart] route key=%s target=%s routed via %s (%dms, %s)", key, domain, proxy.Name(), connectTime, tag)
 			s.routeTable.IncrementUseCount(key, domain, proxy.Name())
 			if challenger != "" && bestName != "" {
-				s.routeTable.SetBestProxyAndTCPProbedPreserveEvaluation(key, domain, bestName)
+				s.routeTable.SetTCPProbedPreserveEvaluation(key, domain)
 			} else if bestName != "" && proxy.Name() == bestName {
-				s.routeTable.SetBestProxyAndTCPProbedPreserveEvaluation(key, domain, proxy.Name())
+				s.routeTable.SetTCPProbedPreserveEvaluation(key, domain)
+			} else if bestName != "" {
+				s.routeTable.PromoteTCPBestAfterFallback(key, domain, bestName, proxy.Name())
 			} else {
 				s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
 			}
@@ -471,7 +481,7 @@ func (s *Smart) raceAndWrapPolicy(ctx context.Context, metadata *C.Metadata, key
 	if conn == nil {
 		return nil, nil
 	}
-	return s.wrapTCPConnWithExploration(conn, winner, metadata, connectTime, bestName, challenger), nil
+	return s.wrapTCPConnWithExploration(conn, winner, metadata, connectTime, bestName, challenger, refreshAfterSample), nil
 }
 
 // staggerTag identifies the winner by its position in this race. When a best
@@ -913,10 +923,10 @@ func (t *tcpTimingConn) Upstream() any { return t.Conn }
 // and speed, and penalize RST / early-death failures.  Latency (dial connectTime)
 // is recorded at dial time by the callers, not here.
 func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64) C.Conn {
-	return s.wrapTCPConnWithExploration(c, proxy, metadata, connectTime, "", "")
+	return s.wrapTCPConnWithExploration(c, proxy, metadata, connectTime, "", "", false)
 }
 
-func (s *Smart) wrapTCPConnWithExploration(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, incumbent, challenger string) C.Conn {
+func (s *Smart) wrapTCPConnWithExploration(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, incumbent, challenger string, refreshAfterSample bool) C.Conn {
 	key := routeKey(metadata)
 	domain := routeDomain(metadata)
 
@@ -964,13 +974,21 @@ func (s *Smart) wrapTCPConnWithExploration(c C.Conn, proxy C.Proxy, metadata *C.
 		if err == nil && baselineOK {
 			regret := float64(ttfb) - baseline.Mean
 			s.routeTable.UpdateExplorationRegret(key, domain, challenger, regret)
-			if proxy.Name() != incumbent && float64(ttfb)+smartPromotionMinGainMs < baseline.Mean {
-				s.routeTable.SetBestProxyAndTCPProbed(key, domain, proxy.Name())
+			if proxy.Name() != incumbent && float64(ttfb)+smartPromotionMinGainMs < baseline.Mean &&
+				s.routeTable.PromoteTCPBestIfCurrent(key, domain, incumbent, proxy.Name()) {
 				log.Infoln("[Smart] promoted challenger %s for %s after TTFB improved %.0fms -> %dms",
 					proxy.Name(), domain, baseline.Mean, ttfb)
 			}
-			log.Infoln("[Smart] exploration outcome key=%s challenger=%s incumbent=%s winner=%s ttfb=%dms baseline=%.0fms regret=%.0fms",
-				key, challenger, incumbent, proxy.Name(), ttfb, baseline.Mean, regret)
+			candidate, _ := s.routeTable.ProxyTTFBPrior(key, domain, proxy.Name())
+			log.Infoln("[Smart] exploration outcome key=%s target=%s challenger=%s incumbent=%s winner=%s ttfb=%dms baseline=%.0fms candidate_ema=%.0fms regret=%.0fms",
+				key, domain, challenger, incumbent, proxy.Name(), ttfb, baseline.Mean, candidate.Mean, regret)
+		}
+		if err == nil && refreshAfterSample {
+			// A stale-route recheck has completed even if its candidate did not
+			// beat the incumbent. Without this, every subsequent request remains
+			// stale and repeats the same forced challenger trial.
+			s.routeTable.SetTCPProbed(key, domain)
+			log.Debugln("[SmartTrace] recheck-complete key=%s target=%s winner=%s incumbent=%s", key, domain, proxy.Name(), incumbent)
 		}
 		log.Infoln("[Smart] established key=%s target=%s proxy=%s latency=%dms tcp_connect=%dms ttfb=%dms",
 			key, domain, proxy.Name(), connectTime, tcpConnectTime.Milliseconds(), ttfb)

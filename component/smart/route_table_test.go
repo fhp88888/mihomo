@@ -798,6 +798,43 @@ func TestBestReuseDoesNotRefreshEvaluationTime(t *testing.T) {
 	}
 }
 
+func TestLateExplorationCannotRestoreOldBest(t *testing.T) {
+	rt := NewRouteTable(10)
+	key := "TARGET:example.com"
+	rt.SetBestProxyAndTCPProbed(key, testDomain, "old-best")
+
+	// Two requests captured old-best. The first promotes a challenger while
+	// the second is still dialing; its late dial result must not restore it.
+	rt.SetTCPProbedPreserveEvaluation(key, testDomain)
+	if !rt.PromoteTCPBestIfCurrent(key, testDomain, "old-best", "new-best") {
+		t.Fatal("first challenger was not promoted")
+	}
+	rt.SetTCPProbedPreserveEvaluation(key, testDomain)
+	if best, _ := rt.GetBestProxy(key, testDomain); best != "new-best" {
+		t.Fatalf("late dial restored %q, want new-best", best)
+	}
+	if rt.PromoteTCPBestIfCurrent(key, testDomain, "old-best", "late-best") {
+		t.Fatal("late TTFB result replaced a newer best")
+	}
+	if best, _ := rt.GetBestProxy(key, testDomain); best != "new-best" {
+		t.Fatalf("late TTFB replaced best with %q", best)
+	}
+	if rt.PromoteTCPBestAfterFallback(key, testDomain, "old-best", "late-fallback") {
+		t.Fatal("late dial fallback replaced a newer best")
+	}
+
+	rt.MarkFailed(key, "new-best", testDomain, 1)
+	if _, ok := rt.GetBestProxy(key, testDomain); ok {
+		t.Fatal("failed best was not cleared")
+	}
+	if !rt.PromoteTCPBestAfterFallback(key, testDomain, "new-best", "working-fallback") {
+		t.Fatal("working fallback did not replace an empty best")
+	}
+	if best, _ := rt.GetBestProxy(key, testDomain); best != "working-fallback" {
+		t.Fatalf("best after failed incumbent = %q", best)
+	}
+}
+
 func TestPreRankLatency(t *testing.T) {
 	rt := NewRouteTable(100)
 
