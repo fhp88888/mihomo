@@ -185,3 +185,10 @@ type Tunnel interface {
 	RuleProviders() map[string]RuleProvider
 	RuleUpdateCallback() *utils.Callback[RuleProvider]
 }
+
+// HealthCheckRecoveryProvider is implemented by providers with shared recovery
+// scheduling. RecoverHealthCheck joins a current check or requests recovery
+// for a registered URL; it never bypasses that task's retry deadline.
+type HealthCheckRecoveryProvider interface {
+	RecoverHealthCheck(context.Context, string, []string) error
+}

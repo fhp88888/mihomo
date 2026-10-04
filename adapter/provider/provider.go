@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -66,6 +67,10 @@ func (bp *baseProvider) Initial() error {
 		go bp.healthCheck.process()
 	}
 	return nil
+}
+
+func (bp *baseProvider) RecoverHealthCheck(ctx context.Context, url string, names []string) error {
+	return bp.healthCheck.recover(ctx, url, names...)
 }
 
 func (bp *baseProvider) HealthCheck() {

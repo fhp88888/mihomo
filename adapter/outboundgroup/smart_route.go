@@ -726,8 +726,17 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key,
 	}
 
 	if len(available) == 0 {
-		log.Infoln("[Smart] route key=%s no usable proxies (total=%d)", key, len(proxies))
-		return nil, errors.New("no alive proxies available")
+		if err := s.waitForHealthRecovery(ctx); err != nil {
+			return nil, err
+		}
+		for _, p := range s.GetProxies(true) {
+			if p.AliveForTestUrl(s.testUrl) {
+				available = append(available, p)
+			}
+		}
+		if len(available) == 0 {
+			return nil, errors.New("no alive proxies available")
+		}
 	}
 
 	// With no usable best sequence, build a cold-start challenger sequence:
@@ -1095,7 +1104,21 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 		}
 	}
 	if len(udpProxies) == 0 {
-		return nil, errors.New("no UDP-capable proxies available")
+		// TCP health recovery is group-wide. Unsupported UDP alone must not
+		// trigger retries while the group has healthy nodes.
+		if !s.hasHealthyProxy() {
+			if err := s.waitForHealthRecovery(ctx); err != nil {
+				return nil, err
+			}
+			for _, p := range s.GetProxies(true) {
+				if p.SupportUDP() && p.AliveForTestUrl(s.testUrl) {
+					udpProxies = append(udpProxies, p)
+				}
+			}
+		}
+		if len(udpProxies) == 0 {
+			return nil, errors.New("no UDP-capable proxies available")
+		}
 	}
 
 	// Try fresh best proxy first
