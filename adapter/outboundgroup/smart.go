@@ -27,7 +27,8 @@ import (
 )
 
 const (
-	cleanupInterval = 120 * time.Minute
+	cleanupInterval       = 120 * time.Minute
+	smartPersistBatchSize = 256
 )
 
 type SmartOption struct {
@@ -245,7 +246,7 @@ func (s *Smart) InitSmart() {
 	// table and enqueue dirty cells to the bbolt batch queue.
 	s.startTimedTask(10*time.Minute, 10*time.Minute, "Route table persistence", s.persistRouteTable, false)
 	s.startTimedTask(10*time.Minute, 10*time.Minute, "FailedCount decay", s.decayFailedCounts, false)
-	s.startTimedTask(10*time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, true)
+	s.startTimedTask(10*time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, false)
 	s.startTimedTask(1*time.Minute, 1*time.Minute, "Proxy aggregation", s.aggregateProxies, false)
 }
 
@@ -602,10 +603,23 @@ func (s *Smart) persistRouteTable() {
 		return
 	}
 
-	// Collect all operations into a single slice and append them in one call.
-	// AppendToGlobalQueue rebuilds the whole queue on every call, so enqueuing
-	// N operations one-by-one is O(N * queueLen); batching makes it one pass.
-	ops := make([]smart.StoreOperation, 0, len(dirty)+len(dirtyRows)+1)
+	// Bound serialization and queue-merge memory. A large dirty route table
+	// previously materialized every JSON payload plus multiple full operation
+	// copies at once; fixed-size batches keep persistence peak memory stable.
+	ops := make([]smart.StoreOperation, 0, smartPersistBatchSize)
+	flushBatch := func() {
+		if len(ops) == 0 {
+			return
+		}
+		store.AppendToGlobalQueue(ops...)
+		ops = make([]smart.StoreOperation, 0, smartPersistBatchSize)
+	}
+	appendOp := func(op smart.StoreOperation) {
+		ops = append(ops, op)
+		if len(ops) >= smartPersistBatchSize {
+			flushBatch()
+		}
+	}
 
 	for cellKey, pc := range dirty {
 		// cellKey format: {routeKey}\x00{domain}\x00{proxyName}
@@ -620,7 +634,7 @@ func (s *Smart) persistRouteTable() {
 			continue
 		}
 
-		ops = append(ops, smart.StoreOperation{
+		appendOp(smart.StoreOperation{
 			Type:   smart.OpSaveRoute,
 			Group:  s.Name(),
 			Config: s.configName,
@@ -634,7 +648,7 @@ func (s *Smart) persistRouteTable() {
 		if err != nil {
 			continue
 		}
-		ops = append(ops, smart.StoreOperation{
+		appendOp(smart.StoreOperation{
 			Type:   smart.OpSaveRouteMeta,
 			Group:  s.Name(),
 			Config: s.configName,
@@ -645,7 +659,7 @@ func (s *Smart) persistRouteTable() {
 
 	if tableDirty {
 		if data, err := json.Marshal(tableMeta); err == nil {
-			ops = append(ops, smart.StoreOperation{
+			appendOp(smart.StoreOperation{
 				Type:   smart.OpSaveRouteMeta,
 				Group:  s.Name(),
 				Config: s.configName,
@@ -654,10 +668,7 @@ func (s *Smart) persistRouteTable() {
 			})
 		}
 	}
-
-	if len(ops) > 0 {
-		store.AppendToGlobalQueue(ops...)
-	}
+	flushBatch()
 
 	log.Infoln("[Smart] Enqueued %d dirty route cells and %d rows for group [%s]", len(dirty), len(dirtyRows), s.Name())
 }

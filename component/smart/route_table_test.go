@@ -3,6 +3,7 @@ package smart
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -183,6 +184,116 @@ func TestIncrementUseCount(t *testing.T) {
 	snap := rt.Snapshot("test")
 	if domainProxies(snap.Rows[0], testDomain)[proxy].UseCount != 2 {
 		t.Fatalf("expected use_count=2, got %d", domainProxies(snap.Rows[0], testDomain)[proxy].UseCount)
+	}
+}
+
+func TestRouteFamilyUsesRegistrableDomain(t *testing.T) {
+	if got := RouteFamily("*.img2.eu-example.test"); got != "eu-example.test" {
+		t.Fatalf("family = %q", got)
+	}
+	if got := RouteFamily("www.eu-example.test"); got != "eu-example.test" {
+		t.Fatalf("family = %q", got)
+	}
+	if DomainTreeSimilarity("www.example.com", "img1.example.com") >=
+		DomainTreeSimilarity("img2.example.com", "*.img2.example.com") {
+		t.Fatal("a parent/child pair should be closer than sibling hosts")
+	}
+	if got := DomainTreeSimilarity("www.example.com", "www.example.net"); got != 0 {
+		t.Fatalf("unrelated registrable domains have similarity %v", got)
+	}
+}
+
+func TestSimilarPriorFutureDemandAndExplorationRisk(t *testing.T) {
+	rt := NewRouteTable(100)
+	k1, d1 := "TARGET:www.eu-example.test", "www.eu-example.test"
+	k2, d2 := "TARGET:img1.eu-example.test", "img1.eu-example.test"
+	rt.UpdateTTFB(k1, d1, "eu", 200)
+	if got := rt.RouteFamilyTTFBProxyCount(d2); got != 1 {
+		t.Fatalf("family TTFB proxy count = %d", got)
+	}
+	if got := rt.RouteTTFBProxyCount(k2, d2); got != 0 {
+		t.Fatalf("sibling observation counted as local coverage: %d", got)
+	}
+	if got := rt.RouteTTFBProxyCount(k1, d1); got != 1 {
+		t.Fatalf("local TTFB proxy count = %d, want 1", got)
+	}
+	prior, ok := rt.SimilarTTFBPrior(k2, d2, "eu")
+	if !ok || math.Abs(prior.Mean-200) > .001 {
+		t.Fatalf("similar prior = %+v, %v", prior, ok)
+	}
+	for i := 0; i < 8; i++ {
+		rt.IncrementUseCount(k1, d1, "eu")
+	}
+	if future := rt.ExpectedFutureRequests(d2, 30*time.Second); future <= 1 || future > 32 {
+		t.Fatalf("future requests = %v", future)
+	}
+	if future := rt.ExpectedRouteFutureRequests(k2, d2, 30*time.Second); future != 1 {
+		t.Fatalf("sibling demand counted as local demand: %v", future)
+	}
+	if future := rt.ExpectedRouteFutureRequests(k1, d1, 30*time.Second); future <= 1 || future > 32 {
+		t.Fatalf("local future requests = %v", future)
+	}
+	rt.UpdateExplorationRegret(k1, d1, "challenger", 100)
+	rt.UpdateExplorationRegret(k1, d1, "challenger", 300)
+	risk, ok := rt.ExplorationRisk(d2, "challenger")
+	if !ok || risk.Samples != 2 || math.Abs(risk.Mean-200) > .001 || math.Abs(risk.StdDev-math.Sqrt(20000)) > .001 {
+		t.Fatalf("risk = %+v, %v", risk, ok)
+	}
+}
+
+func TestShouldExploreUsesExactRouteCadence(t *testing.T) {
+	rt := NewRouteTable(100)
+	for i := 1; i <= 50; i++ {
+		domain := "www.eu-example.test"
+		if i%2 == 0 {
+			domain = "img1.eu-example.test"
+		}
+		got := rt.ShouldExplore("TARGET:"+domain, domain, 25)
+		if got != (i == 49 || i == 50) {
+			t.Fatalf("request %d: explore=%v", i, got)
+		}
+	}
+	if rt.ShouldExplore("ASN:other", "www.eu-example.test", 25) {
+		t.Fatal("same domain under a different route key inherited the counter")
+	}
+	if rt.ShouldExplore("TARGET:www.hk-example.test", "www.hk-example.test", 25) {
+		t.Fatal("a different route inherited the first route's counter")
+	}
+	if rt.ShouldExplore("TARGET:a", "a", 0) {
+		t.Fatal("disabled cadence explored")
+	}
+}
+
+func TestSimilarPriorUsesPerformanceSignature(t *testing.T) {
+	rt := NewRouteTable(100)
+	current := "img2.example.com"
+	positive := "img1.example.com"
+	negative := "www.example.com"
+	for i, proxy := range []string{"p1", "p2", "p3"} {
+		rt.UpdateTTFB("TARGET:"+current, current, proxy, int64(100+i*100))
+		rt.UpdateTTFB("TARGET:"+positive, positive, proxy, int64(110+i*100))
+		rt.UpdateTTFB("TARGET:"+negative, negative, proxy, int64(310-i*100))
+	}
+	rt.UpdateTTFB("TARGET:"+positive, positive, "challenger", 150)
+	rt.UpdateTTFB("TARGET:"+negative, negative, "challenger", 900)
+	prior, ok := rt.SimilarTTFBPrior("TARGET:"+current, current, "challenger")
+	if !ok || prior.Mean >= 525 {
+		t.Fatalf("performance posterior did not favor matching signature: %+v, %v", prior, ok)
+	}
+}
+
+func TestSimilarPriorKeepsSiblingEvidenceDespiteOppositeSignature(t *testing.T) {
+	rt := NewRouteTable(100)
+	current := "img2.example.com"
+	sibling := "www.example.com"
+	for i, proxy := range []string{"p1", "p2", "p3"} {
+		rt.UpdateTTFB("TARGET:"+current, current, proxy, int64(100+i*100))
+		rt.UpdateTTFB("TARGET:"+sibling, sibling, proxy, int64(300-i*100))
+	}
+	rt.UpdateTTFB("TARGET:"+sibling, sibling, "challenger", 500)
+	prior, ok := rt.SimilarTTFBPrior("TARGET:"+current, current, "challenger")
+	if !ok || math.Abs(prior.Mean-500) > .001 {
+		t.Fatalf("posterior discarded same-site evidence: %+v, %v", prior, ok)
 	}
 }
 
@@ -478,6 +589,37 @@ func TestRankByScoreSkipsProxiesSlowerThanMinTTFB(t *testing.T) {
 	}
 }
 
+func TestRankByScoreURLTestDelayOnlyRanksUnknownProxies(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	proxies := []string{"unknown-slow", "sampled", "unknown-fast", "dial-slow"}
+	urlTest := func(name string) uint16 {
+		switch name {
+		case "unknown-slow":
+			return 1200
+		case "unknown-fast":
+			return 300
+		case "dial-slow":
+			return 1 // URL-test cannot override a measured dial latency.
+		default:
+			return 0xffff
+		}
+	}
+
+	// Before any local TTFB sample, URL-test orders the unknown proxies.
+	if got := rt.RankByScore(proxies[:3], urlTest, key, testDomain); !slices.Equal(got, []string{"unknown-fast", "unknown-slow", "sampled"}) {
+		t.Fatalf("cold-start URL-test ranking: got %v", got)
+	}
+
+	rt.UpdateTTFB(key, testDomain, "sampled", 100)
+	rt.UpdateLatency(key, testDomain, "dial-slow", 200)
+	got := rt.RankByScore(proxies, urlTest, key, testDomain)
+	want := []string{"sampled", "unknown-fast", "unknown-slow"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("URL-test delays must not prune unknown proxies; got %v, want %v", got, want)
+	}
+}
+
 func TestRankByScoreLatencyGroupAfterTTFBGroup(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
@@ -688,6 +830,43 @@ func TestBestReuseDoesNotRefreshEvaluationTime(t *testing.T) {
 	}
 }
 
+func TestLateExplorationCannotRestoreOldBest(t *testing.T) {
+	rt := NewRouteTable(10)
+	key := "TARGET:example.com"
+	rt.SetBestProxyAndTCPProbed(key, testDomain, "old-best")
+
+	// Two requests captured old-best. The first promotes a challenger while
+	// the second is still dialing; its late dial result must not restore it.
+	rt.SetTCPProbedPreserveEvaluation(key, testDomain)
+	if !rt.PromoteTCPBestIfCurrent(key, testDomain, "old-best", "new-best") {
+		t.Fatal("first challenger was not promoted")
+	}
+	rt.SetTCPProbedPreserveEvaluation(key, testDomain)
+	if best, _ := rt.GetBestProxy(key, testDomain); best != "new-best" {
+		t.Fatalf("late dial restored %q, want new-best", best)
+	}
+	if rt.PromoteTCPBestIfCurrent(key, testDomain, "old-best", "late-best") {
+		t.Fatal("late TTFB result replaced a newer best")
+	}
+	if best, _ := rt.GetBestProxy(key, testDomain); best != "new-best" {
+		t.Fatalf("late TTFB replaced best with %q", best)
+	}
+	if rt.PromoteTCPBestAfterFallback(key, testDomain, "old-best", "late-fallback") {
+		t.Fatal("late dial fallback replaced a newer best")
+	}
+
+	rt.MarkFailed(key, "new-best", testDomain, 1)
+	if _, ok := rt.GetBestProxy(key, testDomain); ok {
+		t.Fatal("failed best was not cleared")
+	}
+	if !rt.PromoteTCPBestAfterFallback(key, testDomain, "new-best", "working-fallback") {
+		t.Fatal("working fallback did not replace an empty best")
+	}
+	if best, _ := rt.GetBestProxy(key, testDomain); best != "working-fallback" {
+		t.Fatalf("best after failed incumbent = %q", best)
+	}
+}
+
 func TestPreRankLatency(t *testing.T) {
 	rt := NewRouteTable(100)
 
@@ -826,6 +1005,76 @@ func TestRemoveProxy(t *testing.T) {
 	// best proxy should be cleared since it was removed
 	if bp, _ := rt.GetBestProxy("ASN:1", testDomain); bp != "" {
 		t.Fatalf("best proxy should be empty after removal, got %s", bp)
+	}
+}
+
+func TestProxyCellLRUEvictionProtectsBest(t *testing.T) {
+	rt := NewRouteTable(10)
+	key, domain := "ASN:64512", "example.com"
+	for i := 0; i < MaxProxyCellsPerDomain; i++ {
+		rt.UpdateLatency(key, domain, fmt.Sprintf("proxy-%02d", i), int64(10+i))
+	}
+	rt.SetBestProxyAndTCPProbed(key, domain, "proxy-00")
+	rt.SetUDPBestProxy(key, domain, "proxy-01", true)
+
+	// All cells are dirty, so the hard-bound fallback must evict the oldest
+	// non-best observation (proxy-02), not either protected best.
+	rt.UpdateLatency(key, domain, "proxy-new", 5)
+
+	proxies := domainProxies(rt.Snapshot("test").Rows[0], domain)
+	if len(proxies) != MaxProxyCellsPerDomain {
+		t.Fatalf("proxy cells = %d, want %d", len(proxies), MaxProxyCellsPerDomain)
+	}
+	for _, protected := range []string{"proxy-00", "proxy-01"} {
+		if _, ok := proxies[protected]; !ok {
+			t.Fatalf("protected best %s was evicted", protected)
+		}
+	}
+	if _, ok := proxies["proxy-02"]; ok {
+		t.Fatal("oldest non-best proxy-02 should have been evicted")
+	}
+	if _, ok := proxies["proxy-new"]; !ok {
+		t.Fatal("new proxy cell was not inserted")
+	}
+}
+
+func TestProxyCellLRUTouchMovesToBack(t *testing.T) {
+	rt := NewRouteTable(10)
+	key, domain := "ASN:64512", "example.com"
+	for i := 0; i < MaxProxyCellsPerDomain; i++ {
+		rt.UpdateLatency(key, domain, fmt.Sprintf("proxy-%02d", i), int64(10+i))
+	}
+	// Clear dirty flags so clean-cell preference follows pure observation LRU.
+	rt.SnapshotAndClearDirty()
+	rt.UpdateLatency(key, domain, "proxy-00", 20) // touch oldest
+	rt.UpdateLatency(key, domain, "proxy-new", 5)
+
+	proxies := domainProxies(rt.Snapshot("test").Rows[0], domain)
+	if _, ok := proxies["proxy-00"]; !ok {
+		t.Fatal("recently observed proxy-00 was evicted")
+	}
+	if _, ok := proxies["proxy-01"]; ok {
+		t.Fatal("least-recent clean proxy-01 should have been evicted")
+	}
+}
+
+func TestExploreCountsBoundedLRU(t *testing.T) {
+	rt := NewRouteTable(10)
+	for i := 0; i <= MaxExploreRoutes; i++ {
+		domain := fmt.Sprintf("family-%d.example", i)
+		rt.ShouldExplore("", domain, 2)
+	}
+
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if len(rt.exploreCounts) != MaxExploreRoutes {
+		t.Fatalf("exploreCounts = %d, want %d", len(rt.exploreCounts), MaxExploreRoutes)
+	}
+	if _, ok := rt.exploreCounts["family-0.example"]; ok {
+		t.Fatal("least-recent exploration route was not evicted")
+	}
+	if _, ok := rt.exploreCounts[fmt.Sprintf("family-%d.example", MaxExploreRoutes)]; !ok {
+		t.Fatal("newest exploration route is missing")
 	}
 }
 

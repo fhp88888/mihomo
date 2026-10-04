@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/log"
+	"golang.org/x/net/publicsuffix"
 )
 
 const DefaultMaxRows = 200
@@ -17,7 +18,7 @@ const DefaultMaxRows = 200
 const RouteTableMetaKey = "__table__"
 
 // MaxDomainsPerNormalASRow caps the per-row domain table (LRU) for a normal
-// ASN or TARGET row: each tracks at most this many distinct effective domains
+// ASN or TARGET row: each tracks at most this many distinct hostnames or IPs
 // by connection size.
 const MaxDomainsPerNormalASRow = 50
 
@@ -30,6 +31,15 @@ const MaxDomainsPerCDNASRow = 300
 // Even when many proxies have a TTFB sample, only the top-N by score survive;
 // the rest of the candidate list is filled by the latency (non-TTFB) group.
 const MaxTTFBProxiesPerRank = 6
+
+// MaxProxyCellsPerDomain bounds detailed, domain-specific observations.
+// Ranking is score-based, but storage eviction is recency-based so an early
+// high score cannot occupy a slot forever and starve new proxies of samples.
+const MaxProxyCellsPerDomain = 12
+
+// MaxExploreRoutes bounds exploration cadence counters whose routes may
+// otherwise outlive the bounded row/domain tables indefinitely.
+const MaxExploreRoutes = 1024
 
 // minConnSizeForSpeedKB gates the speed term in calculateScore: smaller
 // connections transfer too little data for a reliable throughput reading.
@@ -52,6 +62,24 @@ type ProxyAttributes struct {
 	Jitter      float64 `json:"jitter"`
 }
 
+// TTFBPrior summarizes end-to-end TTFB observations for one proxy. Mean and
+// StdDev are in milliseconds. Samples counts independent route/domain cells,
+// not raw requests, because each cell already stores an EMA.
+type TTFBPrior struct {
+	Mean    float64
+	StdDev  float64
+	Samples int
+}
+
+// ExplorationRisk is the observed request-level cost of trying a challenger.
+// Positive regret means the served request was slower than the incumbent's
+// historical TTFB; negative regret means exploration improved it.
+type ExplorationRisk struct {
+	Mean    float64
+	StdDev  float64
+	Samples int64
+}
+
 // ProxyRecord is the per-proxy entry in a route table row.
 type ProxyRecord struct {
 	Name       string          `json:"name"`
@@ -65,11 +93,11 @@ type ProxyRecord struct {
 // target-dependent (TTFB especially), so sharing them across every domain
 // behind an ASN would blend unrelated sites' behavior into one noisy signal.
 type rowEntry struct {
-	key      string
-	lastUsed int64
+	key         string
+	lastUsed    int64
 	domainTable map[string]*domainCell
 	domainOrder []string
-	rowDirty bool
+	rowDirty    bool
 }
 
 // domainCell is the per-domain entry in a row's domainTable.  bestProxy and
@@ -83,29 +111,62 @@ type domainCell struct {
 	udpBestProxy      string
 	tcpProbed         bool
 	lastUsed          int64 // domain LRU/activity timestamp
+	firstUsed         int64 // first observation in this process
 	tcpEvaluatedAt    int64 // last time TCP best was evaluated, not merely reused
 	udpEvaluatedAt    int64 // last time UDP best was evaluated, not merely reused
 	connSize          float64
 	hasConnSizeSample bool
 	proxies           map[string]*proxyCell
+	// Observation LRU; current TCP and UDP bests are protected on eviction.
+	proxyOrder []string
+}
+
+// ShouldExplore advances this route's request counter and returns true once
+// every N known-route requests. Sibling observations inform risk pruning, but
+// must not consume this route's opportunities to gather its own TTFB samples.
+func (rt *RouteTable) ShouldExplore(key, domain string, every uint64) bool {
+	if every == 0 {
+		return false
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	route := domain
+	if key != "" {
+		route = key + "\x00" + domain
+	}
+	if _, exists := rt.exploreCounts[route]; !exists && len(rt.exploreCounts) >= MaxExploreRoutes {
+		evict := rt.exploreOrder[0]
+		rt.exploreOrder = rt.exploreOrder[1:]
+		delete(rt.exploreCounts, evict)
+	}
+	if _, exists := rt.exploreCounts[route]; exists {
+		rt.exploreOrder = moveToBack(rt.exploreOrder, route)
+	} else {
+		rt.exploreOrder = append(rt.exploreOrder, route)
+	}
+	rt.exploreCounts[route]++
+	return rt.exploreCounts[route]%every == 0
 }
 
 type proxyCell struct {
-	Name             string
-	UseCount         int64
-	FailedCount      float64
-	Latency          int64   // EMA, 0 means no sample yet
-	TTFB             int64   // EMA of time-to-first-byte (ms), 0 means no sample yet
-	PkgLoss          float64 // EMA
-	Speed            float64 // EMA
-	Jitter           float64 // EMA of |sample - previous TTFB EMA|, 0 means no sample yet
-	Score            float64 // non-EMA score derived from latency, speed, pkgLoss and failedCount
-	HasLatencySample bool
-	HasTTFBSample    bool
-	HasPkgLossSample bool
-	HasSpeedSample   bool
-	HasJitterSample  bool
-	Dirty            bool // true when cell has unsaved changes
+	Name                  string
+	UseCount              int64
+	FailedCount           float64
+	Latency               int64   // EMA, 0 means no sample yet
+	TTFB                  int64   // EMA of time-to-first-byte (ms), 0 means no sample yet
+	PkgLoss               float64 // EMA
+	Speed                 float64 // EMA
+	Jitter                float64 // EMA of |sample - previous TTFB EMA|, 0 means no sample yet
+	Score                 float64 // non-EMA score derived from latency, speed, pkgLoss and failedCount
+	HasLatencySample      bool
+	HasTTFBSample         bool
+	HasPkgLossSample      bool
+	HasSpeedSample        bool
+	HasJitterSample       bool
+	ExplorationRegretMean float64
+	ExplorationRegretM2   float64
+	ExplorationSamples    int64
+	Dirty                 bool // true when cell has unsaved changes
 }
 
 func (c *proxyCell) hasSample() bool {
@@ -182,8 +243,10 @@ type RouteTable struct {
 	// It backs discovery ordering (exploreOrder) and the REST aggregation
 	// snapshot.  It is NOT part of calculateScore, which uses only the
 	// per-target (cell) view.  A missing proxy means "no aggregation yet".
-	proxyAttrs map[string]ProxyAttributes
-	tableDirty bool
+	proxyAttrs    map[string]ProxyAttributes
+	exploreCounts map[string]uint64
+	exploreOrder  []string
+	tableDirty    bool
 }
 
 // NewRouteTable creates a new RouteTable with the given capacity.
@@ -192,10 +255,12 @@ func NewRouteTable(maxRows int) *RouteTable {
 		maxRows = DefaultMaxRows
 	}
 	return &RouteTable{
-		rows:       make(map[string]*rowEntry),
-		maxRows:    maxRows,
-		lruOrder:   make([]string, 0, maxRows),
-		proxyAttrs: make(map[string]ProxyAttributes),
+		rows:          make(map[string]*rowEntry),
+		maxRows:       maxRows,
+		lruOrder:      make([]string, 0, maxRows),
+		proxyAttrs:    make(map[string]ProxyAttributes),
+		exploreCounts: make(map[string]uint64),
+		exploreOrder:  make([]string, 0, MaxExploreRoutes),
 	}
 }
 
@@ -298,7 +363,15 @@ func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domai
 		row.rowDirty = true
 	}
 
-	cell := &domainCell{domainName: domain, connSize: 100, proxies: make(map[string]*proxyCell)}
+	now := time.Now().Unix()
+	cell := &domainCell{
+		domainName: domain,
+		connSize:   100,
+		firstUsed:  now,
+		lastUsed:   now,
+		proxies:    make(map[string]*proxyCell),
+		proxyOrder: make([]string, 0, MaxProxyCellsPerDomain),
+	}
 	row.domainTable[domain] = cell
 	row.domainOrder = append(row.domainOrder, domain)
 	row.rowDirty = true
@@ -426,6 +499,42 @@ func (rt *RouteTable) SetTCPProbed(key, domain string) {
 	rt.setDomainState(key, domain, "", false, true, true)
 }
 
+// SetTCPProbedPreserveEvaluation records a successful exploration dial without
+// replacing the best or refreshing its evaluation time. Another in-flight
+// request may already have promoted a new best since this dial began.
+func (rt *RouteTable) SetTCPProbedPreserveEvaluation(key, domain string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.setDomainState(key, domain, "", false, true, false)
+}
+
+// PromoteTCPBestIfCurrent prevents a late dial or exploration result from
+// replacing a best that changed after the request captured its incumbent.
+func (rt *RouteTable) PromoteTCPBestIfCurrent(key, domain, incumbent, challenger string) bool {
+	return rt.promoteTCPBestIfCurrent(key, domain, incumbent, challenger, false)
+}
+
+// PromoteTCPBestAfterFallback also accepts an empty best: a failed dial may
+// have cleared the incumbent before the fallback connected.
+func (rt *RouteTable) PromoteTCPBestAfterFallback(key, domain, incumbent, fallback string) bool {
+	return rt.promoteTCPBestIfCurrent(key, domain, incumbent, fallback, true)
+}
+
+func (rt *RouteTable) promoteTCPBestIfCurrent(key, domain, incumbent, challenger string, allowEmpty bool) bool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return false
+	}
+	cell, ok := row.domainTable[domain]
+	if !ok || cell.tcpBestProxy != incumbent && (!allowEmpty || cell.tcpBestProxy != "") {
+		return false
+	}
+	rt.setDomainState(key, domain, challenger, true, true, true)
+	return true
+}
+
 // SetBestProxyAndTCPProbed sets the domain's best proxy and TCP-probed flag
 // atomically, so a MarkFailed interleaving cannot leave bestProxy empty with
 // tcpProbed set.
@@ -447,10 +556,44 @@ func (rt *RouteTable) SetBestProxyAndTCPProbedPreserveEvaluation(key, domain, pr
 // Must be called with mu held.
 func (rt *RouteTable) getOrCreateCell(dc *domainCell, proxy string) *proxyCell {
 	cell, ok := dc.proxies[proxy]
-	if !ok {
-		cell = &proxyCell{Name: proxy}
-		dc.proxies[proxy] = cell
+	if ok {
+		dc.proxyOrder = moveToBack(dc.proxyOrder, proxy)
+		return cell
 	}
+
+	if len(dc.proxies) >= MaxProxyCellsPerDomain {
+		evictIdx := -1
+		// Prefer a clean LRU cell. Best proxies are routing state rather than
+		// disposable observations and must remain resident.
+		for i, name := range dc.proxyOrder {
+			if name == dc.tcpBestProxy || name == dc.udpBestProxy {
+				continue
+			}
+			if existing := dc.proxies[name]; existing != nil && !existing.Dirty {
+				evictIdx = i
+				break
+			}
+		}
+		// Preserve the hard bound even when every cell changed since the last
+		// persistence pass; the oldest non-best observation is least valuable.
+		if evictIdx < 0 {
+			for i, name := range dc.proxyOrder {
+				if name != dc.tcpBestProxy && name != dc.udpBestProxy {
+					evictIdx = i
+					break
+				}
+			}
+		}
+		if evictIdx >= 0 {
+			evict := dc.proxyOrder[evictIdx]
+			dc.proxyOrder = append(dc.proxyOrder[:evictIdx], dc.proxyOrder[evictIdx+1:]...)
+			delete(dc.proxies, evict)
+		}
+	}
+
+	cell = &proxyCell{Name: proxy}
+	dc.proxies[proxy] = cell
+	dc.proxyOrder = append(dc.proxyOrder, proxy)
 	return cell
 }
 
@@ -562,6 +705,374 @@ func (rt *RouteTable) ProxyHasTTFBSample(key, domain, proxy string) bool {
 	}
 	cell, ok := dc.proxies[proxy]
 	return ok && cell.HasTTFBSample
+}
+
+// RouteFamily returns the registrable-domain root of the domain suffix tree.
+// A leading fake-IP wildcard describes a deeper hostname and does not change
+// that root. Public suffixes alone never form a family.
+func RouteFamily(domain string) string {
+	host := strings.TrimPrefix(strings.ToLower(strings.TrimSuffix(domain, ".")), "*.")
+	if root, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
+		return root
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) >= 2 {
+		return strings.Join(parts[len(parts)-2:], ".")
+	}
+	return host
+}
+
+// DomainTreeSimilarity measures proximity in a reversed, public-suffix-aware
+// domain tree. Siblings under one registrable domain are related; an ancestor
+// and descendant sharing a longer private suffix are closer. A public suffix
+// by itself contributes no similarity.
+func DomainTreeSimilarity(a, b string) float64 {
+	labels := func(domain string) (string, []string) {
+		host := strings.TrimPrefix(strings.ToLower(strings.TrimSuffix(domain, ".")), "*.")
+		root := RouteFamily(host)
+		if root == "" || !strings.HasSuffix(host, root) {
+			return root, nil
+		}
+		rootLabels := strings.Split(root, ".")
+		public, _ := publicsuffix.PublicSuffix(root)
+		publicLabels := 0
+		if public != "" {
+			publicLabels = len(strings.Split(public, "."))
+		}
+		privateCount := len(rootLabels) - publicLabels
+		if privateCount < 1 {
+			privateCount = 1
+		}
+		privateRoot := rootLabels[:privateCount]
+		sub := strings.TrimSuffix(host, "."+root)
+		parts := append([]string{}, privateRoot...)
+		if sub != host && sub != "" {
+			subLabels := strings.Split(sub, ".")
+			for i := len(subLabels) - 1; i >= 0; i-- {
+				parts = append(parts, subLabels[i])
+			}
+		}
+		return root, parts
+	}
+	rootA, aParts := labels(a)
+	rootB, bParts := labels(b)
+	if rootA == "" || rootA != rootB {
+		return 0
+	}
+	shared := 0
+	for shared < len(aParts) && shared < len(bParts) && aParts[shared] == bParts[shared] {
+		shared++
+	}
+	if shared == 0 {
+		return 0
+	}
+	distance := len(aParts) + len(bParts) - 2*shared
+	return 1 / float64(1+distance)
+}
+
+func performanceSignatureSimilarity(a, b *domainCell) float64 {
+	x, y := make([]float64, 0), make([]float64, 0)
+	for proxy, ac := range a.proxies {
+		bc, ok := b.proxies[proxy]
+		if !ok || !ac.HasTTFBSample || !bc.HasTTFBSample {
+			continue
+		}
+		x, y = append(x, float64(ac.TTFB)), append(y, float64(bc.TTFB))
+	}
+	if len(x) < 3 {
+		return 1
+	}
+	mx, my := 0.0, 0.0
+	for i := range x {
+		mx, my = mx+x[i], my+y[i]
+	}
+	mx, my = mx/float64(len(x)), my/float64(len(y))
+	cov, vx, vy := 0.0, 0.0, 0.0
+	for i := range x {
+		dx, dy := x[i]-mx, y[i]-my
+		cov, vx, vy = cov+dx*dy, vx+dx*dx, vy+dy*dy
+	}
+	if vx == 0 || vy == 0 {
+		return 1
+	}
+	correlation := cov / math.Sqrt(vx*vy)
+	return math.Max(0, math.Min(1, (correlation+1)/2))
+}
+
+func summarizeValues(values []float64, floorFraction float64) (TTFBPrior, bool) {
+	if len(values) == 0 {
+		return TTFBPrior{}, false
+	}
+	mean := 0.0
+	for _, value := range values {
+		mean += value
+	}
+	mean /= float64(len(values))
+	variance := 0.0
+	for _, value := range values {
+		delta := value - mean
+		variance += delta * delta
+	}
+	variance /= float64(len(values))
+	stddev := math.Sqrt(variance)
+	if floor := mean * floorFraction; stddev < floor {
+		stddev = floor
+	}
+	return TTFBPrior{Mean: mean, StdDev: stddev, Samples: len(values)}, true
+}
+
+// SimilarTTFBPrior combines the nearest domains under the same registrable
+// root. Domain-tree proximity is the prior weight; once both domains have at
+// least three common proxy observations, their performance-signature
+// correlation becomes a posterior correction. ASN is deliberately excluded.
+func (rt *RouteTable) SimilarTTFBPrior(key, domain, proxy string) (TTFBPrior, bool) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	type neighbor struct{ value, weight float64 }
+	neighbors := make([]neighbor, 0)
+	var current *domainCell
+	if row, ok := rt.rows[key]; ok {
+		current = row.domainTable[domain]
+	}
+	for _, row := range rt.rows {
+		for name, dc := range row.domainTable {
+			if name == domain {
+				continue
+			}
+			treeSimilarity := DomainTreeSimilarity(domain, name)
+			if treeSimilarity == 0 {
+				continue
+			}
+			// Keep most of the registrable-domain prior so a shallow tree does
+			// not discard useful sibling evidence. Tree distance and the
+			// posterior signature refine that prior instead of replacing it.
+			weight := .75 + .25*treeSimilarity
+			if current != nil {
+				weight *= .75 + .25*performanceSignatureSimilarity(current, dc)
+			}
+			if cell, ok := dc.proxies[proxy]; ok && cell.HasTTFBSample && weight > 0 {
+				neighbors = append(neighbors, neighbor{float64(cell.TTFB), weight})
+			}
+		}
+	}
+	if len(neighbors) == 0 {
+		return TTFBPrior{}, false
+	}
+	sort.Slice(neighbors, func(i, j int) bool { return neighbors[i].weight > neighbors[j].weight })
+	if len(neighbors) > 8 {
+		neighbors = neighbors[:8]
+	}
+	total, mean := 0.0, 0.0
+	for _, n := range neighbors {
+		total, mean = total+n.weight, mean+n.value*n.weight
+	}
+	mean /= total
+	variance := 0.0
+	for _, n := range neighbors {
+		variance += n.weight * (n.value - mean) * (n.value - mean)
+	}
+	variance /= total
+	stddev := math.Sqrt(variance)
+	avgWeight := total / float64(len(neighbors))
+	if floor := mean * (.20 + .20*(1-avgWeight)); stddev < floor {
+		stddev = floor
+	}
+	return TTFBPrior{Mean: mean, StdDev: stddev, Samples: len(neighbors)}, true
+}
+
+// RouteTTFBProxyCount returns how many proxies have a TTFB observation on
+// this exact route. Sibling observations must not count as local coverage.
+func (rt *RouteTable) RouteTTFBProxyCount(key, domain string) int {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return 0
+	}
+	dc, ok := row.domainTable[domain]
+	if !ok {
+		return 0
+	}
+	count := 0
+	for _, cell := range dc.proxies {
+		if cell.HasTTFBSample {
+			count++
+		}
+	}
+	return count
+}
+
+// RouteFamilyTTFBProxyCount reports distinct proxies observed across a route
+// family. It does not measure the coverage of an individual route.
+func (rt *RouteTable) RouteFamilyTTFBProxyCount(domain string) int {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	family := RouteFamily(domain)
+	seen := make(map[string]struct{})
+	for _, row := range rt.rows {
+		for name, dc := range row.domainTable {
+			if RouteFamily(name) != family {
+				continue
+			}
+			for proxy, cell := range dc.proxies {
+				if cell.HasTTFBSample {
+					seen[proxy] = struct{}{}
+				}
+			}
+		}
+	}
+	return len(seen)
+}
+
+// ExpectedRouteFutureRequests estimates demand for this exact route when
+// deciding whether to accelerate its own initial exploration.
+func (rt *RouteTable) ExpectedRouteFutureRequests(key, domain string, horizon time.Duration) float64 {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	row, ok := rt.rows[key]
+	if !ok {
+		return 1
+	}
+	dc, ok := row.domainTable[domain]
+	if !ok {
+		return 1
+	}
+	uses := int64(0)
+	for _, cell := range dc.proxies {
+		uses += cell.UseCount
+	}
+	if uses <= 1 || dc.firstUsed == 0 {
+		return 1
+	}
+	elapsed := math.Max(time.Since(time.Unix(dc.firstUsed, 0)).Seconds(), 1)
+	estimate := float64(uses) / elapsed * horizon.Seconds()
+	return math.Max(1, math.Min(estimate, 32))
+}
+
+// ExpectedFutureRequests estimates near-term demand for sibling routes from
+// their observed request rate. It is used only to budget risk pruning.
+func (rt *RouteTable) ExpectedFutureRequests(domain string, horizon time.Duration) float64 {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	family := RouteFamily(domain)
+	uses, first := int64(0), int64(0)
+	for _, row := range rt.rows {
+		for name, dc := range row.domainTable {
+			if RouteFamily(name) != family {
+				continue
+			}
+			if first == 0 || dc.firstUsed < first {
+				first = dc.firstUsed
+			}
+			for _, cell := range dc.proxies {
+				uses += cell.UseCount
+			}
+		}
+	}
+	if uses <= 1 || first == 0 {
+		return 1
+	}
+	elapsed := math.Max(time.Since(time.Unix(first, 0)).Seconds(), 1)
+	estimate := float64(uses) / elapsed * horizon.Seconds()
+	return math.Max(1, math.Min(estimate, 32))
+}
+
+func (rt *RouteTable) UpdateExplorationRegret(key, domain, challenger string, regret float64) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	row := rt.getOrCreateRow(key)
+	dc := rt.getOrCreateDomainCell(row, domain)
+	cell := rt.getOrCreateCell(dc, challenger)
+	cell.ExplorationSamples++
+	delta := regret - cell.ExplorationRegretMean
+	cell.ExplorationRegretMean += delta / float64(cell.ExplorationSamples)
+	cell.ExplorationRegretM2 += delta * (regret - cell.ExplorationRegretMean)
+}
+
+func (rt *RouteTable) ExplorationRisk(domain, challenger string) (ExplorationRisk, bool) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	family := RouteFamily(domain)
+	count, mean, m2 := int64(0), 0.0, 0.0
+	for _, row := range rt.rows {
+		for name, dc := range row.domainTable {
+			if RouteFamily(name) != family {
+				continue
+			}
+			cell, ok := dc.proxies[challenger]
+			if !ok || cell.ExplorationSamples == 0 {
+				continue
+			}
+			// Merge each cell's Welford accumulator without losing its within-cell variance.
+			n := cell.ExplorationSamples
+			delta := cell.ExplorationRegretMean - mean
+			newCount := count + n
+			mean += delta * float64(n) / float64(newCount)
+			m2 += cell.ExplorationRegretM2 + delta*delta*float64(count*n)/float64(newCount)
+			count = newCount
+		}
+	}
+	if count == 0 {
+		return ExplorationRisk{}, false
+	}
+	variance := 0.0
+	if count > 1 {
+		variance = m2 / float64(count-1)
+	}
+	return ExplorationRisk{Mean: mean, StdDev: math.Sqrt(variance), Samples: count}, true
+}
+
+// ProxyTTFBPrior returns a proxy's current-domain observation when available;
+// otherwise it pools observations from other route/domain cells as a prior.
+// The current cell is deliberately preferred so mature per-target knowledge
+// is never diluted by unrelated destinations.
+func (rt *RouteTable) ProxyTTFBPrior(key, domain, proxy string) (TTFBPrior, bool) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if row, ok := rt.rows[key]; ok {
+		if dc, ok := row.domainTable[domain]; ok {
+			if cell, ok := dc.proxies[proxy]; ok && cell.HasTTFBSample {
+				stddev := cell.Jitter
+				if !cell.HasJitterSample {
+					stddev = float64(cell.TTFB) * 0.15
+				}
+				return TTFBPrior{Mean: float64(cell.TTFB), StdDev: stddev, Samples: 1}, true
+			}
+		}
+	}
+
+	values := make([]float64, 0)
+	for rowKey, row := range rt.rows {
+		for domainName, dc := range row.domainTable {
+			if rowKey == key && domainName == domain {
+				continue
+			}
+			if cell, ok := dc.proxies[proxy]; ok && cell.HasTTFBSample {
+				values = append(values, float64(cell.TTFB))
+			}
+		}
+	}
+	if len(values) == 0 {
+		return TTFBPrior{}, false
+	}
+	var mean float64
+	for _, value := range values {
+		mean += value
+	}
+	mean /= float64(len(values))
+	var variance float64
+	for _, value := range values {
+		delta := value - mean
+		variance += delta * delta
+	}
+	variance /= float64(len(values))
+	// A single aggregate cell has no between-domain variance. Preserve enough
+	// uncertainty to allow a plausibly better proxy to be explored.
+	stddev := math.Sqrt(variance)
+	if floor := mean * 0.15; stddev < floor {
+		stddev = floor
+	}
+	return TTFBPrior{Mean: mean, StdDev: stddev, Samples: len(values)}, true
 }
 
 // UpdateTTFB updates the EMA time-to-first-byte for a (key, domain, proxy)
@@ -755,13 +1266,13 @@ func (rt *RouteTable) PreRankLatency(proxies []string, healthCheckLatency func(s
 //     latency as the response-time term; at most MaxTTFBProxiesPerRank of them
 //     survive (the top-scored ones), so a crowded TTFB group cannot crowd out
 //     the latency-ranked fallbacks;
-//   - proxies without a TTFB sample whose latency already exceeds the domain's
-//     minimum TTFB (a known-faster first-byte makes them hopeless) are skipped;
-//     the rest are ranked after the TTFB group by latency-derived score.
+//   - proxies without a TTFB sample whose measured dial latency already exceeds
+//     the domain's minimum TTFB are skipped; the rest are ranked after the TTFB
+//     group. URL-test delay is only a ranking fallback, never a pruning bound.
 //
 // With no TTFB sample at all (cold start for this domain) it falls back to
 // latency-derived scores as before.
-func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(string) uint16, key, domain string) []string {
+func (rt *RouteTable) RankByScore(proxies []string, urlTestDelay func(string) uint16, key, domain string) []string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 
@@ -817,32 +1328,33 @@ func (rt *RouteTable) RankByScore(proxies []string, healthCheckLatency func(stri
 			continue
 		}
 
-		// No TTFB sample: resolve a latency — cell EMA when the cell has any
-		// data (a failed-only cell keeps latency 0 so its failure penalty still
-		// drives it to the back), otherwise the health-check fallback.
-		var latency int64
+		// No TTFB sample: use the dial-latency EMA when the cell has data,
+		// otherwise use URL-test only to order cold candidates. A failed-only
+		// cell keeps rankingDelay 0 so its failure penalty drives it back.
+		var rankingDelay int64
 		var speed, pkgLoss, failedCount, jitter float64
 		if cell != nil && cell.hasData() {
-			latency = cell.Latency
+			rankingDelay = cell.Latency
 			speed = cell.Speed
 			pkgLoss = cell.PkgLoss
 			failedCount = cell.FailedCount
 			jitter = cell.Jitter
-		} else if healthCheckLatency != nil {
-			if hc := healthCheckLatency(proxy); hc != 0 && hc != 0xffff {
-				latency = int64(hc)
+		} else if urlTestDelay != nil {
+			if delay := urlTestDelay(proxy); delay != 0 && delay != 0xffff {
+				rankingDelay = int64(delay)
 			}
 		}
 
-		// Once any proxy has a TTFB sample, a proxy whose latency already
-		// exceeds the known minimum first-byte time cannot win — skip it.
-		if hasTTFB && latency > minTTFB {
+		// Only a measured dial latency can bound this proxy's first-byte time.
+		// The URL-test fallback includes a request to another target and
+		// must never be used as a pruning bound.
+		if hasTTFB && cell != nil && cell.HasLatencySample && cell.Latency > minTTFB {
 			continue
 		}
 
 		cands = append(cands, candidate{
 			name:  proxy,
-			score: calculateScore(latency, speed, pkgLoss, failedCount, jitter, connSizeKB),
+			score: calculateScore(rankingDelay, speed, pkgLoss, failedCount, jitter, connSizeKB),
 			ttfb:  false,
 		})
 	}
@@ -1234,6 +1746,12 @@ func (rt *RouteTable) RemoveProxy(name string) {
 	for _, row := range rt.rows {
 		for _, dc := range row.domainTable {
 			delete(dc.proxies, name)
+			for i, proxyName := range dc.proxyOrder {
+				if proxyName == name {
+					dc.proxyOrder = append(dc.proxyOrder[:i], dc.proxyOrder[i+1:]...)
+					break
+				}
+			}
 			if dc.tcpBestProxy == name {
 				dc.tcpBestProxy = ""
 				dc.tcpProbed = false
