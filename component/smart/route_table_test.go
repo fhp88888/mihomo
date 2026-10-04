@@ -1,6 +1,7 @@
 package smart
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"slices"
@@ -329,34 +330,10 @@ func TestCalculateScore(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		got := calculateScore(tc.latency, tc.speed, 0, tc.failedCount, tc.jitter, connSizeUnknown)
+		got := calculateScore(tc.latency, tc.speed, 0, tc.failedCount, tc.jitter)
 		if math.Abs(got-tc.expect) > 0.000001 {
 			t.Fatalf("latency=%d speed=%.0f fail=%.1f jitter=%.1f: expected score %.6f, got %.6f", tc.latency, tc.speed, tc.failedCount, tc.jitter, tc.expect, got)
 		}
-	}
-}
-
-func TestCalculateScoreSkipsSpeedForSmallConnSize(t *testing.T) {
-	// For a domain whose connections are smaller than 4kB, the speed term must
-	// be skipped, leaving only the latency (+penalty) components.
-	latencyOnly := 100.0 / (100.0 + 10.0) // latency=100, jitter=0 -> 100/110
-	withSpeed := latencyOnly + math.Log1p(10485760.0/1024.0/1024.0/0.5)
-
-	// connSize below the 4kB threshold: speed skipped.
-	if got := calculateScore(100, 10485760, 0, 0, 0, 3.0); math.Abs(got-latencyOnly) > 0.000001 {
-		t.Fatalf("small connSize: expected %.6f (speed skipped), got %.6f", latencyOnly, got)
-	}
-	// connSize exactly at the threshold (4kB): speed included.
-	if got := calculateScore(100, 10485760, 0, 0, 0, 4.0); math.Abs(got-withSpeed) > 0.000001 {
-		t.Fatalf("connSize at threshold: expected %.6f (speed included), got %.6f", withSpeed, got)
-	}
-	// connSize above the threshold: speed included.
-	if got := calculateScore(100, 10485760, 0, 0, 0, 5.0); math.Abs(got-withSpeed) > 0.000001 {
-		t.Fatalf("large connSize: expected %.6f (speed included), got %.6f", withSpeed, got)
-	}
-	// connSize unknown sentinel: speed included (domain-less callers).
-	if got := calculateScore(100, 10485760, 0, 0, 0, connSizeUnknown); math.Abs(got-withSpeed) > 0.000001 {
-		t.Fatalf("connSize unknown: expected %.6f (speed included), got %.6f", withSpeed, got)
 	}
 }
 
@@ -397,8 +374,6 @@ func TestRankByScore(t *testing.T) {
 	rt.UpdateLatency(key, testDomain, "proxy-b", 50)
 	rt.UpdateLatency(key, testDomain, "proxy-c", 200)
 	rt.UpdateSpeed(key, testDomain, "proxy-c", 10485760)
-	// Give the domain a large connSize so the speed component is not skipped.
-	rt.UpdateConnSize(key, testDomain, 2048)
 	rt.RefreshScores(key, testDomain, []string{"proxy-a", "proxy-b", "proxy-c"})
 
 	proxies := []string{"proxy-a", "proxy-c", "proxy-b"}
@@ -409,70 +384,6 @@ func TestRankByScore(t *testing.T) {
 		if ranked[i] != expected[i] {
 			t.Fatalf("ranked[%d]: expected %s, got %s", i, expected[i], ranked[i])
 		}
-	}
-}
-
-func TestRankByScoreSkipsSpeedForSmallConnSize(t *testing.T) {
-	rt := NewRouteTable(100)
-	key := "ASN:64512"
-
-	// Proxy metrics are per-domain now, so each domain under test needs its
-	// own latency/speed samples — a domain no longer inherits data recorded
-	// against a sibling domain in the same row.
-	//
-	// proxy-a: fast latency (100ms), no speed.
-	// proxy-c: slow latency (200ms) but huge speed — normally boosted above
-	// proxy-a when the speed term counts.
-	rt.UpdateLatency(key, "small.example.com", "proxy-a", 100)
-	rt.UpdateLatency(key, "small.example.com", "proxy-c", 200)
-	rt.UpdateSpeed(key, "small.example.com", "proxy-c", 10485760)
-
-	// Small connSize (< minConnSizeForSpeedKB): speed is skipped, so proxy-a
-	// (faster latency) ranks above proxy-c.
-	rt.UpdateConnSize(key, "small.example.com", 1)
-	ranked := rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "small.example.com")
-	if ranked[0] != "proxy-a" {
-		t.Fatalf("small connSize: expected proxy-a first (speed skipped), got %v", ranked)
-	}
-
-	rt.UpdateLatency(key, "large.example.com", "proxy-a", 100)
-	rt.UpdateLatency(key, "large.example.com", "proxy-c", 200)
-	rt.UpdateSpeed(key, "large.example.com", "proxy-c", 10485760)
-
-	// Large connSize (>= minConnSizeForSpeedKB): speed is included, so
-	// proxy-c's throughput pushes it above proxy-a.
-	rt.UpdateConnSize(key, "large.example.com", 2048)
-	ranked = rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "large.example.com")
-	if ranked[0] != "proxy-c" {
-		t.Fatalf("large connSize: expected proxy-c first (speed included), got %v", ranked)
-	}
-}
-
-func TestRankByScoreDefaultConnSizeForUnseenDomain(t *testing.T) {
-	rt := NewRouteTable(100)
-	key := "ASN:64512"
-
-	// proxy-a: fast latency (100ms), no speed.
-	// proxy-c: slow latency (200ms) but huge speed — boosted above proxy-a when
-	// the speed term counts.
-	rt.UpdateLatency(key, "fresh.example.com", "proxy-a", 100)
-	rt.UpdateLatency(key, "fresh.example.com", "proxy-c", 200)
-	rt.UpdateSpeed(key, "fresh.example.com", "proxy-c", 10485760)
-
-	// A domain with no connSize sample yet defaults to connSize 100 (above
-	// minConnSizeForSpeedKB), so the speed term is still counted and proxy-c
-	// outranks proxy-a.
-	ranked := rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "fresh.example.com")
-	if ranked[0] != "proxy-c" {
-		t.Fatalf("unseen domain: expected proxy-c first (default connSize keeps speed), got %v", ranked)
-	}
-
-	// Once a real (small) connSize is recorded, the speed term is skipped and
-	// the ranking flips.
-	rt.UpdateConnSize(key, "fresh.example.com", 1)
-	ranked = rt.RankByScore([]string{"proxy-c", "proxy-a"}, nil, key, "fresh.example.com")
-	if ranked[0] != "proxy-a" {
-		t.Fatalf("small connSize: expected proxy-a first (speed skipped), got %v", ranked)
 	}
 }
 
@@ -1639,44 +1550,43 @@ func TestRestoreRowMetaLegacyASNDropped(t *testing.T) {
 	}
 }
 
-func TestRestoreRowMetaConnSizeRoundtrip(t *testing.T) {
+func TestRestoreRowMetaIgnoresLegacyConnectionSize(t *testing.T) {
+	const legacy = `{"domains":{"example.com":{"best_proxy":"proxy-a","udp_best_proxy":"proxy-b","tcp_probed":true,"conn_size":1,"has_conn_size_sample":true}}}`
+	var row PersistedRow
+	if err := json.Unmarshal([]byte(legacy), &row); err != nil {
+		t.Fatal(err)
+	}
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
-
-	// UpdateConnSize alone must mark the row dirty so the connSize EMA is
-	// persisted.  (Regression guard: connSize used to be silently dropped
-	// because UpdateConnSize never set rowDirty.)
-	rt.UpdateConnSize(key, testDomain, 2048)
-
-	snap := rt.SnapshotAndClearDirtyRows()
-	if len(snap) != 1 {
-		t.Fatalf("expected 1 dirty row after UpdateConnSize, got %d", len(snap))
+	rt.RestoreRowMeta(key, row)
+	if best, ok := rt.GetBestProxy(key, testDomain); !ok || best != "proxy-a" {
+		t.Fatalf("legacy TCP best lost: %q, %v", best, ok)
 	}
-	pd, ok := snap[key].Domains[testDomain]
-	if !ok {
-		t.Fatalf("snapshot missing domain %q", testDomain)
+	if !rt.IsTCPProbed(key, testDomain) {
+		t.Fatal("legacy probe state lost")
 	}
-	if pd.ConnSize != 2048 {
-		t.Fatalf("ConnSize = %v, want 2048", pd.ConnSize)
+	rt.UpdateLatency(key, testDomain, "proxy-a", 100)
+	rt.UpdateLatency(key, testDomain, "proxy-c", 200)
+	rt.UpdateSpeed(key, testDomain, "proxy-c", 10485760)
+	ranked := rt.RankByScore([]string{"proxy-a", "proxy-c"}, nil, key, testDomain)
+	if ranked[0] != "proxy-c" {
+		t.Fatalf("legacy small connection must not suppress speed: %v", ranked)
 	}
-	if !pd.HasConnSizeSample {
-		t.Fatal("HasConnSizeSample should be true")
+	if best, ok := rt.GetUDPBestProxyIfFresh(key, testDomain, time.Minute); !ok || best != "proxy-b" {
+		t.Fatalf("legacy UDP best lost: %q, %v", best, ok)
 	}
-
-	// Restore into a fresh table and verify connSize is brought back.
-	rt2 := NewRouteTable(100)
-	rt2.RestoreRowMeta(key, snap[key])
-
-	rt2.mu.RLock()
-	cell := rt2.rows[key].domainTable[testDomain]
-	gotConnSize := cell.connSize
-	gotHas := cell.hasConnSizeSample
-	rt2.mu.RUnlock()
-
-	if gotConnSize != 2048 {
-		t.Fatalf("restored connSize = %v, want 2048", gotConnSize)
+	rt.SetBestProxy(key, testDomain, "proxy-c")
+	encoded, err := json.Marshal(rt.SnapshotAndClearDirtyRows()[key])
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !gotHas {
-		t.Fatal("restored hasConnSizeSample should be true")
+	var decoded map[string]map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"conn_size", "has_conn_size_sample"} {
+		if _, ok := decoded["domains"][testDomain][field]; ok {
+			t.Fatalf("obsolete field persisted: %s", field)
+		}
 	}
 }

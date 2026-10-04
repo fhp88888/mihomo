@@ -1012,17 +1012,6 @@ func (s *Smart) wrapTCPConnWithExploration(c C.Conn, proxy C.Proxy, metadata *C.
 				s.routeTable.UpdateSpeed(key, domain, proxy.Name(), speed)
 			}
 
-			// Collect per-domain connection size (kB) for this CDN row.  Only
-			// recorded when a hostname was resolved; IP-only connections have no
-			// meaningful domain to bucket by, and GetEffectiveTarget would key
-			// them by their IP string.
-			if metadata.Host != "" {
-				connSize := float64(info.DownloadTotal.Load()+info.UploadTotal.Load()) / 1024.0
-				if connSize > 0 {
-					s.routeTable.UpdateConnSize(key, domain, connSize)
-				}
-			}
-
 			// Collect pkg_loss from TCP stats.
 			// Always update when TCP stats are available — even 0% loss
 			// drives the EMA back toward 0, preventing stale loss from

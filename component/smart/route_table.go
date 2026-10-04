@@ -19,7 +19,7 @@ const RouteTableMetaKey = "__table__"
 
 // MaxDomainsPerNormalASRow caps the per-row domain table (LRU) for a normal
 // ASN or TARGET row: each tracks at most this many distinct hostnames or IPs
-// by connection size.
+// by recency.
 const MaxDomainsPerNormalASRow = 50
 
 // MaxDomainsPerCDNASRow caps the per-row domain table (LRU) for a CDN ASN row.
@@ -40,14 +40,6 @@ const MaxProxyCellsPerDomain = 12
 // MaxExploreRoutes bounds exploration cadence counters whose routes may
 // otherwise outlive the bounded row/domain tables indefinitely.
 const MaxExploreRoutes = 1024
-
-// minConnSizeForSpeedKB gates the speed term in calculateScore: smaller
-// connections transfer too little data for a reliable throughput reading.
-const minConnSizeForSpeedKB = 4.0
-
-// connSizeUnknown stands in for connSize when none is known (restore,
-// aggregation, debug); it is large enough to always include the speed term.
-const connSizeUnknown = 1e18
 
 const maxFailedCount = 10.0
 
@@ -101,22 +93,19 @@ type rowEntry struct {
 }
 
 // domainCell is the per-domain entry in a row's domainTable.  bestProxy and
-// tcpProbed hold this domain's routing decision, connSize is an EMA of the
-// connection size (kB) seen for the domain, and proxies holds this domain's
+// tcpProbed hold this domain's routing decision, and proxies holds this domain's
 // own view of every proxy's quality metrics — nothing here is shared with
 // sibling domains in the same row.
 type domainCell struct {
-	domainName        string
-	tcpBestProxy      string
-	udpBestProxy      string
-	tcpProbed         bool
-	lastUsed          int64 // domain LRU/activity timestamp
-	firstUsed         int64 // first observation in this process
-	tcpEvaluatedAt    int64 // last time TCP best was evaluated, not merely reused
-	udpEvaluatedAt    int64 // last time UDP best was evaluated, not merely reused
-	connSize          float64
-	hasConnSizeSample bool
-	proxies           map[string]*proxyCell
+	domainName     string
+	tcpBestProxy   string
+	udpBestProxy   string
+	tcpProbed      bool
+	lastUsed       int64 // domain LRU/activity timestamp
+	firstUsed      int64 // first observation in this process
+	tcpEvaluatedAt int64 // last time TCP best was evaluated, not merely reused
+	udpEvaluatedAt int64 // last time UDP best was evaluated, not merely reused
+	proxies        map[string]*proxyCell
 	// Observation LRU; current TCP and UDP bests are protected on eviction.
 	proxyOrder []string
 }
@@ -209,7 +198,6 @@ type DomainSnapshot struct {
 	UDPBestProxy string                 `json:"udp_best_proxy"`
 	TCPProbed    bool                   `json:"tcp_probed"`
 	LastUsed     int64                  `json:"last_used"`
-	ConnSize     float64                `json:"conn_size"`
 	Proxies      map[string]ProxyRecord `json:"proxies"`
 }
 
@@ -366,7 +354,6 @@ func (rt *RouteTable) getOrCreateDomainCell(row *rowEntry, domain string) *domai
 	now := time.Now().Unix()
 	cell := &domainCell{
 		domainName: domain,
-		connSize:   100,
 		firstUsed:  now,
 		lastUsed:   now,
 		proxies:    make(map[string]*proxyCell),
@@ -613,13 +600,13 @@ func applyEMAInt64(old, new int64, hasSample bool) int64 {
 // Pass latency for the legacy latency-derived score, or TTFB to score by
 // time-to-first-byte instead.  All other dimensions (speed, pkgLoss,
 // failedCount, jitter) apply identically.
-func calculateScore(responseTime int64, speed float64, pkgLoss float64, failedCount float64, jitter float64, connSizeKB float64) float64 {
+func calculateScore(responseTime int64, speed float64, pkgLoss float64, failedCount float64, jitter float64) float64 {
 	score := 0.0
 	if responseTime > 0 {
 		score = 100.0 / (math.Max(float64(responseTime), 50.0) +
 			math.Max(jitter, 10.0))
 	}
-	if speed > 0 && connSizeKB >= minConnSizeForSpeedKB {
+	if speed > 0 {
 		// 500kb/s is a sensitive threshold to define what is good download speed or not.
 		// so divided by 0.5
 		score += math.Log1p(speed / 1024.0 / 1024.0 / 0.5)
@@ -649,7 +636,7 @@ func (rt *RouteTable) RefreshScores(key, domain string, proxies []string) {
 		if !ok || !cell.hasData() {
 			continue
 		}
-		cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeUnknown)
+		cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
 	}
 }
 
@@ -1138,23 +1125,6 @@ func (rt *RouteTable) UpdateSpeed(key, domain, proxy string, speed float64) {
 	rt.touchLRU(key)
 }
 
-// UpdateConnSize updates the EMA connection size (kB) for a domain, evicting
-// the least-recently-used domain when the row's LRU is full.
-func (rt *RouteTable) UpdateConnSize(key, domain string, sizeKB float64) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-
-	row := rt.getOrCreateRow(key)
-	cell := rt.getOrCreateDomainCell(row, domain)
-	rt.touchDomainLRU(row, domain)
-
-	cell.connSize = applyEMA(cell.connSize, sizeKB, cell.hasConnSizeSample)
-	cell.hasConnSizeSample = true
-	row.rowDirty = true
-	row.lastUsed = time.Now().Unix()
-	rt.touchLRU(key)
-}
-
 // IncrementUseCount increments the use counter for a proxy within a route
 // key's domain.  Also resets failedCount since a successful use means the
 // proxy is working.
@@ -1282,13 +1252,6 @@ func (rt *RouteTable) RankByScore(proxies []string, urlTestDelay func(string) ui
 		dc = row.domainTable[domain]
 	}
 
-	// connSize gates the speed component.  A domain without a cell yet has
-	// connSize 0, which also skips the speed term.
-	var connSizeKB float64
-	if dc != nil {
-		connSizeKB = dc.connSize
-	}
-
 	// minTTFB is the smallest TTFB EMA among proxies with a sample in this domain.
 	var minTTFB int64
 	hasTTFB := false
@@ -1322,7 +1285,7 @@ func (rt *RouteTable) RankByScore(proxies []string, urlTestDelay func(string) ui
 		if cell != nil && cell.HasTTFBSample {
 			cands = append(cands, candidate{
 				name:  proxy,
-				score: calculateScore(cell.TTFB, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeKB),
+				score: calculateScore(cell.TTFB, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter),
 				ttfb:  true,
 			})
 			continue
@@ -1354,7 +1317,7 @@ func (rt *RouteTable) RankByScore(proxies []string, urlTestDelay func(string) ui
 
 		cands = append(cands, candidate{
 			name:  proxy,
-			score: calculateScore(rankingDelay, speed, pkgLoss, failedCount, jitter, connSizeKB),
+			score: calculateScore(rankingDelay, speed, pkgLoss, failedCount, jitter),
 			ttfb:  false,
 		})
 	}
@@ -1587,7 +1550,7 @@ func (rt *RouteTable) RestoreRow(key, domain, proxy string, pc PersistedCell) {
 		cell.HasPkgLossSample = pc.PkgLoss > 0
 		cell.HasSpeedSample = pc.Speed > 0
 	}
-	cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter, connSizeUnknown)
+	cell.Score = calculateScore(cell.Latency, cell.Speed, cell.PkgLoss, cell.FailedCount, cell.Jitter)
 	cell.Dirty = false
 	rt.touchDomainLRU(row, domain)
 	row.lastUsed = time.Now().Unix()
@@ -1595,17 +1558,14 @@ func (rt *RouteTable) RestoreRow(key, domain, proxy string, pc PersistedCell) {
 }
 
 // PersistedDomain is the JSON-serializable form of a domainCell's routing
-// state (bestProxy, tcpProbed) plus its connection-size EMA so the connSize
-// gating in calculateScore survives a restart.
+// state (bestProxy, tcpProbed).
 type PersistedDomain struct {
-	BestProxy         string  `json:"best_proxy,omitempty"` // legacy and TCP best compatibility
-	TCPBestProxy      string  `json:"tcp_best_proxy,omitempty"`
-	UDPBestProxy      string  `json:"udp_best_proxy,omitempty"`
-	TCPEvaluatedAt    int64   `json:"tcp_evaluated_at,omitempty"`
-	UDPEvaluatedAt    int64   `json:"udp_evaluated_at,omitempty"`
-	TCPProbed         bool    `json:"tcp_probed"`
-	ConnSize          float64 `json:"conn_size"`
-	HasConnSizeSample bool    `json:"has_conn_size_sample"`
+	BestProxy      string `json:"best_proxy,omitempty"` // legacy and TCP best compatibility
+	TCPBestProxy   string `json:"tcp_best_proxy,omitempty"`
+	UDPBestProxy   string `json:"udp_best_proxy,omitempty"`
+	TCPEvaluatedAt int64  `json:"tcp_evaluated_at,omitempty"`
+	UDPEvaluatedAt int64  `json:"udp_evaluated_at,omitempty"`
+	TCPProbed      bool   `json:"tcp_probed"`
 }
 
 // PersistedRow is the JSON-serializable form of a rowEntry's routing state:
@@ -1666,8 +1626,6 @@ func (rt *RouteTable) RestoreRowMeta(key string, pr PersistedRow) {
 			}
 			cell.udpBestProxy = pd.UDPBestProxy
 			cell.tcpProbed = pd.TCPProbed
-			cell.connSize = pd.ConnSize
-			cell.hasConnSizeSample = pd.HasConnSizeSample
 			cell.lastUsed = now
 			cell.tcpEvaluatedAt = pd.TCPEvaluatedAt
 			if cell.tcpBestProxy != "" && cell.tcpEvaluatedAt == 0 {
@@ -1709,14 +1667,12 @@ func (rt *RouteTable) SnapshotAndClearDirtyRows() map[string]PersistedRow {
 			domains := make(map[string]PersistedDomain, len(row.domainTable))
 			for domain, cell := range row.domainTable {
 				domains[domain] = PersistedDomain{
-					BestProxy:         cell.tcpBestProxy,
-					TCPBestProxy:      cell.tcpBestProxy,
-					UDPBestProxy:      cell.udpBestProxy,
-					TCPEvaluatedAt:    cell.tcpEvaluatedAt,
-					UDPEvaluatedAt:    cell.udpEvaluatedAt,
-					TCPProbed:         cell.tcpProbed,
-					ConnSize:          cell.connSize,
-					HasConnSizeSample: cell.hasConnSizeSample,
+					BestProxy:      cell.tcpBestProxy,
+					TCPBestProxy:   cell.tcpBestProxy,
+					UDPBestProxy:   cell.udpBestProxy,
+					TCPEvaluatedAt: cell.tcpEvaluatedAt,
+					UDPEvaluatedAt: cell.udpEvaluatedAt,
+					TCPProbed:      cell.tcpProbed,
 				}
 			}
 			snapshot[key] = PersistedRow{Domains: domains}
@@ -1828,7 +1784,6 @@ func (rt *RouteTable) Snapshot(groupName string) TableSnapshot {
 				UDPBestProxy: dc.udpBestProxy,
 				TCPProbed:    dc.tcpProbed,
 				LastUsed:     dc.lastUsed,
-				ConnSize:     dc.connSize,
 				Proxies:      proxies,
 			})
 			if dc.tcpBestProxy != "" && dc.lastUsed > bestLastUsed {

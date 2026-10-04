@@ -122,7 +122,7 @@ func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
 				PkgLoss:     pkgLoss,
 				Jitter:      jitter,
 				FailedCount: failedCount,
-				Score:       calculateScore(latency, speed, pkgLoss, failedCount, jitter, connSizeUnknown),
+				Score:       calculateScore(latency, speed, pkgLoss, failedCount, jitter),
 			},
 		})
 	}
