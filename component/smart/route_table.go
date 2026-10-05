@@ -808,6 +808,75 @@ func summarizeValues(values []float64, floorFraction float64) (TTFBPrior, bool) 
 	return TTFBPrior{Mean: mean, StdDev: stddev, Samples: len(values)}, true
 }
 
+// similarDomainWeight preserves the same-site structural prior and uses
+// common proxy observations only as a mild posterior correction.
+func similarDomainWeight(domain, name string, current, other *domainCell) float64 {
+	if name == domain {
+		return 0
+	}
+	similarity := DomainTreeSimilarity(domain, name)
+	if similarity == 0 {
+		return 0
+	}
+	weight := .75 + .25*similarity
+	if current != nil {
+		weight *= .75 + .25*performanceSignatureSimilarity(current, other)
+	}
+	return weight
+}
+
+// SimilarFailedCount averages failure penalties from up to eight nearest
+// same-site route/domain cells, across ASNs. Observed zero-penalty cells
+// participate; failure-only cells need no TTFB sample. Empty placeholders and
+// the target hostname (including other rows) never contribute. Source cells
+// retain their normal success reset and time decay; no shared state is stored.
+func (rt *RouteTable) SimilarFailedCount(key, domain, proxy string) float64 {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	type neighbor struct {
+		value, weight float64
+		key, domain   string
+	}
+	neighbors := make([]neighbor, 0)
+	var current *domainCell
+	if row, ok := rt.rows[key]; ok {
+		current = row.domainTable[domain]
+	}
+	for rowKey, row := range rt.rows {
+		for name, dc := range row.domainTable {
+			cell, ok := dc.proxies[proxy]
+			if !ok || !(cell.hasData() || cell.UseCount > 0) {
+				continue
+			}
+			if weight := similarDomainWeight(domain, name, current, dc); weight > 0 {
+				neighbors = append(neighbors, neighbor{cell.FailedCount, weight, rowKey, name})
+			}
+		}
+	}
+	// Deterministic ties prevent map iteration from changing the selected eight.
+	sort.Slice(neighbors, func(i, j int) bool {
+		if neighbors[i].weight != neighbors[j].weight {
+			return neighbors[i].weight > neighbors[j].weight
+		}
+		if neighbors[i].domain != neighbors[j].domain {
+			return neighbors[i].domain < neighbors[j].domain
+		}
+		return neighbors[i].key < neighbors[j].key
+	})
+	if len(neighbors) > 8 {
+		neighbors = neighbors[:8]
+	}
+	total, sum := 0.0, 0.0
+	for _, n := range neighbors {
+		total += n.weight
+		sum += n.weight * n.value
+	}
+	if total == 0 {
+		return 0
+	}
+	return sum / total
+}
+
 // SimilarTTFBPrior combines the nearest domains under the same registrable
 // root. Domain-tree proximity is the prior weight; once both domains have at
 // least three common proxy observations, their performance-signature
@@ -823,20 +892,7 @@ func (rt *RouteTable) SimilarTTFBPrior(key, domain, proxy string) (TTFBPrior, bo
 	}
 	for _, row := range rt.rows {
 		for name, dc := range row.domainTable {
-			if name == domain {
-				continue
-			}
-			treeSimilarity := DomainTreeSimilarity(domain, name)
-			if treeSimilarity == 0 {
-				continue
-			}
-			// Keep most of the registrable-domain prior so a shallow tree does
-			// not discard useful sibling evidence. Tree distance and the
-			// posterior signature refine that prior instead of replacing it.
-			weight := .75 + .25*treeSimilarity
-			if current != nil {
-				weight *= .75 + .25*performanceSignatureSimilarity(current, dc)
-			}
+			weight := similarDomainWeight(domain, name, current, dc)
 			if cell, ok := dc.proxies[proxy]; ok && cell.HasTTFBSample && weight > 0 {
 				neighbors = append(neighbors, neighbor{float64(cell.TTFB), weight})
 			}

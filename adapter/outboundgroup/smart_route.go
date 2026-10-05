@@ -302,6 +302,10 @@ func (s *Smart) explorationWorthRisk(key, domain, bestName, challengerName strin
 	if potentialGain < 0 {
 		potentialGain = 0
 	}
+	// Related-domain failures discount exploration's benefit, not the damage
+	// budget. Low-damage and missing-TTFB candidates keep their existing paths.
+	sharedFailedCount := s.routeTable.SimilarFailedCount(key, domain, challengerName)
+	potentialGain *= math.Pow(0.8, sharedFailedCount)
 	potentialDamage := challenger.Mean - best.Mean
 	if potentialDamage < 0 {
 		potentialDamage = 0
@@ -317,8 +321,8 @@ func (s *Smart) explorationWorthRisk(key, domain, bestName, challengerName strin
 	}
 	allowed := potentialDamage <= damageBudget || potentialGain >= smartExploreMinGainMs && futureGain >= riskBudget
 	if !allowed {
-		log.Debugln("[Smart] skip challenger %s for %s: prior mean=%.0fms stddev=%.0fms best=%.0fms gain=%.0fms damage=%.0fms budget=%.0fms samples=%d",
-			challengerName, domain, challenger.Mean, challenger.StdDev, best.Mean, potentialGain, potentialDamage, damageBudget, challenger.Samples)
+		log.Debugln("[Smart] skip challenger %s for %s: prior mean=%.0fms stddev=%.0fms best=%.0fms gain=%.0fms damage=%.0fms budget=%.0fms samples=%d shared_failed=%.2f",
+			challengerName, domain, challenger.Mean, challenger.StdDev, best.Mean, potentialGain, potentialDamage, damageBudget, challenger.Samples, sharedFailedCount)
 	}
 	return allowed
 }

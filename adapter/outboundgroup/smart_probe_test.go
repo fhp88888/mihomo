@@ -1218,6 +1218,56 @@ func TestSmartExploration_AggregatePriorKeepsPlausibleAndUnknownChallengers(t *t
 	}
 }
 
+func TestSmartExploration_SharedFailuresDiscountGain(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		low, high int64
+		failures  float64
+	}{
+		// Gain falls below the risk while remaining above the 25ms minimum.
+		{"future-gain", 200, 2000, 4},
+		// Enough future demand covers the risk, but discounted gain is <25ms.
+		{"minimum-gain", 600, 2000, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const key, domain = "current", "img.example.com"
+			s, rt, pc := newBestRaceSmart()
+			defer pc.Close()
+			rt.UpdateTTFB(key, domain, "best", 800)
+			rt.UpdateTTFB("ASN:1", "a.example.com", "challenger", tc.low)
+			rt.UpdateTTFB("ASN:2", "b.example.com", "challenger", tc.high)
+			if tc.name == "minimum-gain" {
+				for i := 0; i < 8; i++ {
+					rt.IncrementUseCount("ASN:1", "a.example.com", "challenger")
+				}
+			}
+			if !s.explorationWorthRisk(key, domain, "best", "challenger") {
+				t.Fatal("plausible challenger rejected before shared failures")
+			}
+			rt.MarkFailed("ASN:1", "challenger", "a.example.com", tc.failures)
+			rt.MarkFailed("ASN:2", "challenger", "b.example.com", tc.failures)
+			if s.explorationWorthRisk(key, domain, "best", "challenger") {
+				t.Fatal("shared failures did not discount exploration gain")
+			}
+		})
+	}
+}
+
+func TestSmartExploration_SharedFailuresPreserveExistingAllowPaths(t *testing.T) {
+	const key, domain = "current", "img.example.com"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+	rt.UpdateTTFB(key, domain, "best", 800)
+	rt.UpdateTTFB("sibling", "www.example.com", "low-damage", 900)
+	rt.MarkFailed("sibling", "low-damage", "www.example.com", 10)
+	rt.MarkFailed("sibling", "failure-only", "www.example.com", 10)
+	for _, proxy := range []string{"low-damage", "failure-only", "unknown"} {
+		if !s.explorationWorthRisk(key, domain, "best", proxy) {
+			t.Fatalf("existing allow path changed for %s", proxy)
+		}
+	}
+}
+
 func TestSmartExploration_ChallengerFailureFallsBackToBestImmediately(t *testing.T) {
 	const key, domain = "TARGET:example.com", "example.com"
 	s, rt, pc := newBestRaceSmart()

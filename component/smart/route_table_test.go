@@ -298,6 +298,71 @@ func TestSimilarPriorKeepsSiblingEvidenceDespiteOppositeSignature(t *testing.T) 
 	}
 }
 
+func TestSimilarFailedCountIncludesFailureOnlyAndObservedZeros(t *testing.T) {
+	rt := NewRouteTable(100)
+	const domain, proxy = "img.example.com", "p"
+	// A parent failure-only cell contributes with weight .875.
+	rt.SetBestProxy("ASN:1", "example.com", "other")
+	rt.MarkFailed("ASN:1", proxy, "example.com", 2)
+	// A successful sibling contributes zero with weight 5/6.
+	rt.IncrementUseCount("ASN:2", "www.example.com", proxy)
+	// Empty placeholders, unrelated sites and the exact hostname in any row
+	// must not dilute or increase the shared penalty.
+	rt.SetBestProxy("ASN:3", "empty.example.com", "other")
+	rt.getOrCreateCell(rt.rows["ASN:3"].domainTable["empty.example.com"], proxy)
+	for key, host := range map[string]string{"ASN:4": domain, "ASN:5": "other.net", "TARGET:local": domain} {
+		rt.SetBestProxy(key, host, "other")
+		rt.MarkFailed(key, proxy, host, 10)
+	}
+	want := 2 * .875 / (.875 + 5.0/6)
+	if got := rt.SimilarFailedCount("TARGET:local", domain, proxy); math.Abs(got-want) > 1e-9 {
+		t.Fatalf("shared failure = %v, want %v", got, want)
+	}
+	if got := rt.SimilarFailedCount("TARGET:local", domain, "unknown"); got != 0 {
+		t.Fatalf("unknown proxy penalty = %v", got)
+	}
+	rt.DecayFailedCounts()
+	want = 1.9 * .875 / (.875 + 5.0/6)
+	if got := rt.SimilarFailedCount("TARGET:local", domain, proxy); math.Abs(got-want) > 1e-9 {
+		t.Fatalf("decayed shared failure = %v, want %v", got, want)
+	}
+	rt.IncrementUseCount("ASN:1", "example.com", proxy)
+	if got := rt.SimilarFailedCount("TARGET:local", domain, proxy); got != 0 {
+		t.Fatalf("successful source did not reset shared penalty: %v", got)
+	}
+}
+
+func TestSimilarFailedCountUsesPerformanceSignature(t *testing.T) {
+	rt := NewRouteTable(100)
+	const domain = "img.example.com"
+	for i, proxy := range []string{"p1", "p2", "p3"} {
+		rt.UpdateTTFB("current", domain, proxy, int64(100+i*100))
+		rt.UpdateTTFB("positive", "a.example.com", proxy, int64(100+i*100))
+		rt.UpdateTTFB("negative", "b.example.com", proxy, int64(300-i*100))
+	}
+	rt.MarkFailed("positive", "challenger", "a.example.com", 2)
+	rt.MarkFailed("negative", "challenger", "b.example.com", 6)
+	want := (2.0 + .75*6) / (1 + .75)
+	if got := rt.SimilarFailedCount("current", domain, "challenger"); math.Abs(got-want) > 1e-9 {
+		t.Fatalf("signature-weighted failure = %v, want %v", got, want)
+	}
+}
+
+func TestSimilarFailedCountKeepsEightNearestRecords(t *testing.T) {
+	rt := NewRouteTable(100)
+	const domain = "preview.img.example.com"
+	for i := 0; i < 8; i++ {
+		host := fmt.Sprintf("c%d.%s", i, domain)
+		rt.SetBestProxy(host, host, "other")
+		rt.MarkFailed(host, "p", host, 2)
+	}
+	rt.SetBestProxy("far", "www.example.com", "other")
+	rt.MarkFailed("far", "p", "www.example.com", 10)
+	if got := rt.SimilarFailedCount("current", domain, "p"); math.Abs(got-2) > 1e-9 {
+		t.Fatalf("distant ninth record contributed: %v", got)
+	}
+}
+
 func TestCalculateScore(t *testing.T) {
 	cases := []struct {
 		latency     int64
