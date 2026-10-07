@@ -15,7 +15,12 @@ import (
 
 const topK = 15
 
-// discoveryState tracks an in-progress discovery for a route key.
+type discoveryKey struct {
+	routeKey string
+	domain   string
+}
+
+// discoveryState tracks an in-progress discovery for a route key and domain.
 type discoveryState struct {
 	mu           sync.Mutex
 	done         chan struct{}
@@ -26,11 +31,11 @@ type discoveryState struct {
 	leaderCancel context.CancelFunc
 }
 
-// ProbeCoordinator manages concurrent TCP discovery with per-route-key merging.
-// Only one discovery (leader) runs per route key; followers wait for the result.
+// ProbeCoordinator merges TCP discovery for the same route key and domain.
+// Only one leader runs per pair; followers wait for its result.
 type ProbeCoordinator struct {
 	mu          sync.Mutex
-	discoveries map[string]*discoveryState
+	discoveries map[discoveryKey]*discoveryState
 	closed      bool
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -41,14 +46,37 @@ type ProbeCoordinator struct {
 func NewProbeCoordinator() *ProbeCoordinator {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &ProbeCoordinator{
-		discoveries: make(map[string]*discoveryState),
+		discoveries: make(map[discoveryKey]*discoveryState),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
 }
 
-// Discover runs a discovery for the given route key. If another goroutine is
-// already discovering this key, the caller waits for that result. Otherwise,
+// TrackRace registers a non-discovery race before it can create asynchronous
+// loser-drain work. Registration and the closed check share pc.mu with Close,
+// so Wait can never overtake a later WaitGroup.Add. The returned context is
+// canceled by either the caller or the coordinator.
+func (pc *ProbeCoordinator) TrackRace(ctx context.Context) (context.Context, func(), error) {
+	pc.mu.Lock()
+	if pc.closed {
+		pc.mu.Unlock()
+		return nil, nil, errors.New("probe coordinator closed")
+	}
+	pc.wg.Add(1)
+	pc.mu.Unlock()
+
+	raceCtx, cancel := context.WithCancel(ctx)
+	stopCoordinatorCancel := context.AfterFunc(pc.ctx, cancel)
+	done := func() {
+		stopCoordinatorCancel()
+		cancel()
+		pc.wg.Done()
+	}
+	return raceCtx, done, nil
+}
+
+// Discover runs a discovery for the given route key and normalized domain.
+// If another goroutine is discovering that pair, the caller waits. Otherwise,
 // this goroutine becomes the leader and probes the top-K proxies concurrently,
 // returning the first successful connection.
 func (pc *ProbeCoordinator) Discover(
@@ -60,6 +88,8 @@ func (pc *ProbeCoordinator) Discover(
 	singleDial func(context.Context, C.Proxy, *C.Metadata, time.Time) (C.Conn, int64, error),
 	rt *smart.RouteTable,
 ) (C.Proxy, C.Conn, int64, error) {
+	domain := routeDomain(metadata)
+	discoveryID := discoveryKey{routeKey: key, domain: domain}
 
 	// Check if we should join an existing discovery
 	pc.mu.Lock()
@@ -68,11 +98,24 @@ func (pc *ProbeCoordinator) Discover(
 		return nil, nil, 0, errors.New("probe coordinator closed")
 	}
 
-	ds, exists := pc.discoveries[key]
+	ds, exists := pc.discoveries[discoveryID]
 	if exists {
-		// Follower path: wait for leader
+		// Register the complete follower lifetime while holding pc.mu. Close
+		// takes the same lock before Wait, so the counter cannot reach zero and
+		// then be incremented by a late follower fallback.
+		pc.wg.Add(1)
 		done := ds.done
 		pc.mu.Unlock()
+		defer pc.wg.Done()
+
+		// A follower is owned by both its caller and the coordinator. This keeps
+		// its re-dial and any fallback discovery cancellable during Smart.Close.
+		followerCtx, cancelFollower := context.WithCancel(ctx)
+		stopCoordinatorCancel := context.AfterFunc(pc.ctx, cancelFollower)
+		defer func() {
+			stopCoordinatorCancel()
+			cancelFollower()
+		}()
 
 		select {
 		case <-done:
@@ -83,15 +126,39 @@ func (pc *ProbeCoordinator) Discover(
 			if p != nil && e == nil {
 				// Follower gets a NEW connection to the same proxy
 				start := time.Now()
-				newConn, connectTime, dialErr := singleDial(ctx, p, metadata, start)
-				if dialErr != nil {
+				newConn, connectTime, dialErr := singleDial(followerCtx, p, metadata, start)
+				if dialErr == nil {
+					rt.UpdateLatency(key, domain, p.Name(), connectTime)
+					return p, newConn, connectTime, nil
+				}
+
+				// A winner is only a hint for followers: its next connection can
+				// still fail because of a transient node error or a concurrency
+				// limit. Penalize node-level failures and continue discovery with
+				// the remaining candidates instead of failing the request outright.
+				if err := followerCtx.Err(); err != nil {
+					return nil, nil, 0, err
+				}
+				if tunnel.ShouldStopRetry(dialErr) || errors.Is(dialErr, context.Canceled) {
 					return nil, nil, 0, dialErr
 				}
-				return p, newConn, connectTime, nil
+				rt.MarkFailed(key, p.Name(), domain, 1.0)
+
+				remainingNames := make([]string, 0, len(preRanked))
+				for _, name := range preRanked {
+					if name != p.Name() {
+						remainingNames = append(remainingNames, name)
+					}
+				}
+				if len(remainingNames) == 0 {
+					return nil, nil, 0, dialErr
+				}
+				fallback := pc.probeBatch(followerCtx, key, proxies, metadata, remainingNames, singleDial, rt)
+				return fallback.proxy, fallback.conn, fallback.connectTime, fallback.err
 			}
 			return nil, nil, 0, e
-		case <-ctx.Done():
-			return nil, nil, 0, ctx.Err()
+		case <-followerCtx.Done():
+			return nil, nil, 0, followerCtx.Err()
 		}
 	}
 
@@ -102,23 +169,16 @@ func (pc *ProbeCoordinator) Discover(
 		leaderCtx:    leaderCtx,
 		leaderCancel: leaderCancel,
 	}
-	pc.discoveries[key] = ds
+	pc.discoveries[discoveryID] = ds
 	pc.wg.Add(1)
 	pc.mu.Unlock()
 
 	defer func() {
-		// NOTE: leaderCancel is NOT called here.  raceStaggered (reached via
-		// probeBatch below) owns cancellation of raceCtx for the normal path:
-		// on a winner it defers cancelRace until the background drain finishes
-		// sampling late losers' connectTime (keepLosersAlive), and on failure
-		// paths its deferred cancelRace fires immediately.  Canceling
-		// leaderCtx here would abort those in-flight loser dials the instant
-		// the winner returns, defeating the loser sampling.  leaderCtx is only
-		// canceled by Close() for shutdown, or GC'd once this discovery is
-		// deleted and unreferenced (no goroutine blocks on it besides the
-		// self-bounded 2s dials).
+		// leaderCancel is not called here: raceStaggered owns cancellation, so
+		// in-flight loser dials keep sampling their connectTime after the winner
+		// returns.  leaderCtx is only canceled by Close().
 		pc.mu.Lock()
-		delete(pc.discoveries, key)
+		delete(pc.discoveries, discoveryID)
 		pc.mu.Unlock()
 		close(ds.done)
 		pc.wg.Done()
@@ -134,13 +194,6 @@ func (pc *ProbeCoordinator) Discover(
 	ds.mu.Unlock()
 
 	return proxy.proxy, proxy.conn, proxy.connectTime, proxy.err
-}
-
-type probeResult struct {
-	proxy       C.Proxy
-	conn        C.Conn
-	connectTime int64
-	err         error
 }
 
 // dialResult is the result of a single dial attempt in a staggered race.
@@ -160,7 +213,7 @@ func (pc *ProbeCoordinator) probeBatch(
 	preRanked []string,
 	singleDial func(context.Context, C.Proxy, *C.Metadata, time.Time) (C.Conn, int64, error),
 	rt *smart.RouteTable,
-) probeResult {
+) dialResult {
 	// Build a name→proxy lookup
 	proxyMap := make(map[string]C.Proxy, len(proxies))
 	for _, p := range proxies {
@@ -168,6 +221,10 @@ func (pc *ProbeCoordinator) probeBatch(
 	}
 
 	n := len(preRanked)
+	discoveryOrdinal := make(map[string]int, len(preRanked))
+	for i, name := range preRanked {
+		discoveryOrdinal[name] = i + 1
+	}
 	for offset := 0; offset < n; {
 		// Take up to topK proxies from the current offset
 		batch := make([]C.Proxy, 0, topK)
@@ -185,7 +242,7 @@ func (pc *ProbeCoordinator) probeBatch(
 		var failMu sync.Mutex
 		var fatalErr error
 
-		winner, conn, connectTime, err := raceStaggered(ctx, key, batch, &pc.wg, smartTCPFallbackStagger, "Discovery",
+		winner, conn, connectTime, err := raceStaggered(ctx, batch, &pc.wg, smartTCPFallbackStagger,
 			// Discovery dials use the caller's raw dial (no MarkFailed inside —
 			// probeBatch classifies node-level vs fatal itself).
 			func(dialCtx context.Context, p C.Proxy) (C.Conn, int64, error) {
@@ -196,12 +253,18 @@ func (pc *ProbeCoordinator) probeBatch(
 			// are not wasted — they improve prerank accuracy for subsequent
 			// discoveries on this route key.
 			func(proxyName string, connectTime int64) {
-				rt.UpdateLatency(key, proxyName, connectTime)
+				rt.UpdateLatency(key, routeDomain(metadata), proxyName, connectTime)
 			},
 			// onFail: classify node-level vs fatal/cancellation.  Only proxies
 			// with node-level errors are penalized (MarkFailed 1.0); fatal
 			// target-level errors and cancellations are not the proxy's fault.
 			func(p C.Proxy, dialErr error) {
+				// The parent request or coordinator may have expired while a dial
+				// result was becoming ready. Check the parent first so a select race
+				// cannot turn caller cancellation/deadline into a node penalty.
+				if ctx.Err() != nil {
+					return
+				}
 				if tunnel.ShouldStopRetry(dialErr) {
 					failMu.Lock()
 					if fatalErr == nil {
@@ -213,15 +276,18 @@ func (pc *ProbeCoordinator) probeBatch(
 				if errors.Is(dialErr, context.Canceled) {
 					return // Don't penalize proxy for cancellation
 				}
-				rt.MarkFailed(key, p.Name(), 1.0)
+				rt.MarkFailed(key, p.Name(), routeDomain(metadata), 1.0)
 			},
-			// onWinner: probeBatch does its own winner bookkeeping via the
-			// returned winner, so nothing to do here.
-			nil,
+			// onWinner: discovery has no distinguished first candidate; every
+			// winner belongs to the discovery race.
+			func(proxy C.Proxy, connectTime int64) {
+				log.Infoln("[Smart] route key=%s routed via %s (%dms, Discovery#%d)",
+					key, proxy.Name(), connectTime, discoveryOrdinal[proxy.Name()])
+			},
 		)
 
 		if err == nil && conn != nil {
-			return probeResult{proxy: winner, conn: conn, connectTime: connectTime}
+			return dialResult{proxy: winner, conn: conn, connectTime: connectTime}
 		}
 
 		// No winner.  Fatal errors were captured live in onFail; node-level
@@ -233,18 +299,18 @@ func (pc *ProbeCoordinator) probeBatch(
 		failMu.Unlock()
 
 		if fe != nil {
-			return probeResult{err: fe}
+			return dialResult{err: fe}
 		}
 
 		// If ctx is done, stop
 		if ctx.Err() != nil {
-			return probeResult{err: ctx.Err()}
+			return dialResult{err: ctx.Err()}
 		}
 
 		// All dials failed with node-level errors — continue to the next batch.
 	}
 
-	return probeResult{err: fmt.Errorf("all %d proxies failed for key=%s", n, key)}
+	return dialResult{err: fmt.Errorf("all %d proxies failed for key=%s", n, key)}
 }
 
 // Close cancels all active discoveries and waits for workers to finish.

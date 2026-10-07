@@ -23,16 +23,34 @@ import (
 
 // stubProxy implements C.Proxy with minimal behavior for testing.
 type stubProxy struct {
-	name string
+	name  string
 	delay uint16
 	dial  func(context.Context, *C.Metadata) (C.Conn, error)
 }
 
-func (s *stubProxy) Name() string              { return s.name }
-func (s *stubProxy) Type() C.AdapterType       { return C.Direct }
-func (s *stubProxy) Addr() string              { return "" }
-func (s *stubProxy) SupportUDP() bool          { return false }
-func (s *stubProxy) ProxyInfo() C.ProxyInfo    { return C.ProxyInfo{} }
+type nilPacketProxy struct{ *stubProxy }
+
+func (p *nilPacketProxy) SupportUDP() bool { return true }
+func (p *nilPacketProxy) ListenPacketContext(context.Context, *C.Metadata) (C.PacketConn, error) {
+	return nil, nil
+}
+
+type udpErrorProxy struct {
+	*stubProxy
+	calls int
+}
+
+func (p *udpErrorProxy) SupportUDP() bool { return true }
+func (p *udpErrorProxy) ListenPacketContext(context.Context, *C.Metadata) (C.PacketConn, error) {
+	p.calls++
+	return nil, errors.New("udp dial failed")
+}
+
+func (s *stubProxy) Name() string           { return s.name }
+func (s *stubProxy) Type() C.AdapterType    { return C.Direct }
+func (s *stubProxy) Addr() string           { return "" }
+func (s *stubProxy) SupportUDP() bool       { return false }
+func (s *stubProxy) ProxyInfo() C.ProxyInfo { return C.ProxyInfo{} }
 func (s *stubProxy) MarshalJSON() ([]byte, error) {
 	return []byte(`"` + s.name + `"`), nil
 }
@@ -45,13 +63,13 @@ func (s *stubProxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Co
 func (s *stubProxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
 	return nil, errors.New("stub: ListenPacketContext not implemented")
 }
-func (s *stubProxy) SupportUOT() bool                      { return false }
-func (s *stubProxy) IsL3Protocol(metadata *C.Metadata) bool { return false }
-func (s *stubProxy) Unwrap(metadata *C.Metadata, touch bool) C.Proxy { return nil }
-func (s *stubProxy) Close() error                          { return nil }
-func (s *stubProxy) Adapter() C.ProxyAdapter               { return s }
-func (s *stubProxy) AliveForTestUrl(url string) bool       { return true }
-func (s *stubProxy) DelayHistory() []C.DelayHistory        { return nil }
+func (s *stubProxy) SupportUOT() bool                                   { return false }
+func (s *stubProxy) IsL3Protocol(metadata *C.Metadata) bool             { return false }
+func (s *stubProxy) Unwrap(metadata *C.Metadata, touch bool) C.Proxy    { return nil }
+func (s *stubProxy) Close() error                                       { return nil }
+func (s *stubProxy) Adapter() C.ProxyAdapter                            { return s }
+func (s *stubProxy) AliveForTestUrl(url string) bool                    { return true }
+func (s *stubProxy) DelayHistory() []C.DelayHistory                     { return nil }
 func (s *stubProxy) DelayHistoryForTestUrl(url string) []C.DelayHistory { return nil }
 func (s *stubProxy) ExtraDelayHistories() map[string]C.ProxyState       { return nil }
 func (s *stubProxy) LastDelayForTestUrl(url string) uint16              { return s.delay }
@@ -211,8 +229,8 @@ type stubConn struct {
 	closes int
 }
 
-func (s *stubConn) Read(b []byte) (n int, err error)            { return 0, io.EOF }
-func (s *stubConn) Write(b []byte) (n int, err error)           { return len(b), nil }
+func (s *stubConn) Read(b []byte) (n int, err error)  { return 0, io.EOF }
+func (s *stubConn) Write(b []byte) (n int, err error) { return len(b), nil }
 func (s *stubConn) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -224,30 +242,49 @@ func (s *stubConn) CloseCount() int {
 	defer s.mu.Unlock()
 	return s.closes
 }
-func (s *stubConn) LocalAddr() net.Addr                         { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
-func (s *stubConn) RemoteAddr() net.Addr                        { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443} }
-func (s *stubConn) SetDeadline(t time.Time) error               { return nil }
-func (s *stubConn) SetReadDeadline(t time.Time) error           { return nil }
-func (s *stubConn) SetWriteDeadline(t time.Time) error          { return nil }
-func (s *stubConn) ReadBuffer(buffer *buf.Buffer) error         { return io.EOF }
-func (s *stubConn) WriteBuffer(buffer *buf.Buffer) error        { return nil }
-func (s *stubConn) Upstream() any                               { return nil }
-func (s *stubConn) NeedHandshake() bool                         { return false }
-func (s *stubConn) ReaderReplaceable() bool                     { return false }
-func (s *stubConn) WriterReplaceable() bool                     { return false }
-func (s *stubConn) Chains() C.Chain                             { return nil }
-func (s *stubConn) ProviderChains() C.Chain                     { return nil }
-func (s *stubConn) AppendToChains(adapter C.ProxyAdapter)       {}
-func (s *stubConn) RemoteDestination() string                   { return "" }
+func (s *stubConn) LocalAddr() net.Addr                   { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
+func (s *stubConn) RemoteAddr() net.Addr                  { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443} }
+func (s *stubConn) SetDeadline(t time.Time) error         { return nil }
+func (s *stubConn) SetReadDeadline(t time.Time) error     { return nil }
+func (s *stubConn) SetWriteDeadline(t time.Time) error    { return nil }
+func (s *stubConn) ReadBuffer(buffer *buf.Buffer) error   { return io.EOF }
+func (s *stubConn) WriteBuffer(buffer *buf.Buffer) error  { return nil }
+func (s *stubConn) Upstream() any                         { return nil }
+func (s *stubConn) NeedHandshake() bool                   { return false }
+func (s *stubConn) ReaderReplaceable() bool               { return false }
+func (s *stubConn) WriterReplaceable() bool               { return false }
+func (s *stubConn) Chains() C.Chain                       { return nil }
+func (s *stubConn) ProviderChains() C.Chain               { return nil }
+func (s *stubConn) AppendToChains(adapter C.ProxyAdapter) {}
+func (s *stubConn) RemoteDestination() string             { return "" }
 
 var _ C.Conn = (*stubConn)(nil)
 
-func routeFailedCount(t *testing.T, table *smart.RouteTable, key, proxy string) float64 {
+// domainRecords returns the ProxyRecord map for a named domain within a row
+// snapshot (nil if the domain isn't present).  Proxy metrics live per domain,
+// not per row, so tests that used to read row.Proxies directly go through this.
+func domainRecords(row smart.RowSnapshot, domain string) map[string]smart.ProxyRecord {
+	for _, d := range row.Domains {
+		if d.Name == domain {
+			return d.Proxies
+		}
+	}
+	return nil
+}
+
+func routeFailedCount(t *testing.T, table *smart.RouteTable, key, domain, proxy string) float64 {
 	t.Helper()
 	for _, row := range table.Snapshot("").Rows {
-		if row.Key == key {
-			return row.Proxies[proxy].Attributes.FailedCount
+		if row.Key != key {
+			continue
 		}
+		for _, dom := range row.Domains {
+			if dom.Name == domain {
+				return dom.Proxies[proxy].Attributes.FailedCount
+			}
+		}
+		// Domain has no recorded state yet — equivalent to FailedCount 0.
+		return 0
 	}
 	t.Fatalf("route row %q not found", key)
 	return 0
@@ -276,8 +313,8 @@ func TestRaceAndWrap_FirstSuccessCancelsLosers(t *testing.T) {
 	}}
 
 	table := smart.NewRouteTable(10)
-	table.UpdateLatency(key, first.Name(), 10)
-	table.SetBestProxy(key, first.Name())
+	table.UpdateLatency(key, "example.com", first.Name(), 10)
+	table.SetBestProxy(key, "example.com", first.Name())
 	s := &Smart{testUrl: "test", routeTable: table}
 
 	result := make(chan struct {
@@ -285,8 +322,8 @@ func TestRaceAndWrap_FirstSuccessCancelsLosers(t *testing.T) {
 		err  error
 	}, 1)
 	go func() {
-		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key,
-			[]C.Proxy{first, second, third}, smartTCPFallbackStagger, nil, "Stagger")
+		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com",
+			[]C.Proxy{first, second, third}, smartTCPFallbackStagger, nil, "")
 		result <- struct {
 			conn C.Conn
 			err  error
@@ -324,7 +361,7 @@ func TestRaceAndWrap_FirstSuccessCancelsLosers(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first proxy did not observe cancellation")
 	}
-	if got := routeFailedCount(t, table, key, first.Name()); got != 0 {
+	if got := routeFailedCount(t, table, key, "example.com", first.Name()); got != 0 {
 		t.Fatalf("canceled first proxy failed count = %v, want 0", got)
 	}
 	if winner.CloseCount() != 0 {
@@ -356,8 +393,8 @@ func TestRaceAndWrap_ClosesLateSuccessfulLoser(t *testing.T) {
 		err  error
 	}, 1)
 	go func() {
-		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key,
-			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "Stagger")
+		conn, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com",
+			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "")
 		result <- struct {
 			conn C.Conn
 			err  error
@@ -392,17 +429,18 @@ func TestRaceAndWrap_ClosesLateSuccessfulLoser(t *testing.T) {
 	if winner.CloseCount() != 0 {
 		t.Fatalf("winner was closed %d times", winner.CloseCount())
 	}
-	if best, ok := s.routeTable.GetBestProxy(key); !ok || best != second.Name() {
+	if best, ok := s.routeTable.GetBestProxy(key, "example.com"); !ok || best != second.Name() {
 		t.Fatalf("best proxy = %q ok=%v, want selected winner %q", best, ok, second.Name())
 	}
-	if !s.routeTable.IsTCPProbed(key) {
+	if !s.routeTable.IsTCPProbed(key, "example.com") {
 		t.Fatal("selected winner did not mark route TCP-probed")
 	}
 	var firstUseCount, secondUseCount int64
 	for _, row := range s.routeTable.Snapshot("").Rows {
 		if row.Key == key {
-			firstUseCount = row.Proxies[first.Name()].UseCount
-			secondUseCount = row.Proxies[second.Name()].UseCount
+			proxies := domainRecords(row, "example.com")
+			firstUseCount = proxies[first.Name()].UseCount
+			secondUseCount = proxies[second.Name()].UseCount
 			break
 		}
 	}
@@ -427,11 +465,11 @@ func TestRaceAndWrap_FatalErrorStopsScheduling(t *testing.T) {
 	}}
 
 	table := smart.NewRouteTable(10)
-	table.UpdateLatency(key, first.Name(), 10)
-	table.SetBestProxy(key, first.Name())
+	table.UpdateLatency(key, "example.com", first.Name(), 10)
+	table.SetBestProxy(key, "example.com", first.Name())
 	s := &Smart{testUrl: "test", routeTable: table}
-	_, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key,
-		[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "Stagger")
+	_, err := s.raceAndWrap(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com",
+		[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "")
 	if !errors.Is(err, resolver.ErrIPNotFound) || !tunnel.ShouldStopRetry(err) {
 		t.Fatalf("fatal error = %v, want ErrIPNotFound", err)
 	}
@@ -440,7 +478,7 @@ func TestRaceAndWrap_FatalErrorStopsScheduling(t *testing.T) {
 		t.Fatal("second proxy started after fatal first result")
 	case <-time.After(2 * smartTCPFallbackStagger):
 	}
-	if best, ok := table.GetBestProxy(key); !ok || best != first.Name() {
+	if best, ok := table.GetBestProxy(key, "example.com"); !ok || best != first.Name() {
 		t.Fatalf("fatal error cleared best proxy: best=%q ok=%v", best, ok)
 	}
 }
@@ -462,14 +500,14 @@ func TestRaceAndWrap_ParentCancellationStopsScheduling(t *testing.T) {
 	}}
 
 	table := smart.NewRouteTable(10)
-	table.UpdateLatency(key, first.Name(), 10)
-	table.SetBestProxy(key, first.Name())
+	table.UpdateLatency(key, "example.com", first.Name(), 10)
+	table.SetBestProxy(key, "example.com", first.Name())
 	s := &Smart{testUrl: "test", routeTable: table}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, err := s.raceAndWrap(ctx, &C.Metadata{Host: "example.com"}, key,
-			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "Stagger")
+		_, err := s.raceAndWrap(ctx, &C.Metadata{Host: "example.com"}, key, "example.com",
+			[]C.Proxy{first, second}, smartTCPFallbackStagger, nil, "")
 		result <- err
 	}()
 
@@ -497,7 +535,7 @@ func TestRaceAndWrap_ParentCancellationStopsScheduling(t *testing.T) {
 		t.Fatal("second proxy started after parent cancellation")
 	case <-time.After(2 * smartTCPFallbackStagger):
 	}
-	if got := routeFailedCount(t, table, key, first.Name()); got != 0 {
+	if got := routeFailedCount(t, table, key, "example.com", first.Name()); got != 0 {
 		t.Fatalf("canceled first proxy failed count = %v, want 0", got)
 	}
 }
@@ -544,7 +582,7 @@ func TestProbeBatch_FatalError_ReturnsImmediately(t *testing.T) {
 	pc := NewProbeCoordinator()
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
-	rt.UpdateLatency("TARGET:example.com", "p1", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p1", 10)
 
 	proxies := makeStubProxies("p1", "p2")
 
@@ -574,9 +612,9 @@ func TestProbeBatch_FatalError_SkipsMarkFailed(t *testing.T) {
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
 
-	rt.UpdateLatency("TARGET:example.com", "p1", 10)
-	rt.UpdateLatency("TARGET:example.com", "p2", 10)
-	rt.SetBestProxy("TARGET:example.com", "p1")
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p1", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p2", 10)
+	rt.SetBestProxy("TARGET:example.com", "example.com", "p1")
 
 	proxies := makeStubProxies("p1", "p2")
 
@@ -596,7 +634,7 @@ func TestProbeBatch_FatalError_SkipsMarkFailed(t *testing.T) {
 
 	// MarkFailed should NOT have been called for fatal error.
 	// Best proxy should still be set.
-	bp, _ := rt.GetBestProxy("TARGET:example.com")
+	bp, _ := rt.GetBestProxy("TARGET:example.com", "example.com")
 	if bp == "" {
 		t.Error("best proxy was cleared — MarkFailed was incorrectly called for fatal error")
 	}
@@ -607,9 +645,9 @@ func TestProbeBatch_NodeLevelError_MarksFailingProxy(t *testing.T) {
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
 
-	rt.UpdateLatency("TARGET:example.com", "p1", 10)
-	rt.UpdateLatency("TARGET:example.com", "p2", 10)
-	rt.SetBestProxy("TARGET:example.com", "p1")
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p1", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p2", 10)
+	rt.SetBestProxy("TARGET:example.com", "example.com", "p1")
 
 	proxies := makeStubProxies("p1", "p2")
 
@@ -626,14 +664,14 @@ func TestProbeBatch_NodeLevelError_MarksFailingProxy(t *testing.T) {
 
 	_ = pc.probeBatch(
 		context.Background(), "TARGET:example.com",
-		proxies, &C.Metadata{}, []string{"p1", "p2"},
+		proxies, &C.Metadata{Host: "example.com"}, []string{"p1", "p2"},
 		singleDial, rt,
 	)
 
 	// p1 should have been marked failed → best proxy cleared
 	// p2 should NOT be marked failed (cancellation → skip)
 	// So best proxy should be empty (p1 was cleared)
-	bp, _ := rt.GetBestProxy("TARGET:example.com")
+	bp, _ := rt.GetBestProxy("TARGET:example.com", "example.com")
 	if bp == "p1" {
 		t.Error("p1 should have been marked failed (node-level error), best proxy should be cleared")
 	}
@@ -644,8 +682,8 @@ func TestProbeBatch_ContextCanceled_SkipsMarkFailed(t *testing.T) {
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
 
-	rt.UpdateLatency("TARGET:example.com", "p1", 10)
-	rt.SetBestProxy("TARGET:example.com", "p1")
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p1", 10)
+	rt.SetBestProxy("TARGET:example.com", "example.com", "p1")
 
 	proxies := makeStubProxies("p1")
 
@@ -659,7 +697,7 @@ func TestProbeBatch_ContextCanceled_SkipsMarkFailed(t *testing.T) {
 		singleDial, rt,
 	)
 
-	bp, ok := rt.GetBestProxy("TARGET:example.com")
+	bp, ok := rt.GetBestProxy("TARGET:example.com", "example.com")
 	if !ok || bp != "p1" {
 		t.Errorf("best proxy should still be 'p1' after context.Canceled, got %q ok=%v", bp, ok)
 	}
@@ -670,8 +708,8 @@ func TestProbeBatch_MixedErrors_ReturnsFatal(t *testing.T) {
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
 
-	rt.UpdateLatency("TARGET:example.com", "p1", 10)
-	rt.UpdateLatency("TARGET:example.com", "p2", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p1", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p2", 10)
 
 	proxies := makeStubProxies("p1", "p2")
 
@@ -704,7 +742,7 @@ func TestProbeBatch_AllProxiesNodeLevel_NoSentinelDetected(t *testing.T) {
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
 
-	rt.UpdateLatency("TARGET:example.com", "p1", 10)
+	rt.UpdateLatency("TARGET:example.com", "example.com", "p1", 10)
 
 	proxies := makeStubProxies("p1")
 
@@ -764,7 +802,7 @@ func TestProbeBatch_KeepsLosersAliveAfterWinner(t *testing.T) {
 	rt := smart.NewRouteTable(100)
 	// Seed the winner as best proxy, as discoverAndRoute would after a win.
 	// The late loser's onConnect must not displace or clear it.
-	rt.SetBestProxy(key, "winner")
+	rt.SetBestProxy(key, "example.com", "winner")
 
 	result := make(chan struct {
 		conn C.Conn
@@ -838,7 +876,9 @@ func TestProbeBatch_KeepsLosersAliveAfterWinner(t *testing.T) {
 	var loserLat int64
 	for _, row := range rt.Snapshot("").Rows {
 		if row.Key == key {
-			loserLat = row.Proxies["loser"].Attributes.Latency
+			// probeBatch/Discover above dial with &C.Metadata{} (empty Host),
+			// so routeDomain resolves to the zero-value DstIP's string form.
+			loserLat = domainRecords(row, "invalid IP")["loser"].Attributes.Latency
 		}
 	}
 	if loserLat != 42 {
@@ -846,7 +886,7 @@ func TestProbeBatch_KeepsLosersAliveAfterWinner(t *testing.T) {
 	}
 
 	// winner must remain the best proxy; the late loser must not displace it.
-	if best, ok := rt.GetBestProxy(key); !ok || best != "winner" {
+	if best, ok := rt.GetBestProxy(key, "example.com"); !ok || best != "winner" {
 		t.Fatalf("best proxy = %q ok=%v, want winner", best, ok)
 	}
 }
@@ -883,7 +923,7 @@ func TestProbeBatch_KeepsLosersAliveThroughDiscover(t *testing.T) {
 	pc := NewProbeCoordinator()
 	defer pc.Close()
 	rt := smart.NewRouteTable(100)
-	rt.SetBestProxy(key, "winner")
+	rt.SetBestProxy(key, "example.com", "winner")
 
 	result := make(chan struct {
 		conn C.Conn
@@ -954,13 +994,16 @@ func TestProbeBatch_KeepsLosersAliveThroughDiscover(t *testing.T) {
 	var loserLat int64
 	for _, row := range rt.Snapshot("").Rows {
 		if row.Key == key {
-			loserLat = row.Proxies["loser"].Attributes.Latency
+			// probeBatch/Discover above dial with &C.Metadata{} (empty Host),
+			// so routeDomain resolves to the zero-value DstIP's string form.
+			loserLat = domainRecords(row, "invalid IP")["loser"].Attributes.Latency
 		}
 	}
 	if loserLat != 42 {
 		t.Fatalf("loser latency = %dms, want 42ms (sampled via onConnect)", loserLat)
 	}
 }
+
 // =========================================================================
 // best-first race tests (serialTcpConn fast-path)
 // =========================================================================
@@ -1003,10 +1046,10 @@ func TestBestFirstRace_BestWinsWithinWindow(t *testing.T) {
 		return nil, errors.New("unexpected other dial")
 	}}
 
-	rt.SetBestProxy(key, "best")
+	rt.SetBestProxy(key, "example.com", "best")
 
 	start := time.Now()
-	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, other})
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, other})
 	if err != nil {
 		t.Fatalf("serialTcpConn error: %v", err)
 	}
@@ -1014,13 +1057,301 @@ func TestBestFirstRace_BestWinsWithinWindow(t *testing.T) {
 		t.Fatal("serialTcpConn returned nil connection")
 	}
 	elapsed := time.Since(start)
-	if elapsed > smartBestExclusiveWindow {
-		t.Fatalf("best win took %v, want within %v", elapsed, smartBestExclusiveWindow)
+	if elapsed > smartDefaultDialWindow {
+		t.Fatalf("best win took %v, want within %v", elapsed, smartDefaultDialWindow)
 	}
 	if bestConn.CloseCount() != 0 {
 		t.Fatalf("winner conn closed %d times", bestConn.CloseCount())
 	}
 	_ = conn.Close()
+}
+
+func TestAdaptiveDialWindow(t *testing.T) {
+	const (
+		key    = "TARGET:example.com"
+		domain = "example.com"
+	)
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	if got := s.adaptiveDialWindow(key, domain, "unsampled"); got != smartDefaultDialWindow {
+		t.Fatalf("unsampled window = %v, want %v", got, smartDefaultDialWindow)
+	}
+	rt.UpdateLatency(key, domain, "normal", 100)
+	if got := s.adaptiveDialWindow(key, domain, "normal"); got != 150*time.Millisecond {
+		t.Fatalf("sampled window = %v, want 150ms", got)
+	}
+	rt.UpdateLatency(key, domain, "tiny", 1)
+	if got := s.adaptiveDialWindow(key, domain, "tiny"); got != smartMinDialWindow {
+		t.Fatalf("minimum-clamped window = %v, want %v", got, smartMinDialWindow)
+	}
+	rt.UpdateLatency(key, domain, "huge", 2000)
+	if got := s.adaptiveDialWindow(key, domain, "huge"); got != smartMaxDialWindow {
+		t.Fatalf("maximum-clamped window = %v, want %v", got, smartMaxDialWindow)
+	}
+}
+
+// Explicit exploration must give one low-latency, TTFB-untested challenger a
+// head start instead of letting the sampled incumbent win every re-evaluation.
+func TestSmartExploration_UntestedLowLatencyChallengerPrecedesBest(t *testing.T) {
+	const (
+		key    = "TARGET:example.com"
+		domain = "example.com"
+	)
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	best := &stubProxy{
+		name:  "best",
+		delay: 170,
+		dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+			return &stubConn{}, nil
+		},
+	}
+	fastUntested := &stubProxy{
+		name:  "untested-fast",
+		delay: 108,
+		dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+			return &stubConn{}, nil
+		},
+	}
+	slowUntested := &stubProxy{name: "untested-slow", delay: 150}
+	tested := &stubProxy{name: "tested", delay: 80}
+
+	rt.UpdateLatency(key, domain, best.Name(), 100)
+	rt.UpdateTTFB(key, domain, best.Name(), 300)
+	rt.UpdateLatency(key, domain, tested.Name(), 80)
+	rt.UpdateTTFB(key, domain, tested.Name(), 200)
+	rt.SetBestProxyAndTCPProbed(key, domain, best.Name())
+
+	ordered, bestName := s.explorationCallSequence(key, domain, []C.Proxy{slowUntested, best, tested, fastUntested})
+	got := namesOf(ordered)
+	if bestName != best.Name() {
+		t.Fatalf("best name = %q, want %q", bestName, best.Name())
+	}
+	if len(got) < 2 || got[0] != fastUntested.Name() || got[1] != best.Name() {
+		t.Fatalf("exploration sequence = %v, want [untested-fast best ...]", got)
+	}
+	countBeforeBest := 0
+	for _, name := range got {
+		if name == best.Name() {
+			break
+		}
+		countBeforeBest++
+	}
+	if countBeforeBest != 1 {
+		t.Fatalf("challengers before best = %d, want exactly 1 (sequence %v)", countBeforeBest, got)
+	}
+	seen := make(map[string]bool, len(got))
+	for _, name := range got {
+		if seen[name] {
+			t.Fatalf("exploration sequence contains duplicate %q: %v", name, got)
+		}
+		seen[name] = true
+	}
+}
+
+func TestSmartExploration_SiblingPriorPrunesWithoutMarkingTested(t *testing.T) {
+	const key, domain = "TARGET:page.example.test", "page.example.test"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	best := &stubProxy{name: "best", delay: 90}
+	exactTested := &stubProxy{name: "exact-tested", delay: 70}
+	siblingOnly := &stubProxy{name: "sibling-only", delay: 80}
+	riskySibling := &stubProxy{name: "risky-sibling", delay: 60}
+
+	rt.UpdateTTFB(key, domain, best.Name(), 300)
+	rt.UpdateTTFB(key, domain, exactTested.Name(), 200)
+	rt.UpdateTTFB("TARGET:other.example.test", "other.example.test", siblingOnly.Name(), 350)
+	rt.UpdateTTFB("TARGET:other.example.test", "other.example.test", riskySibling.Name(), 1500)
+	rt.SetBestProxyAndTCPProbed(key, domain, best.Name())
+
+	ordered, bestName := s.explorationCallSequence(key, domain,
+		[]C.Proxy{best, exactTested, siblingOnly, riskySibling})
+	got := namesOf(ordered)
+	if bestName != best.Name() {
+		t.Fatalf("best name = %q, want %q", bestName, best.Name())
+	}
+	if len(got) == 0 || got[0] != siblingOnly.Name() {
+		t.Fatalf("exploration sequence = %v, want sibling-only before locally tested proxy", got)
+	}
+	for _, name := range namesOf(s.challengerSequence(key, domain,
+		[]C.Proxy{best, exactTested, siblingOnly, riskySibling}, best.Name())) {
+		if name == riskySibling.Name() {
+			t.Fatalf("risky sibling was not pruned from challengers: %v", got)
+		}
+	}
+}
+
+func TestSmartExploration_AggregatePriorRejectsHighDamageChallenger(t *testing.T) {
+	const key, domain = "TARGET:preview.img2.hk-example.test", "preview.img2.hk-example.test"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	rt.UpdateTTFB(key, domain, "hk-best", 800)
+	// The challenger is untested for this target, but consistently slow on
+	// other targets. Its optimistic estimate remains well behind the best.
+	rt.UpdateTTFB("TARGET:www.hk-example.test", "www.hk-example.test", "eu-risky", 1700)
+	rt.UpdateTTFB("TARGET:img1.hk-example.test", "img1.hk-example.test", "eu-risky", 1800)
+	rt.UpdateTTFB("TARGET:img2.hk-example.test", "img2.hk-example.test", "eu-risky", 1900)
+
+	if s.explorationWorthRisk(key, domain, "hk-best", "eu-risky") {
+		t.Fatal("high-damage challenger accepted despite strong aggregate prior")
+	}
+}
+
+func TestSmartExploration_AggregatePriorKeepsPlausibleAndUnknownChallengers(t *testing.T) {
+	const key, domain = "TARGET:preview.img2.hk-example.test", "preview.img2.hk-example.test"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	rt.UpdateTTFB(key, domain, "hk-best", 800)
+	rt.UpdateTTFB("TARGET:www.hk-example.test", "www.hk-example.test", "hk-plausible", 760)
+	rt.UpdateTTFB("TARGET:img1.hk-example.test", "img1.hk-example.test", "hk-plausible", 880)
+
+	if !s.explorationWorthRisk(key, domain, "hk-best", "hk-plausible") {
+		t.Fatal("plausibly better challenger rejected")
+	}
+	if !s.explorationWorthRisk(key, domain, "hk-best", "never-seen") {
+		t.Fatal("fully unknown challenger rejected")
+	}
+}
+
+func TestSmartExploration_SharedFailuresDiscountGain(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		low, high int64
+		failures  float64
+	}{
+		// Gain falls below the risk while remaining above the 25ms minimum.
+		{"future-gain", 200, 2000, 4},
+		// Enough future demand covers the risk, but discounted gain is <25ms.
+		{"minimum-gain", 600, 2000, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const key, domain = "current", "img.example.com"
+			s, rt, pc := newBestRaceSmart()
+			defer pc.Close()
+			rt.UpdateTTFB(key, domain, "best", 800)
+			rt.UpdateTTFB("ASN:1", "a.example.com", "challenger", tc.low)
+			rt.UpdateTTFB("ASN:2", "b.example.com", "challenger", tc.high)
+			if tc.name == "minimum-gain" {
+				for i := 0; i < 8; i++ {
+					rt.IncrementUseCount("ASN:1", "a.example.com", "challenger")
+				}
+			}
+			if !s.explorationWorthRisk(key, domain, "best", "challenger") {
+				t.Fatal("plausible challenger rejected before shared failures")
+			}
+			rt.MarkFailed("ASN:1", "challenger", "a.example.com", tc.failures)
+			rt.MarkFailed("ASN:2", "challenger", "b.example.com", tc.failures)
+			if s.explorationWorthRisk(key, domain, "best", "challenger") {
+				t.Fatal("shared failures did not discount exploration gain")
+			}
+		})
+	}
+}
+
+func TestSmartExploration_SharedFailuresPreserveExistingAllowPaths(t *testing.T) {
+	const key, domain = "current", "img.example.com"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+	rt.UpdateTTFB(key, domain, "best", 800)
+	rt.UpdateTTFB("sibling", "www.example.com", "low-damage", 900)
+	rt.MarkFailed("sibling", "low-damage", "www.example.com", 10)
+	rt.MarkFailed("sibling", "failure-only", "www.example.com", 10)
+	for _, proxy := range []string{"low-damage", "failure-only", "unknown"} {
+		if !s.explorationWorthRisk(key, domain, "best", proxy) {
+			t.Fatalf("existing allow path changed for %s", proxy)
+		}
+	}
+}
+
+func TestSmartExploration_ChallengerFailureFallsBackToBestImmediately(t *testing.T) {
+	const key, domain = "TARGET:example.com", "example.com"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	challenger := &stubProxy{name: "challenger", delay: 10, dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return nil, syscall.ECONNREFUSED
+	}}
+	bestCalls := 0
+	best := &stubProxy{name: "best", delay: 100, dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		bestCalls++
+		return &stubConn{}, nil
+	}}
+	rt.UpdateLatency(key, domain, best.Name(), 100)
+	rt.UpdateTTFB(key, domain, best.Name(), 150)
+	rt.SetBestProxyAndTCPProbed(key, domain, best.Name())
+
+	start := time.Now()
+	conn, err := s.exploreTcpConn(context.Background(), &C.Metadata{Host: domain}, key, domain, []C.Proxy{best, challenger})
+	if err != nil || conn == nil {
+		t.Fatalf("exploreTcpConn = (%v, %v), want best connection", conn, err)
+	}
+	defer conn.Close()
+	if bestCalls != 1 {
+		t.Fatalf("best dial calls = %d, want 1", bestCalls)
+	}
+	if elapsed := time.Since(start); elapsed >= smartDefaultDialWindow {
+		t.Fatalf("failure fallback took %v, want immediate", elapsed)
+	}
+}
+
+func TestSmartExploration_SlowChallengerFallsBackAfterAdaptiveWindow(t *testing.T) {
+	const key, domain = "TARGET:example.com", "example.com"
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	challengerStarted := make(chan struct{})
+	challengerUnblock := make(chan struct{})
+	challenger := blockingProxy("challenger", challengerUnblock, &stubConn{}, challengerStarted)
+	challenger.delay = 40
+	best := &stubProxy{name: "best", delay: 100, dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return &stubConn{}, nil
+	}}
+	rt.UpdateLatency(key, domain, challenger.Name(), 40)
+	rt.UpdateLatency(key, domain, best.Name(), 100)
+	rt.UpdateTTFB(key, domain, best.Name(), 150)
+	rt.SetBestProxyAndTCPProbed(key, domain, best.Name())
+
+	start := time.Now()
+	conn, err := s.exploreTcpConn(context.Background(), &C.Metadata{Host: domain}, key, domain, []C.Proxy{best, challenger})
+	if err != nil || conn == nil {
+		t.Fatalf("exploreTcpConn = (%v, %v), want best connection", conn, err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 50*time.Millisecond || elapsed >= 250*time.Millisecond {
+		t.Fatalf("best fallback started after %v, want approximately 60ms", elapsed)
+	}
+	close(challengerUnblock)
+	pc.wg.Wait()
+	_ = conn.Close()
+}
+
+func TestSmartExploration_ColdStartUsesLowLatencyTopK(t *testing.T) {
+	const key, domain = "TARGET:example.com", "example.com"
+	s, _, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	proxies := make([]C.Proxy, 0, topK+3)
+	for i := topK + 3; i >= 1; i-- {
+		proxies = append(proxies, &stubProxy{name: fmt.Sprintf("p-%02d", i), delay: uint16(i)})
+	}
+	ordered, bestName := s.explorationCallSequence(key, domain, proxies)
+	if bestName != "" {
+		t.Fatalf("cold-start best = %q, want empty", bestName)
+	}
+	if len(ordered) != topK {
+		t.Fatalf("cold-start sequence length = %d, want topK=%d", len(ordered), topK)
+	}
+	for i, p := range ordered {
+		want := fmt.Sprintf("p-%02d", i+1)
+		if p.Name() != want {
+			t.Fatalf("cold-start sequence[%d] = %q, want %q", i, p.Name(), want)
+		}
+	}
 }
 
 func TestBestFirstRace_StaleBestYieldsToFasterFallback(t *testing.T) {
@@ -1038,10 +1369,12 @@ func TestBestFirstRace_StaleBestYieldsToFasterFallback(t *testing.T) {
 		return &stubConn{}, nil
 	}}
 
-	rt.SetBestProxy(key, "best")
+	rt.UpdateLatency(key, "example.com", "best", 100)
+	rt.SetBestProxy(key, "example.com", "best")
+	wantWindow := 150 * time.Millisecond
 
 	start := time.Now()
-	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, second})
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, second})
 	if err != nil {
 		t.Fatalf("serialTcpConn error: %v", err)
 	}
@@ -1052,10 +1385,10 @@ func TestBestFirstRace_StaleBestYieldsToFasterFallback(t *testing.T) {
 	// second must not be launched before the exclusive window elapses.
 	select {
 	case <-secondStarted:
-		if time.Since(start) < smartBestExclusiveWindow {
+		if time.Since(start) < wantWindow {
 			t.Fatal("second launched before exclusive window elapsed")
 		}
-	case <-time.After(2 * smartBestExclusiveWindow):
+	case <-time.After(2 * wantWindow):
 		t.Fatal("second proxy never launched")
 	}
 
@@ -1063,7 +1396,7 @@ func TestBestFirstRace_StaleBestYieldsToFasterFallback(t *testing.T) {
 	bestUnblock <- struct{}{}
 	pc.wg.Wait()
 
-	got, _ := rt.GetBestProxy(key)
+	got, _ := rt.GetBestProxy(key, "example.com")
 	if got != "second" {
 		t.Fatalf("best = %q, want second", got)
 	}
@@ -1086,10 +1419,10 @@ func TestBestFirstRace_BestFailEarlyStartsFallbackImmediately(t *testing.T) {
 		return &stubConn{}, nil
 	}}
 
-	rt.SetBestProxy(key, "best")
+	rt.SetBestProxy(key, "example.com", "best")
 
 	start := time.Now()
-	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, second})
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, second})
 	if err != nil {
 		t.Fatalf("serialTcpConn error: %v", err)
 	}
@@ -1101,14 +1434,14 @@ func TestBestFirstRace_BestFailEarlyStartsFallbackImmediately(t *testing.T) {
 	select {
 	case <-secondStarted:
 		elapsed := time.Since(start)
-		if elapsed >= smartBestExclusiveWindow {
+		if elapsed >= smartDefaultDialWindow {
 			t.Fatalf("second launched after %v, want immediate (best failed early)", elapsed)
 		}
-	case <-time.After(smartBestExclusiveWindow):
+	case <-time.After(smartDefaultDialWindow):
 		t.Fatal("second proxy never launched after best failed early")
 	}
 
-	got, _ := rt.GetBestProxy(key)
+	got, _ := rt.GetBestProxy(key, "example.com")
 	if got != "second" {
 		t.Fatalf("best = %q, want second", got)
 	}
@@ -1122,7 +1455,7 @@ func TestBestFirstRace_BestFailEarlyStartsFallbackImmediately(t *testing.T) {
 // collectLogs subscribes to log events; waitForLog polls until a log with the
 // given prefix arrives or the deadline elapses.  waitAbsentLog polls for the
 // absence of a prefix (used to assert a proxy was never dialed).
-func collectLogs() (waitForLog func(prefix string, timeout time.Duration) bool, stop func()) {
+func collectLogs() (waitForLog func(timeout time.Duration, parts ...string) bool, stop func()) {
 	sub := log.Subscribe()
 	var mu sync.Mutex
 	var logs []string
@@ -1135,20 +1468,27 @@ func collectLogs() (waitForLog func(prefix string, timeout time.Duration) bool, 
 		}
 		close(done)
 	}()
-	contains := func(prefix string) bool {
+	contains := func(parts ...string) bool {
 		mu.Lock()
 		defer mu.Unlock()
 		for _, l := range logs {
-			if strings.Contains(l, prefix) {
+			matches := true
+			for _, part := range parts {
+				if !strings.Contains(l, part) {
+					matches = false
+					break
+				}
+			}
+			if matches {
 				return true
 			}
 		}
 		return false
 	}
-	waitForLog = func(prefix string, timeout time.Duration) bool {
+	waitForLog = func(timeout time.Duration, parts ...string) bool {
 		deadline := time.After(timeout)
 		for {
-			if contains(prefix) {
+			if contains(parts...) {
 				return true
 			}
 			select {
@@ -1179,19 +1519,84 @@ func TestSmartPolicy_LogSequence_BestWinsWithinWindow(t *testing.T) {
 		t.Error("other should not be dialed")
 		return nil, errors.New("unexpected")
 	}}
-	rt.SetBestProxy(key, "best")
+	rt.SetBestProxy(key, "example.com", "best")
 
-	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, other})
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, other})
 	if err != nil || conn == nil {
 		t.Fatalf("serialTcpConn = (%v, %v), want conn", conn, err)
 	}
 	_ = conn.Close()
 
-	if !waitForLog("routed via best", time.Second) {
-		t.Fatal("best not marked winner")
+	if !waitForLog(time.Second, "routed via best", ", Best)") {
+		t.Fatal("best winner did not use the Best tag")
 	}
-	if waitForLog("routed via other", 200*time.Millisecond) {
+	if waitForLog(50*time.Millisecond, "Best#") {
+		t.Fatal("best winner used a numbered Best tag")
+	}
+	if waitForLog(200*time.Millisecond, "routed via other") {
 		t.Fatal("other dialed despite best winning")
+	}
+}
+
+// TestSmartPolicy_LogSequence_BestWinsAfterFallbackStarts verifies that the
+// log describes the winning connection, not merely the phase currently active.
+func TestSmartPolicy_LogSequence_BestWinsAfterFallbackStarts(t *testing.T) {
+	const key = "TARGET:example.com"
+	waitForLog, stop := collectLogs()
+	defer stop()
+
+	s, rt, pc := newBestRaceSmart()
+	defer pc.Close()
+
+	bestStarted := make(chan struct{})
+	bestUnblock := make(chan struct{})
+	best := blockingProxy("best", bestUnblock, &stubConn{}, bestStarted)
+	secondStarted := make(chan struct{})
+	secondUnblock := make(chan struct{})
+	second := blockingProxy("second", secondUnblock, &stubConn{}, secondStarted)
+	rt.SetBestProxy(key, "example.com", "best")
+
+	result := make(chan struct {
+		conn C.Conn
+		err  error
+	}, 1)
+	go func() {
+		conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, second})
+		result <- struct {
+			conn C.Conn
+			err  error
+		}{conn: conn, err: err}
+	}()
+
+	select {
+	case <-secondStarted:
+		// The exclusive window elapsed and the fallback is now in flight.
+	case <-time.After(2 * smartDefaultDialWindow):
+		t.Fatal("fallback did not start after the best exclusive window")
+	}
+	close(bestUnblock)
+
+	var got struct {
+		conn C.Conn
+		err  error
+	}
+	select {
+	case got = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("best did not win after fallback started")
+	}
+	if got.err != nil || got.conn == nil {
+		t.Fatalf("serialTcpConn = (%v, %v), want best connection", got.conn, got.err)
+	}
+	close(secondUnblock)
+	pc.wg.Wait()
+	_ = got.conn.Close()
+
+	if !waitForLog(time.Second, "routed via best", ", Best)") {
+		t.Fatal("late best winner did not use the Best tag")
+	}
+	if waitForLog(50*time.Millisecond, "routed via best", "Best#") {
+		t.Fatal("late best winner used a numbered Best tag")
 	}
 }
 
@@ -1212,9 +1617,9 @@ func TestSmartPolicy_LogSequence_StaleBestFallsBackToRace(t *testing.T) {
 	second := &stubProxy{name: "second", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
 		return &stubConn{}, nil
 	}}
-	rt.SetBestProxy(key, "best")
+	rt.SetBestProxy(key, "example.com", "best")
 
-	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, second})
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, second})
 	if err != nil || conn == nil {
 		t.Fatalf("serialTcpConn = (%v, %v), want conn", conn, err)
 	}
@@ -1222,8 +1627,8 @@ func TestSmartPolicy_LogSequence_StaleBestFallsBackToRace(t *testing.T) {
 	pc.wg.Wait() // let the background drain settle
 	_ = conn.Close()
 
-	if !waitForLog("routed via second", time.Second) {
-		t.Fatal("second never dialed in fallback race")
+	if !waitForLog(time.Second, "routed via second", ", Stagger#1)") {
+		t.Fatal("fallback winner did not use the Stagger#1 tag")
 	}
 }
 
@@ -1244,19 +1649,153 @@ func TestSmartPolicy_LogSequence_BestFailsEarlyStartsFallbackImmediately(t *test
 	second := &stubProxy{name: "second", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
 		return &stubConn{}, nil
 	}}
-	rt.SetBestProxy(key, "best")
+	rt.SetBestProxy(key, "example.com", "best")
 
-	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, []C.Proxy{best, second})
+	conn, err := s.serialTcpConn(context.Background(), &C.Metadata{Host: "example.com"}, key, "example.com", []C.Proxy{best, second})
 	if err != nil || conn == nil {
 		t.Fatalf("serialTcpConn = (%v, %v), want conn", conn, err)
 	}
 	pc.wg.Wait()
 	_ = conn.Close()
 
-	if !waitForLog("dial best failed", time.Second) {
+	if !waitForLog(time.Second, "dial best failed") {
 		t.Fatal("best failure not logged")
 	}
-	if !waitForLog("routed via second", time.Second) {
-		t.Fatal("second not marked winner")
+	if !waitForLog(time.Second, "routed via second", ", Stagger#1)") {
+		t.Fatal("fallback winner did not use the Stagger#1 tag")
+	}
+}
+
+func TestSmartPolicy_LogSequence_DiscoveryWinner(t *testing.T) {
+	const key = "TARGET:example.com"
+	waitForLog, stop := collectLogs()
+	defer stop()
+
+	pc := NewProbeCoordinator()
+	defer pc.Close()
+	rt := smart.NewRouteTable(10)
+	winner := &stubProxy{name: "discovery", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return &stubConn{}, nil
+	}}
+
+	result := pc.probeBatch(context.Background(), key, []C.Proxy{winner},
+		&C.Metadata{Host: "example.com"}, []string{winner.Name()},
+		func(ctx context.Context, p C.Proxy, metadata *C.Metadata, _ time.Time) (C.Conn, int64, error) {
+			conn, err := p.DialContext(ctx, metadata)
+			return conn, 1, err
+		}, rt)
+	if result.err != nil || result.conn == nil {
+		t.Fatalf("probeBatch = (%v, %v), want discovery connection", result.conn, result.err)
+	}
+	_ = result.conn.Close()
+
+	if !waitForLog(time.Second, "routed via discovery", ", Discovery#1)") {
+		t.Fatal("discovery winner did not preserve the Discovery#1 tag")
+	}
+}
+
+func TestStaggerTagUsesCandidateOrder(t *testing.T) {
+	best := &stubProxy{name: "best"}
+	first := &stubProxy{name: "first"}
+	second := &stubProxy{name: "second"}
+	ordered := []C.Proxy{best, first, second}
+
+	if got := staggerTag(ordered, "best", "best"); got != "Best" {
+		t.Fatalf("best tag = %q, want Best", got)
+	}
+	if got := staggerTag(ordered, "first", "best"); got != "Stagger#1" {
+		t.Fatalf("first fallback tag = %q, want Stagger#1", got)
+	}
+	if got := staggerTag(ordered, "second", "best"); got != "Stagger#2" {
+		t.Fatalf("second fallback tag = %q, want Stagger#2", got)
+	}
+
+	staggerOnly := []C.Proxy{first, second}
+	if got := staggerTag(staggerOnly, "first", ""); got != "Stagger#1" {
+		t.Fatalf("first stagger-only tag = %q, want Stagger#1", got)
+	}
+	if got := staggerTag(staggerOnly, "second", ""); got != "Stagger#2" {
+		t.Fatalf("second stagger-only tag = %q, want Stagger#2", got)
+	}
+}
+
+func TestRaceStaggeredRejectsNilConnectionWinner(t *testing.T) {
+	proxy := &stubProxy{name: "nil-winner"}
+	failed := false
+	winner, conn, _, err := raceStaggered(context.Background(), []C.Proxy{proxy}, nil, 0,
+		func(context.Context, C.Proxy) (C.Conn, int64, error) { return nil, 1, nil },
+		func(string, int64) { t.Fatal("nil connection was recorded as connected") },
+		func(C.Proxy, error) { failed = true },
+		func(C.Proxy, int64) { t.Fatal("nil connection was selected as winner") },
+	)
+	if err != nil || winner != nil || conn != nil {
+		t.Fatalf("race result = (%v, %v, %v), want no winner and no fatal error", winner, conn, err)
+	}
+	if !failed {
+		t.Fatal("nil connection result did not enter failure handling")
+	}
+}
+
+func TestRawDialPathsRejectNilConnections(t *testing.T) {
+	rt := smart.NewRouteTable(10)
+	s := &Smart{testUrl: "test", routeTable: rt}
+	metadata := &C.Metadata{Host: "example.com"}
+	key, domain := routeKey(metadata), routeDomain(metadata)
+
+	tcpProxy := &stubProxy{name: "nil-tcp", dial: func(context.Context, *C.Metadata) (C.Conn, error) {
+		return nil, nil
+	}}
+	if conn, _, err := s.dialTCP(context.Background(), tcpProxy, metadata, key); err == nil || conn != nil {
+		t.Fatalf("dialTCP = (%v, %v), want nil connection and explicit error", conn, err)
+	}
+
+	udpProxy := &nilPacketProxy{stubProxy: &stubProxy{name: "nil-udp"}}
+	if conn, err := s.dialUDPAndWrap(context.Background(), udpProxy, metadata, key, domain, true); err == nil || conn != nil {
+		t.Fatalf("dialUDPAndWrap = (%v, %v), want nil connection and explicit error", conn, err)
+	}
+	if best, ok := rt.GetUDPBestProxyIfFresh(key, domain, time.Minute); ok {
+		t.Fatalf("nil UDP connection was recorded as best %q", best)
+	}
+}
+
+func TestUDPRouteDoesNotRetryFailedBestInFallback(t *testing.T) {
+	best := &udpErrorProxy{stubProxy: &stubProxy{name: "best", delay: 1}}
+	fallback := &udpErrorProxy{stubProxy: &stubProxy{name: "fallback", delay: 2}}
+	base := NewGroupBase(GroupBaseOption{Name: "smart", Type: C.Smart})
+	base.providerProxies = []C.Proxy{best, fallback}
+	rt := smart.NewRouteTable(10)
+	s := &Smart{GroupBase: base, testUrl: "test", routeTable: rt}
+	metadata := &C.Metadata{Host: "example.com"}
+	key, domain := routeKey(metadata), routeDomain(metadata)
+	rt.SetUDPBestProxy(key, domain, best.Name(), true)
+
+	conn, err := s.udpRoute(context.Background(), metadata)
+	if err == nil || conn != nil {
+		t.Fatalf("udpRoute = (%v, %v), want all-proxies-failed error", conn, err)
+	}
+	if best.calls != 1 {
+		t.Fatalf("failed UDP best dialed %d times, want exactly once", best.calls)
+	}
+	if fallback.calls != 1 {
+		t.Fatalf("fallback dialed %d times, want once", fallback.calls)
+	}
+}
+
+func TestTCPRouteMissingManualSelectionReturnsError(t *testing.T) {
+	available := &stubProxy{name: "automatic-fallback"}
+	base := NewGroupBase(GroupBaseOption{Name: "smart", Type: C.Smart})
+	base.providerProxies = []C.Proxy{available}
+	s := &Smart{
+		GroupBase:        base,
+		selected:         "removed-fixed-proxy",
+		testUrl:          "test",
+		routeTable:       smart.NewRouteTable(10),
+		probeCoordinator: NewProbeCoordinator(),
+	}
+	defer s.probeCoordinator.Close()
+
+	conn, err := s.tcpRoute(context.Background(), &C.Metadata{Host: "example.com"})
+	if err == nil || conn != nil {
+		t.Fatalf("tcpRoute = (%v, %v), want explicit missing-selection error", conn, err)
 	}
 }

@@ -48,6 +48,7 @@ func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
 		rows     int
 		totalW   float64
 		wLatency float64
+		wTTFB    float64
 		wPkgLoss float64
 		wSpeed   float64
 		wJitter  float64
@@ -55,35 +56,42 @@ func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
 	}
 	accum := make(map[string]*agg)
 
+	// Proxy metrics now live per (row, domain), so each domain is its own
+	// weighting bucket: a proxy's UseCount within one domain is weighted
+	// against that domain's total, the same way a row used to be the bucket
+	// before per-domain metrics were introduced.
 	for _, row := range rt.rows {
-		var rowTotal int64
-		for _, cell := range row.proxies {
-			if cell.hasSample() {
-				rowTotal += cell.UseCount
+		for _, dc := range row.domainTable {
+			var bucketTotal int64
+			for _, cell := range dc.proxies {
+				if cell.hasSample() {
+					bucketTotal += cell.UseCount
+				}
 			}
-		}
-		if rowTotal <= 0 {
-			continue
-		}
-
-		for _, cell := range row.proxies {
-			if !cell.hasSample() {
+			if bucketTotal <= 0 {
 				continue
 			}
-			a := accum[cell.Name]
-			if a == nil {
-				a = &agg{name: cell.Name}
-				accum[cell.Name] = a
+
+			for _, cell := range dc.proxies {
+				if !cell.hasSample() {
+					continue
+				}
+				a := accum[cell.Name]
+				if a == nil {
+					a = &agg{name: cell.Name}
+					accum[cell.Name] = a
+				}
+				weight := float64(cell.UseCount) / float64(bucketTotal)
+				a.useCount += cell.UseCount
+				a.rows++
+				a.totalW += weight
+				a.wLatency += float64(cell.Latency) * weight
+				a.wTTFB += float64(cell.TTFB) * weight
+				a.wPkgLoss += cell.PkgLoss * weight
+				a.wSpeed += cell.Speed * weight
+				a.wJitter += cell.Jitter * weight
+				a.wFailed += cell.FailedCount * weight
 			}
-			weight := float64(cell.UseCount) / float64(rowTotal)
-			a.useCount += cell.UseCount
-			a.rows++
-			a.totalW += weight
-			a.wLatency += float64(cell.Latency) * weight
-			a.wPkgLoss += cell.PkgLoss * weight
-			a.wSpeed += cell.Speed * weight
-			a.wJitter += cell.Jitter * weight
-			a.wFailed += cell.FailedCount * weight
 		}
 	}
 
@@ -97,6 +105,7 @@ func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
 			continue
 		}
 		latency := int64(math.Round(a.wLatency / div))
+		ttfb := int64(math.Round(a.wTTFB / div))
 		speed := a.wSpeed / div
 		pkgLoss := a.wPkgLoss / div
 		jitter := a.wJitter / div
@@ -108,6 +117,7 @@ func (rt *RouteTable) AggregateByProxy() ProxyAggregation {
 			Rows:     a.rows,
 			Attributes: ProxyAttributes{
 				Latency:     latency,
+				TTFB:        ttfb,
 				Speed:       speed,
 				PkgLoss:     pkgLoss,
 				Jitter:      jitter,

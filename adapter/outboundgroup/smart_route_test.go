@@ -41,42 +41,42 @@ func TestCheckEarlyDeath(t *testing.T) {
 
 	setup := func() (*Smart, float64) {
 		rt := smart.NewRouteTable(smart.DefaultMaxRows)
-		rt.RestoreRow(key, proxyName, smart.PersistedCell{})
+		rt.RestoreRow(key, "example.com", proxyName, smart.PersistedCell{})
 		s := &Smart{routeTable: rt}
-		return s, routeFailedCount(t, rt, key, proxyName)
+		return s, routeFailedCount(t, rt, key, "example.com", proxyName)
 	}
 
 	t.Run("early death marks failed", func(t *testing.T) {
 		s, before := setup()
-		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.6 {
-			t.Fatalf("FailedCount = %v, want %v", got, before+0.6)
+		s.checkEarlyDeath(key, "example.com", proxyName, errors.New("connection reset by peer"), 100, nil)
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before+0.8 {
+			t.Fatalf("FailedCount = %v, want %v", got, before+0.8)
 		}
 	})
 
 	t.Run("EOF is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.checkEarlyDeath(key, proxyName, io.EOF, 100, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		s.checkEarlyDeath(key, "example.com", proxyName, io.EOF, 100, nil)
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
 
 	t.Run("RST is left to checkResetByPeer", func(t *testing.T) {
 		s, before := setup()
-		// RST is the primary signal handled by checkResetByPeer (0.3); early
-		// death must not add its 1.0 on top.
+		// RST is the primary signal handled by checkResetByPeer (0.4); early
+		// death must not add its 0.8 on top.
 		err := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
-		s.checkEarlyDeath(key, proxyName, err, 100, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		s.checkEarlyDeath(key, "example.com", proxyName, err, 100, nil)
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
 
 	t.Run("nil error is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.checkEarlyDeath(key, proxyName, nil, 100, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		s.checkEarlyDeath(key, "example.com", proxyName, nil, 100, nil)
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
@@ -85,8 +85,8 @@ func TestCheckEarlyDeath(t *testing.T) {
 		s, before := setup()
 		// A full request/response exchange (both upload and download) means the
 		// connection survived its first byte — not an early death.
-		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 512))
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		s.checkEarlyDeath(key, "example.com", proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 512))
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
@@ -95,17 +95,17 @@ func TestCheckEarlyDeath(t *testing.T) {
 		s, before := setup()
 		// Only upload flowed, no download — the response never arrived, so the
 		// connection died before completing the exchange.
-		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 0))
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.6 {
-			t.Fatalf("FailedCount = %v, want %v", got, before+0.6)
+		s.checkEarlyDeath(key, "example.com", proxyName, errors.New("connection reset by peer"), 100, newFakeTracker(1024, 0))
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before+0.8 {
+			t.Fatalf("FailedCount = %v, want %v", got, before+0.8)
 		}
 	})
 
 	t.Run("slow failure is ignored", func(t *testing.T) {
 		s, before := setup()
 		slow := smartEarlyDeathLatencyLimit.Milliseconds() + 1000
-		s.checkEarlyDeath(key, proxyName, errors.New("connection reset by peer"), slow, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		s.checkEarlyDeath(key, "example.com", proxyName, errors.New("connection reset by peer"), slow, nil)
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
@@ -117,42 +117,42 @@ func TestCheckResetByPeer(t *testing.T) {
 
 	setup := func() (*Smart, float64) {
 		rt := smart.NewRouteTable(smart.DefaultMaxRows)
-		rt.RestoreRow(key, proxyName, smart.PersistedCell{})
+		rt.RestoreRow(key, "example.com", proxyName, smart.PersistedCell{})
 		s := &Smart{routeTable: rt}
-		return s, routeFailedCount(t, rt, key, proxyName)
+		return s, routeFailedCount(t, rt, key, "example.com", proxyName)
 	}
 
 	t.Run("ECONNRESET marks failed", func(t *testing.T) {
 		s, before := setup()
 		// Realistic error chain: *net.OpError wrapping *os.SyscallError wrapping syscall.ECONNRESET.
 		err := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}
-		s.checkResetByPeer(key, proxyName, err)
-		// RST carries a lighter 0.2 penalty, not the full 1.0.
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before+0.2 {
-			t.Fatalf("FailedCount = %v, want %v", got, before+0.2)
+		s.checkResetByPeer(key, "example.com", proxyName, err)
+		// RST carries a lighter 0.4 penalty, not the full early-death 0.8.
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before+0.4 {
+			t.Fatalf("FailedCount = %v, want %v", got, before+0.4)
 		}
 	})
 
 	t.Run("non-reset error is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.checkResetByPeer(key, proxyName, errors.New("connection closed"))
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		s.checkResetByPeer(key, "example.com", proxyName, errors.New("connection closed"))
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
 
 	t.Run("EOF is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.checkResetByPeer(key, proxyName, io.EOF)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		s.checkResetByPeer(key, "example.com", proxyName, io.EOF)
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
 
 	t.Run("nil error is ignored", func(t *testing.T) {
 		s, before := setup()
-		s.checkResetByPeer(key, proxyName, nil)
-		if got := routeFailedCount(t, s.routeTable, key, proxyName); got != before {
+		s.checkResetByPeer(key, "example.com", proxyName, nil)
+		if got := routeFailedCount(t, s.routeTable, key, "example.com", proxyName); got != before {
 			t.Fatalf("FailedCount = %v, want %v", got, before)
 		}
 	})
@@ -209,6 +209,22 @@ func TestRouteKey(t *testing.T) {
 		}
 	})
 
+	t.Run("rule descriptor SmartTarget still keys by effective target", func(t *testing.T) {
+		// The tunnel pre-populates SmartTarget with a rule descriptor (e.g.
+		// "DomainSuffix [example.com]"). routeKey must key the row by the
+		// effective target, not the descriptor, so the same site reached via
+		// different rules shares one row.
+		m := mkMeta("www.example.com", "1.2.3.4", "0")
+		m.SmartTarget = "DomainSuffix [example.com]"
+		if got := routeKey(m); got != "TARGET:www.example.com" {
+			t.Fatalf("routeKey = %q, want %q", got, "TARGET:www.example.com")
+		}
+		// The descriptor must be preserved (not overwritten) — it feeds stats.
+		if m.SmartTarget != "DomainSuffix [example.com]" {
+			t.Fatalf("SmartTarget = %q, want rule descriptor preserved", m.SmartTarget)
+		}
+	})
+
 	t.Run("cdn ASN is not special-cased", func(t *testing.T) {
 		// 13335 = Cloudflare, listed in CdnASNs. The CDN key form is gone, so
 		// Cloudflare targets key by ASN+org like any other ASN.
@@ -226,6 +242,57 @@ func TestRouteKey(t *testing.T) {
 			t.Fatalf("routeKey = %q, want %q", got, "TARGET:1.2.3.4")
 		}
 	})
+}
+
+// TestRouteDomain verifies that the per-domain key is the full hostname,
+// not the broader effective target or the rule descriptor in SmartTarget.
+// This must match the conn-size bucket written by wrapTCPConn's close callback
+// so routing state and conn-size land in the same domainCell.
+func TestRouteDomain(t *testing.T) {
+	ip, err := netip.ParseAddr("1.2.3.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rule-matched traffic: SmartTarget is a rule descriptor, but the domain
+	// key remains the actual hostname.
+	m := &C.Metadata{Host: "www.example.com", DstIP: ip, SmartTarget: "DomainSuffix [example.com]"}
+	if got := routeDomain(m); got != "www.example.com" {
+		t.Fatalf("routeDomain = %q, want %q", got, "www.example.com")
+	}
+
+	// Hosts that share an effective target must retain independent Best cells.
+	rt := smart.NewRouteTable(10)
+	key := "TARGET:*.gov-tw.test"
+	for host, best := range map[string]string{
+		"gov-tw.test":             "tw-ss-1",
+		"WWW.gov-tw.test.":        "sg-ss-2",
+		"data.gov-tw.test":        "tw-ss-2",
+		"www.service.gov-tw.test": "jp-ss-1",
+	} {
+		m.Host = host
+		rt.SetBestProxy(key, routeDomain(m), best)
+	}
+	for host, want := range map[string]string{
+		"gov-tw.test":             "tw-ss-1",
+		"www.gov-tw.test":         "sg-ss-2",
+		"data.gov-tw.test":        "tw-ss-2",
+		"www.service.gov-tw.test": "jp-ss-1",
+	} {
+		m.Host = host
+		if got, ok := rt.GetBestProxy(key, routeDomain(m)); !ok || got != want {
+			t.Fatalf("Best for %s = %q, %v; want %q", host, got, ok, want)
+		}
+	}
+	if smart.DomainTreeSimilarity("www.gov-tw.test", "data.gov-tw.test") == 0 {
+		t.Fatal("related hosts should still share domain-tree prior evidence")
+	}
+
+	// IP-only traffic falls back to the IP.
+	m = &C.Metadata{Host: "", DstIP: ip, SmartTarget: ""}
+	if got := routeDomain(m); got != "1.2.3.4" {
+		t.Fatalf("routeDomain(ip-only) = %q, want %q", got, "1.2.3.4")
+	}
 }
 
 // =========================================================================
@@ -259,14 +326,14 @@ func hasDupNames(names []string) bool {
 func TestExploreOrder_DeferredLast(t *testing.T) {
 	rt := smart.NewRouteTable(10)
 	rt.SetProxyAttrs(map[string]smart.ProxyAttributes{
-		"good":    {Score: 5.0},
+		"good":     {Score: 5.0},
 		"deferred": {Score: 6.0, FailedCount: 1.0}, // high score but failed
-		"lossy":   {Score: 4.0, PkgLoss: 0.3},      // high pkg loss
+		"lossy":    {Score: 4.0, PkgLoss: 0.3},     // high pkg loss
 	})
 	s := &Smart{routeTable: rt, testUrl: "test"}
 
 	proxies := makeStubProxies("good", "deferred", "lossy")
-	ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com")
+	ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com", "example.com")
 
 	names := orderedNames(ordered)
 	if len(names) != 3 || hasDupNames(names) {
@@ -295,7 +362,7 @@ func TestExploreOrder_UnsampledUsesNeutral(t *testing.T) {
 	s := &Smart{routeTable: rt, testUrl: "test"}
 
 	proxies := makeStubProxies("a", "b", "unsampled")
-	ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com")
+	ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com", "example.com")
 	names := orderedNames(ordered)
 
 	if len(names) != 3 || hasDupNames(names) {
@@ -347,7 +414,7 @@ func TestExploreOrder_TopShuffledOnlyForLargePool(t *testing.T) {
 	// non-deferred tier must only ever be a permutation of the same 8.
 	for i := 0; i < 20; i++ {
 		proxies := makeAll()
-		ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com")
+		ordered := s.exploreOrder(proxies, proxies, "TARGET:example.com", "example.com")
 		names := orderedNames(ordered)
 		if len(names) != 9 || hasDupNames(names) {
 			t.Fatalf("expected 9 unique proxies, got %v", names)
@@ -374,12 +441,12 @@ func TestExploreOrder_EmptyAggregationFallsBack(t *testing.T) {
 	const key = "TARGET:example.com"
 	// Seed per-key latency so PreRankLatency sorts deterministically (without
 	// per-key data it shuffles to avoid always favoring the same proxy).
-	rt.UpdateLatency(key, "slow", 300)
-	rt.UpdateLatency(key, "fast", 50)
+	rt.UpdateLatency(key, "example.com", "slow", 300)
+	rt.UpdateLatency(key, "example.com", "fast", 50)
 	s := &Smart{routeTable: rt, testUrl: "test"}
 
 	proxies := makeStubProxies("slow", "fast")
-	ordered := s.exploreOrder(proxies, proxies, key)
+	ordered := s.exploreOrder(proxies, proxies, key, "example.com")
 	names := orderedNames(ordered)
 	// Stable pre-rank by per-key latency: fast(50) before slow(300).
 	if len(names) != 2 || names[0] != "fast" || names[1] != "slow" {

@@ -7,12 +7,10 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
-	"github.com/metacubex/mihomo/common/singledo"
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
-	"github.com/dlclark/regexp2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -27,29 +25,38 @@ type extraOption struct {
 }
 
 type HealthCheck struct {
-	ctx            context.Context
-	ctxCancel      context.CancelFunc
-	url            string
-	extra          map[string]*extraOption
-	mu             sync.Mutex
-	proxies        []C.Proxy
-	interval       time.Duration
-	lazy           bool
-	expectedStatus utils.IntRanges[uint16]
-	lastTouch      atomic.TypedValue[time.Time]
-	singleDo       *singledo.Single[struct{}]
-	timeout        time.Duration
+	ctx                        context.Context
+	ctxCancel                  context.CancelFunc
+	url                        string
+	extra                      map[string]*extraOption
+	mu                         sync.Mutex
+	proxies                    []C.Proxy
+	interval                   time.Duration
+	lazy                       bool
+	expectedStatus             utils.IntRanges[uint16]
+	lastTouch                  atomic.TypedValue[time.Time]
+	tasks                      map[string]*healthCheckTask
+	wg                         sync.WaitGroup
+	closed                     bool
+	retryInitial, retryMaximum time.Duration
+	timeout                    time.Duration
 }
 
 func (hc *HealthCheck) process() {
-	ticker := time.NewTicker(hc.interval)
+	hc.mu.Lock()
+	interval := hc.interval
+	hc.mu.Unlock()
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
 	go hc.check()
 	for {
 		select {
 		case <-ticker.C:
 			lastTouch := hc.lastTouch.Load()
 			since := time.Since(lastTouch)
-			if !hc.lazy || since < hc.interval {
+			if !hc.lazy || since < interval {
 				hc.check()
 			} else {
 				log.Debugln("Skip once health check because we are lazy")
@@ -62,6 +69,8 @@ func (hc *HealthCheck) process() {
 }
 
 func (hc *HealthCheck) setProxies(proxies []C.Proxy) {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
 	hc.proxies = proxies
 }
 
@@ -113,6 +122,8 @@ func splitAndAddFiltersToExtra(filter string, option *extraOption) {
 }
 
 func (hc *HealthCheck) auto() bool {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
 	return hc.interval != 0
 }
 
@@ -121,63 +132,53 @@ func (hc *HealthCheck) touch() {
 }
 
 func (hc *HealthCheck) check() {
-	if len(hc.proxies) == 0 {
-		return
+	hc.mu.Lock()
+	urls := make([]string, 0, len(hc.extra)+1)
+	urls = append(urls, hc.url)
+	for url := range hc.extra {
+		urls = append(urls, url)
 	}
-
-	_, _, _ = hc.singleDo.Do(func() (struct{}, error) {
-		id := utils.NewUUIDV4().String()
-		log.Debugln("Start New Health Checking {%s}", id)
-		b := new(errgroup.Group)
-		b.SetLimit(10)
-
-		// execute default health check
-		option := &extraOption{filters: nil, expectedStatus: hc.expectedStatus}
-		hc.execute(b, hc.url, id, option)
-
-		// execute extra health check
-		if len(hc.extra) != 0 {
-			for url, option := range hc.extra {
-				hc.execute(b, url, id, option)
-			}
+	hc.mu.Unlock()
+	// Launch through the same scheduler as recovery; do not let a slow default
+	// URL prevent another URL's check from starting.
+	var done []<-chan struct{}
+	for _, url := range urls {
+		if ch := hc.requestCheck(url, false); ch != nil {
+			done = append(done, ch)
 		}
-		_ = b.Wait()
-		log.Debugln("Finish A Health Checking {%s}", id)
-		return struct{}{}, nil
-	})
+	}
+	for _, ch := range done {
+		select {
+		case <-ch:
+		case <-hc.ctx.Done():
+			return
+		}
+	}
 }
 
-func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extraOption) {
+func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extraOption, proxies []C.Proxy) {
 	url = strings.TrimSpace(url)
 	if len(url) == 0 {
 		log.Debugln("Health Check has been skipped due to testUrl is empty, {%s}", uid)
 		return
 	}
 
-	var filterReg *regexp2.Regexp
 	var expectedStatus utils.IntRanges[uint16]
 	if option != nil {
 		expectedStatus = option.expectedStatus
-		if len(option.filters) != 0 {
-			filters := make([]string, 0, len(option.filters))
-			for filter := range option.filters {
-				filters = append(filters, filter)
-			}
-
-			filterReg = regexp2.MustCompile(strings.Join(filters, "|"), regexp2.None)
-		}
 	}
 
-	for _, proxy := range hc.proxies {
-		// skip proxies that do not require health check
-		if filterReg != nil {
-			if match, _ := filterReg.MatchString(proxy.Name()); !match {
-				continue
-			}
-		}
-
+	for _, proxy := range proxies {
 		p := proxy
 		b.Go(func() error {
+			// The shared budget includes all automatic provider checks. Acquire
+			// before starting the timeout so waiting for a slot is not a failure.
+			select {
+			case healthCheckBudget <- struct{}{}:
+				defer func() { <-healthCheckBudget }()
+			case <-hc.ctx.Done():
+				return nil
+			}
 			ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
 			defer cancel()
 			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", p.Name(), url, uid)
@@ -189,7 +190,18 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
 }
 
 func (hc *HealthCheck) close() {
-	hc.ctxCancel()
+	hc.mu.Lock()
+	if !hc.closed {
+		hc.closed = true
+		hc.ctxCancel()
+		for _, task := range hc.tasks {
+			if task.timer != nil {
+				task.timer.Stop()
+			}
+		}
+	}
+	hc.mu.Unlock()
+	hc.wg.Wait()
 }
 
 func NewHealthCheck(proxies []C.Proxy, url string, timeout uint, interval uint, lazy bool, expectedStatus utils.IntRanges[uint16]) *HealthCheck {
@@ -212,6 +224,8 @@ func NewHealthCheck(proxies []C.Proxy, url string, timeout uint, interval uint, 
 		interval:       time.Duration(interval) * time.Second,
 		lazy:           lazy,
 		expectedStatus: expectedStatus,
-		singleDo:       singledo.NewSingle[struct{}](time.Second),
+		tasks:          make(map[string]*healthCheckTask),
+		retryInitial:   10 * time.Second,
+		retryMaximum:   5 * time.Minute,
 	}
 }

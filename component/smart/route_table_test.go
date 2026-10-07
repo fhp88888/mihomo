@@ -1,11 +1,30 @@
 package smart
 
 import (
+	"encoding/json"
+	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 )
+
+// testDomain is the per-domain key used by tests that exercise the
+// domain-aware best/tcpProbed routing state.
+const testDomain = "example.com"
+
+// domainProxies returns the ProxyRecord map for a named domain within a row
+// snapshot (nil if the domain isn't present).  Proxy metrics now live per
+// domain, so tests that used to read row.Proxies directly go through this.
+func domainProxies(row RowSnapshot, domain string) map[string]ProxyRecord {
+	for _, d := range row.Domains {
+		if d.Name == domain {
+			return d.Proxies
+		}
+	}
+	return nil
+}
 
 func TestNewRouteTable(t *testing.T) {
 	rt := NewRouteTable(100)
@@ -22,12 +41,12 @@ func TestSetAndGetBestProxy(t *testing.T) {
 	key := "ASN:64512"
 
 	// Initially no best proxy
-	if _, ok := rt.GetBestProxy(key); ok {
+	if _, ok := rt.GetBestProxy(key, testDomain); ok {
 		t.Fatal("expected no best proxy for new key")
 	}
 
-	rt.SetBestProxy(key, "proxy-a")
-	name, ok := rt.GetBestProxy(key)
+	rt.SetBestProxy(key, testDomain, "proxy-a")
+	name, ok := rt.GetBestProxy(key, testDomain)
 	if !ok {
 		t.Fatal("expected best proxy after set")
 	}
@@ -40,12 +59,12 @@ func TestTCPProbed(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	if rt.IsTCPProbed(key) {
+	if rt.IsTCPProbed(key, testDomain) {
 		t.Fatal("expected false for new key")
 	}
 
-	rt.SetTCPProbed(key)
-	if !rt.IsTCPProbed(key) {
+	rt.SetTCPProbed(key, testDomain)
+	if !rt.IsTCPProbed(key, testDomain) {
 		t.Fatal("expected true after SetTCPProbed")
 	}
 }
@@ -56,20 +75,20 @@ func TestEMALatency(t *testing.T) {
 	proxy := "proxy-a"
 
 	// First sample: writes directly (does not average with zero)
-	rt.UpdateLatency(key, proxy, 100)
+	rt.UpdateLatency(key, testDomain, proxy, 100)
 	snap := rt.Snapshot("test")
 	if len(snap.Rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(snap.Rows))
 	}
-	rec := snap.Rows[0].Proxies[proxy]
+	rec := domainProxies(snap.Rows[0], testDomain)[proxy]
 	if rec.Attributes.Latency != 100 {
 		t.Fatalf("expected first latency=100, got %d", rec.Attributes.Latency)
 	}
 
 	// Second sample: EMA = old*3/4 + new*1/4 = 100*3/4 + 40*1/4 = 85
-	rt.UpdateLatency(key, proxy, 40)
+	rt.UpdateLatency(key, testDomain, proxy, 40)
 	snap = rt.Snapshot("test")
-	rec = snap.Rows[0].Proxies[proxy]
+	rec = domainProxies(snap.Rows[0], testDomain)[proxy]
 	expected := int64(float64(100)*3.0/4.0 + float64(40)/4.0)
 	if rec.Attributes.Latency != expected {
 		t.Fatalf("expected EMA latency=%d, got %d", expected, rec.Attributes.Latency)
@@ -81,16 +100,16 @@ func TestEMAPkgLoss(t *testing.T) {
 	key := "ASN:64512"
 	proxy := "proxy-a"
 
-	rt.UpdatePkgLoss(key, proxy, 0.01)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.01)
 	snap := rt.Snapshot("test")
-	if snap.Rows[0].Proxies[proxy].Attributes.PkgLoss != 0.01 {
+	if domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.PkgLoss != 0.01 {
 		t.Fatal("first pkg_loss should be 0.01")
 	}
 
-	rt.UpdatePkgLoss(key, proxy, 0.04)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.04)
 	snap = rt.Snapshot("test")
 	expected := 0.01*3.0/4.0 + 0.04/4.0
-	got := snap.Rows[0].Proxies[proxy].Attributes.PkgLoss
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.PkgLoss
 	if got < expected-0.001 || got > expected+0.001 {
 		t.Fatalf("expected EMA pkg_loss=%.4f, got %.4f", expected, got)
 	}
@@ -101,35 +120,35 @@ func TestEMAJitter(t *testing.T) {
 	key := "ASN:64512"
 	proxy := "proxy-a"
 
-	// First latency sample: no baseline yet, jitter stays 0.
-	rt.UpdateLatency(key, proxy, 100)
+	// First TTFB sample: no baseline yet, jitter stays 0.
+	rt.UpdateTTFB(key, testDomain, proxy, 100)
 	snap := rt.Snapshot("test")
-	rec := snap.Rows[0].Proxies[proxy]
+	rec := domainProxies(snap.Rows[0], testDomain)[proxy]
 	if rec.Attributes.Jitter != 0 {
 		t.Fatalf("expected jitter=0 on first sample, got %.2f", rec.Attributes.Jitter)
 	}
-	if rec.Attributes.Latency != 100 {
-		t.Fatalf("expected first latency=100, got %d", rec.Attributes.Latency)
+	if rec.Attributes.TTFB != 100 {
+		t.Fatalf("expected first ttfb=100, got %d", rec.Attributes.TTFB)
 	}
 
-	// Second sample: previous EMA latency was 100, new sample 40.
+	// Second sample: previous EMA ttfb was 100, new sample 40.
 	// deviation = |40-100| = 60, first jitter sample writes directly.
-	rt.UpdateLatency(key, proxy, 40)
+	rt.UpdateTTFB(key, testDomain, proxy, 40)
 	snap = rt.Snapshot("test")
-	rec = snap.Rows[0].Proxies[proxy]
+	rec = domainProxies(snap.Rows[0], testDomain)[proxy]
 	if rec.Attributes.Jitter != 60 {
 		t.Fatalf("expected first jitter=60, got %.2f", rec.Attributes.Jitter)
 	}
-	// EMA latency = 100*3/4 + 40/4 = 85
-	if rec.Attributes.Latency != 85 {
-		t.Fatalf("expected EMA latency=85, got %d", rec.Attributes.Latency)
+	// EMA ttfb = 100*3/4 + 40/4 = 85
+	if rec.Attributes.TTFB != 85 {
+		t.Fatalf("expected EMA ttfb=85, got %d", rec.Attributes.TTFB)
 	}
 
-	// Third sample: previous EMA latency was 85, new sample 100.
+	// Third sample: previous EMA ttfb was 85, new sample 100.
 	// deviation = |100-85| = 15. Jitter EMA = 60*3/4 + 15/4 = 48.75.
-	rt.UpdateLatency(key, proxy, 100)
+	rt.UpdateTTFB(key, testDomain, proxy, 100)
 	snap = rt.Snapshot("test")
-	rec = snap.Rows[0].Proxies[proxy]
+	rec = domainProxies(snap.Rows[0], testDomain)[proxy]
 	expectedJitter := 60*3.0/4.0 + 15.0/4.0
 	if rec.Attributes.Jitter < expectedJitter-0.01 || rec.Attributes.Jitter > expectedJitter+0.01 {
 		t.Fatalf("expected jitter=%.2f, got %.2f", expectedJitter, rec.Attributes.Jitter)
@@ -141,16 +160,16 @@ func TestEMASpeed(t *testing.T) {
 	key := "ASN:64512"
 	proxy := "proxy-a"
 
-	rt.UpdateSpeed(key, proxy, 10485760)
+	rt.UpdateSpeed(key, testDomain, proxy, 10485760)
 	snap := rt.Snapshot("test")
-	if snap.Rows[0].Proxies[proxy].Attributes.Speed != 10485760 {
+	if domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.Speed != 10485760 {
 		t.Fatal("first speed should be 10485760")
 	}
 
-	rt.UpdateSpeed(key, proxy, 20971520)
+	rt.UpdateSpeed(key, testDomain, proxy, 20971520)
 	snap = rt.Snapshot("test")
 	expected := 10485760.0*3.0/4.0 + 20971520.0/4.0
-	got := snap.Rows[0].Proxies[proxy].Attributes.Speed
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.Speed
 	if got < expected-1 || got > expected+1 {
 		t.Fatalf("expected EMA speed=%.0f, got %.0f", expected, got)
 	}
@@ -161,11 +180,186 @@ func TestIncrementUseCount(t *testing.T) {
 	key := "ASN:64512"
 	proxy := "proxy-a"
 
-	rt.IncrementUseCount(key, proxy)
-	rt.IncrementUseCount(key, proxy)
+	rt.IncrementUseCount(key, testDomain, proxy)
+	rt.IncrementUseCount(key, testDomain, proxy)
 	snap := rt.Snapshot("test")
-	if snap.Rows[0].Proxies[proxy].UseCount != 2 {
-		t.Fatalf("expected use_count=2, got %d", snap.Rows[0].Proxies[proxy].UseCount)
+	if domainProxies(snap.Rows[0], testDomain)[proxy].UseCount != 2 {
+		t.Fatalf("expected use_count=2, got %d", domainProxies(snap.Rows[0], testDomain)[proxy].UseCount)
+	}
+}
+
+func TestRouteFamilyUsesRegistrableDomain(t *testing.T) {
+	if got := RouteFamily("*.img2.eu-example.test"); got != "eu-example.test" {
+		t.Fatalf("family = %q", got)
+	}
+	if got := RouteFamily("www.eu-example.test"); got != "eu-example.test" {
+		t.Fatalf("family = %q", got)
+	}
+	if DomainTreeSimilarity("www.example.com", "img1.example.com") >=
+		DomainTreeSimilarity("img2.example.com", "*.img2.example.com") {
+		t.Fatal("a parent/child pair should be closer than sibling hosts")
+	}
+	if got := DomainTreeSimilarity("www.example.com", "www.example.net"); got != 0 {
+		t.Fatalf("unrelated registrable domains have similarity %v", got)
+	}
+}
+
+func TestSimilarPriorFutureDemandAndExplorationRisk(t *testing.T) {
+	rt := NewRouteTable(100)
+	k1, d1 := "TARGET:www.eu-example.test", "www.eu-example.test"
+	k2, d2 := "TARGET:img1.eu-example.test", "img1.eu-example.test"
+	rt.UpdateTTFB(k1, d1, "eu", 200)
+	if got := rt.RouteFamilyTTFBProxyCount(d2); got != 1 {
+		t.Fatalf("family TTFB proxy count = %d", got)
+	}
+	if got := rt.RouteTTFBProxyCount(k2, d2); got != 0 {
+		t.Fatalf("sibling observation counted as local coverage: %d", got)
+	}
+	if got := rt.RouteTTFBProxyCount(k1, d1); got != 1 {
+		t.Fatalf("local TTFB proxy count = %d, want 1", got)
+	}
+	prior, ok := rt.SimilarTTFBPrior(k2, d2, "eu")
+	if !ok || math.Abs(prior.Mean-200) > .001 {
+		t.Fatalf("similar prior = %+v, %v", prior, ok)
+	}
+	for i := 0; i < 8; i++ {
+		rt.IncrementUseCount(k1, d1, "eu")
+	}
+	if future := rt.ExpectedFutureRequests(d2, 30*time.Second); future <= 1 || future > 32 {
+		t.Fatalf("future requests = %v", future)
+	}
+	if future := rt.ExpectedRouteFutureRequests(k2, d2, 30*time.Second); future != 1 {
+		t.Fatalf("sibling demand counted as local demand: %v", future)
+	}
+	if future := rt.ExpectedRouteFutureRequests(k1, d1, 30*time.Second); future <= 1 || future > 32 {
+		t.Fatalf("local future requests = %v", future)
+	}
+	rt.UpdateExplorationRegret(k1, d1, "challenger", 100)
+	rt.UpdateExplorationRegret(k1, d1, "challenger", 300)
+	risk, ok := rt.ExplorationRisk(d2, "challenger")
+	if !ok || risk.Samples != 2 || math.Abs(risk.Mean-200) > .001 || math.Abs(risk.StdDev-math.Sqrt(20000)) > .001 {
+		t.Fatalf("risk = %+v, %v", risk, ok)
+	}
+}
+
+func TestShouldExploreUsesExactRouteCadence(t *testing.T) {
+	rt := NewRouteTable(100)
+	for i := 1; i <= 50; i++ {
+		domain := "www.eu-example.test"
+		if i%2 == 0 {
+			domain = "img1.eu-example.test"
+		}
+		got := rt.ShouldExplore("TARGET:"+domain, domain, 25)
+		if got != (i == 49 || i == 50) {
+			t.Fatalf("request %d: explore=%v", i, got)
+		}
+	}
+	if rt.ShouldExplore("ASN:other", "www.eu-example.test", 25) {
+		t.Fatal("same domain under a different route key inherited the counter")
+	}
+	if rt.ShouldExplore("TARGET:www.hk-example.test", "www.hk-example.test", 25) {
+		t.Fatal("a different route inherited the first route's counter")
+	}
+	if rt.ShouldExplore("TARGET:a", "a", 0) {
+		t.Fatal("disabled cadence explored")
+	}
+}
+
+func TestSimilarPriorUsesPerformanceSignature(t *testing.T) {
+	rt := NewRouteTable(100)
+	current := "img2.example.com"
+	positive := "img1.example.com"
+	negative := "www.example.com"
+	for i, proxy := range []string{"p1", "p2", "p3"} {
+		rt.UpdateTTFB("TARGET:"+current, current, proxy, int64(100+i*100))
+		rt.UpdateTTFB("TARGET:"+positive, positive, proxy, int64(110+i*100))
+		rt.UpdateTTFB("TARGET:"+negative, negative, proxy, int64(310-i*100))
+	}
+	rt.UpdateTTFB("TARGET:"+positive, positive, "challenger", 150)
+	rt.UpdateTTFB("TARGET:"+negative, negative, "challenger", 900)
+	prior, ok := rt.SimilarTTFBPrior("TARGET:"+current, current, "challenger")
+	if !ok || prior.Mean >= 525 {
+		t.Fatalf("performance posterior did not favor matching signature: %+v, %v", prior, ok)
+	}
+}
+
+func TestSimilarPriorKeepsSiblingEvidenceDespiteOppositeSignature(t *testing.T) {
+	rt := NewRouteTable(100)
+	current := "img2.example.com"
+	sibling := "www.example.com"
+	for i, proxy := range []string{"p1", "p2", "p3"} {
+		rt.UpdateTTFB("TARGET:"+current, current, proxy, int64(100+i*100))
+		rt.UpdateTTFB("TARGET:"+sibling, sibling, proxy, int64(300-i*100))
+	}
+	rt.UpdateTTFB("TARGET:"+sibling, sibling, "challenger", 500)
+	prior, ok := rt.SimilarTTFBPrior("TARGET:"+current, current, "challenger")
+	if !ok || math.Abs(prior.Mean-500) > .001 {
+		t.Fatalf("posterior discarded same-site evidence: %+v, %v", prior, ok)
+	}
+}
+
+func TestSimilarFailedCountIncludesFailureOnlyAndObservedZeros(t *testing.T) {
+	rt := NewRouteTable(100)
+	const domain, proxy = "img.example.com", "p"
+	// A parent failure-only cell contributes with weight .875.
+	rt.SetBestProxy("ASN:1", "example.com", "other")
+	rt.MarkFailed("ASN:1", proxy, "example.com", 2)
+	// A successful sibling contributes zero with weight 5/6.
+	rt.IncrementUseCount("ASN:2", "www.example.com", proxy)
+	// Empty placeholders, unrelated sites and the exact hostname in any row
+	// must not dilute or increase the shared penalty.
+	rt.SetBestProxy("ASN:3", "empty.example.com", "other")
+	rt.getOrCreateCell(rt.rows["ASN:3"].domainTable["empty.example.com"], proxy)
+	for key, host := range map[string]string{"ASN:4": domain, "ASN:5": "other.net", "TARGET:local": domain} {
+		rt.SetBestProxy(key, host, "other")
+		rt.MarkFailed(key, proxy, host, 10)
+	}
+	want := 2 * .875 / (.875 + 5.0/6)
+	if got := rt.SimilarFailedCount("TARGET:local", domain, proxy); math.Abs(got-want) > 1e-9 {
+		t.Fatalf("shared failure = %v, want %v", got, want)
+	}
+	if got := rt.SimilarFailedCount("TARGET:local", domain, "unknown"); got != 0 {
+		t.Fatalf("unknown proxy penalty = %v", got)
+	}
+	rt.DecayFailedCounts()
+	want = 1.9 * .875 / (.875 + 5.0/6)
+	if got := rt.SimilarFailedCount("TARGET:local", domain, proxy); math.Abs(got-want) > 1e-9 {
+		t.Fatalf("decayed shared failure = %v, want %v", got, want)
+	}
+	rt.IncrementUseCount("ASN:1", "example.com", proxy)
+	if got := rt.SimilarFailedCount("TARGET:local", domain, proxy); got != 0 {
+		t.Fatalf("successful source did not reset shared penalty: %v", got)
+	}
+}
+
+func TestSimilarFailedCountUsesPerformanceSignature(t *testing.T) {
+	rt := NewRouteTable(100)
+	const domain = "img.example.com"
+	for i, proxy := range []string{"p1", "p2", "p3"} {
+		rt.UpdateTTFB("current", domain, proxy, int64(100+i*100))
+		rt.UpdateTTFB("positive", "a.example.com", proxy, int64(100+i*100))
+		rt.UpdateTTFB("negative", "b.example.com", proxy, int64(300-i*100))
+	}
+	rt.MarkFailed("positive", "challenger", "a.example.com", 2)
+	rt.MarkFailed("negative", "challenger", "b.example.com", 6)
+	want := (2.0 + .75*6) / (1 + .75)
+	if got := rt.SimilarFailedCount("current", domain, "challenger"); math.Abs(got-want) > 1e-9 {
+		t.Fatalf("signature-weighted failure = %v, want %v", got, want)
+	}
+}
+
+func TestSimilarFailedCountKeepsEightNearestRecords(t *testing.T) {
+	rt := NewRouteTable(100)
+	const domain = "preview.img.example.com"
+	for i := 0; i < 8; i++ {
+		host := fmt.Sprintf("c%d.%s", i, domain)
+		rt.SetBestProxy(host, host, "other")
+		rt.MarkFailed(host, "p", host, 2)
+	}
+	rt.SetBestProxy("far", "www.example.com", "other")
+	rt.MarkFailed("far", "p", "www.example.com", 10)
+	if got := rt.SimilarFailedCount("current", domain, "p"); math.Abs(got-2) > 1e-9 {
+		t.Fatalf("distant ninth record contributed: %v", got)
 	}
 }
 
@@ -177,10 +371,10 @@ func TestCalculateScore(t *testing.T) {
 		jitter      float64
 		expect      float64
 	}{
-		// latency-only: score = 100 / (max(latency, 100) + max(jitter, 10)).
+		// latency-only: score = 100 / (max(latency, 50) + max(jitter, 10)).
 		// jitter=0 still applies the 10ms floor to the denominator.
 		{latency: 100, speed: 0, failedCount: 0, jitter: 0, expect: 100.0 / (100.0 + 10.0)}, // 100/110
-		{latency: 50, speed: 0, failedCount: 0, jitter: 0, expect: 100.0 / (100.0 + 10.0)},  // max(50,100)=100
+		{latency: 50, speed: 0, failedCount: 0, jitter: 0, expect: 100.0 / (50.0 + 10.0)},   // max(50,50)=50
 		{latency: 200, speed: 0, failedCount: 0, jitter: 0, expect: 100.0 / (200.0 + 10.0)}, // 100/210
 		// speed contributes log1p(speed / 0.5MBps)
 		{latency: 100, speed: 10485760, failedCount: 0, jitter: 0, expect: 100.0/(100.0+10.0) + math.Log1p(20)},
@@ -189,7 +383,7 @@ func TestCalculateScore(t *testing.T) {
 		// failedCount penalty: 0.8^n multiplier
 		{latency: 100, speed: 0, failedCount: 1, jitter: 0, expect: 100.0 / (100.0 + 10.0) * 0.8},
 		{latency: 100, speed: 0, failedCount: 3, jitter: 0, expect: 100.0 / (100.0 + 10.0) * math.Pow(0.8, 3)},
-		// jitter inflates the latency denominator: 100 / (max(latency,100) + max(jitter,10))
+		// jitter inflates the latency denominator: 100 / (max(latency,50) + max(jitter,10))
 		{latency: 100, speed: 0, failedCount: 0, jitter: 10, expect: 100.0 / (100.0 + 10.0)},   // max(10,10)=10
 		{latency: 100, speed: 0, failedCount: 0, jitter: 5, expect: 100.0 / (100.0 + 10.0)},    // max(5,10)=10, same floor
 		{latency: 100, speed: 0, failedCount: 0, jitter: 50, expect: 100.0 / (100.0 + 50.0)},   // 100/150
@@ -213,24 +407,24 @@ func TestRefreshScoresStoresNonEMA(t *testing.T) {
 	key := "ASN:64512"
 	proxy := "proxy-a"
 
-	rt.UpdateLatency(key, proxy, 100)
-	rt.UpdateSpeed(key, proxy, 10485760)
-	rt.RefreshScores(key, []string{proxy})
+	rt.UpdateLatency(key, testDomain, proxy, 100)
+	rt.UpdateSpeed(key, testDomain, proxy, 10485760)
+	rt.RefreshScores(key, testDomain, []string{proxy})
 	snap := rt.Snapshot("test")
-	got := snap.Rows[0].Proxies[proxy].Attributes.Score
-	rec := snap.Rows[0].Proxies[proxy]
-	atom := 100.0/(math.Max(float64(rec.Attributes.Latency), 100.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.Score
+	rec := domainProxies(snap.Rows[0], testDomain)[proxy]
+	atom := 100.0/(math.Max(float64(rec.Attributes.Latency), 50.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
 	expected := atom // no per-proxy aggregation -> raw unblended score
 	if math.Abs(got-expected) > 0.000001 {
 		t.Fatalf("expected initial score %.6f, got %.6f", expected, got)
 	}
 
-	rt.UpdateLatency(key, proxy, 20)
-	rt.UpdateSpeed(key, proxy, 20971520)
-	rt.RefreshScores(key, []string{proxy})
+	rt.UpdateLatency(key, testDomain, proxy, 20)
+	rt.UpdateSpeed(key, testDomain, proxy, 20971520)
+	rt.RefreshScores(key, testDomain, []string{proxy})
 	snap = rt.Snapshot("test")
-	rec = snap.Rows[0].Proxies[proxy]
-	atom = 100.0/(math.Max(float64(rec.Attributes.Latency), 100.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
+	rec = domainProxies(snap.Rows[0], testDomain)[proxy]
+	atom = 100.0/(math.Max(float64(rec.Attributes.Latency), 50.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
 	expected = atom
 	if math.Abs(rec.Attributes.Score-expected) > 0.000001 {
 		t.Fatalf("expected score from current latency/speed %.6f, got %.6f", expected, rec.Attributes.Score)
@@ -241,16 +435,16 @@ func TestRankByScore(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	rt.UpdateLatency(key, "proxy-a", 100)
-	rt.UpdateLatency(key, "proxy-b", 50)
-	rt.UpdateLatency(key, "proxy-c", 200)
-	rt.UpdateSpeed(key, "proxy-c", 10485760)
-	rt.RefreshScores(key, []string{"proxy-a", "proxy-b", "proxy-c"})
+	rt.UpdateLatency(key, testDomain, "proxy-a", 100)
+	rt.UpdateLatency(key, testDomain, "proxy-b", 50)
+	rt.UpdateLatency(key, testDomain, "proxy-c", 200)
+	rt.UpdateSpeed(key, testDomain, "proxy-c", 10485760)
+	rt.RefreshScores(key, testDomain, []string{"proxy-a", "proxy-b", "proxy-c"})
 
 	proxies := []string{"proxy-a", "proxy-c", "proxy-b"}
-	ranked := rt.RankByScore(proxies, nil, key)
-	// proxy-c=3.54 (200ms+10MiBps), proxy-a=1.0 (100ms), proxy-b=1.0 (50ms clamped to max 100)
-	expected := []string{"proxy-c", "proxy-a", "proxy-b"}
+	ranked := rt.RankByScore(proxies, nil, key, testDomain)
+	// proxy-c=3.52 (200ms+10MiBps), proxy-b=1.67 (50ms), proxy-a=0.91 (100ms)
+	expected := []string{"proxy-c", "proxy-b", "proxy-a"}
 	for i := range expected {
 		if ranked[i] != expected[i] {
 			t.Fatalf("ranked[%d]: expected %s, got %s", i, expected[i], ranked[i])
@@ -262,13 +456,13 @@ func TestRankByScoreStableSort(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	rt.UpdateLatency(key, "proxy-a", 50)
-	rt.UpdateLatency(key, "proxy-b", 50)
-	rt.UpdateLatency(key, "proxy-c", 50)
-	rt.RefreshScores(key, []string{"proxy-a", "proxy-b", "proxy-c"})
+	rt.UpdateLatency(key, testDomain, "proxy-a", 50)
+	rt.UpdateLatency(key, testDomain, "proxy-b", 50)
+	rt.UpdateLatency(key, testDomain, "proxy-c", 50)
+	rt.RefreshScores(key, testDomain, []string{"proxy-a", "proxy-b", "proxy-c"})
 
 	proxies := []string{"proxy-c", "proxy-a", "proxy-b"}
-	ranked := rt.RankByScore(proxies, nil, key)
+	ranked := rt.RankByScore(proxies, nil, key, testDomain)
 	for i := range proxies {
 		if ranked[i] != proxies[i] {
 			t.Fatalf("stable sort broken at [%d]: expected %s, got %s", i, proxies[i], ranked[i])
@@ -280,8 +474,8 @@ func TestRankByScoreWithHealthCheckFallback(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	rt.UpdateLatency(key, "proxy-a", 100)
-	rt.RefreshScores(key, []string{"proxy-a"})
+	rt.UpdateLatency(key, testDomain, "proxy-a", 100)
+	rt.RefreshScores(key, testDomain, []string{"proxy-a"})
 
 	healthCheck := func(name string) uint16 {
 		switch name {
@@ -297,13 +491,249 @@ func TestRankByScoreWithHealthCheckFallback(t *testing.T) {
 	}
 
 	proxies := []string{"proxy-zero", "proxy-a", "proxy-max", "proxy-b"}
-	ranked := rt.RankByScore(proxies, healthCheck, key)
-	// proxy-a=1.0 (has sample, lat=100), proxy-b=1.0 (hc lat=50 clamped to max 100), proxy-zero=0, proxy-max=0
-	expected := []string{"proxy-a", "proxy-b", "proxy-zero", "proxy-max"}
+	ranked := rt.RankByScore(proxies, healthCheck, key, testDomain)
+	// proxy-b=1.67 (hc lat=50), proxy-a=0.91 (has sample, lat=100), proxy-zero=0, proxy-max=0
+	expected := []string{"proxy-b", "proxy-a", "proxy-zero", "proxy-max"}
 	for i := range expected {
 		if ranked[i] != expected[i] {
 			t.Fatalf("ranked[%d]: expected %s, got %s", i, expected[i], ranked[i])
 		}
+	}
+}
+
+func TestRankByScoreFailedOnlyProxyRanksLast(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// proxy-a has a latency sample; proxy-b has only failures (no sample).
+	rt.UpdateLatency(key, testDomain, "proxy-a", 100)
+	rt.MarkFailed(key, "proxy-b", testDomain, 3.0)
+
+	// A healthy-looking fallback latency must NOT rescue the failed-only proxy:
+	// its failure penalty must be applied (score 0) so it ranks last.
+	healthCheck := func(name string) uint16 { return 50 }
+
+	ranked := rt.RankByScore([]string{"proxy-b", "proxy-a"}, healthCheck, key, testDomain)
+	if ranked[0] != "proxy-a" {
+		t.Fatalf("failed-only proxy ranked before sampled proxy: got %v", ranked)
+	}
+}
+
+func TestRankByScorePrefersTTFBGroup(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// proxy-a: fast latency but slow TTFB.
+	rt.UpdateLatency(key, testDomain, "proxy-a", 100)
+	rt.UpdateTTFB(key, testDomain, "proxy-a", 80)
+	// proxy-b: slow latency but fast TTFB.
+	rt.UpdateLatency(key, testDomain, "proxy-b", 200)
+	rt.UpdateTTFB(key, testDomain, "proxy-b", 50)
+
+	// Once TTFB exists, ranking uses TTFB (not latency): proxy-b (50ms) beats
+	// proxy-a (80ms) even though proxy-a's latency is lower.
+	ranked := rt.RankByScore([]string{"proxy-a", "proxy-b"}, nil, key, testDomain)
+	expected := []string{"proxy-b", "proxy-a"}
+	for i := range expected {
+		if ranked[i] != expected[i] {
+			t.Fatalf("ranked[%d]: expected %s, got %s (full: %v)", i, expected[i], ranked[i], ranked)
+		}
+	}
+}
+
+func TestRankByScoreSkipsProxiesSlowerThanMinTTFB(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// proxy-a establishes minTTFB=50.
+	rt.UpdateTTFB(key, testDomain, "proxy-a", 50)
+	// proxy-b has no TTFB and latency 200 > 50 -> skipped.
+	rt.UpdateLatency(key, testDomain, "proxy-b", 200)
+	// proxy-c has no TTFB and latency 20 <= 50 -> kept.
+	rt.UpdateLatency(key, testDomain, "proxy-c", 20)
+	// proxy-d has no TTFB and latency 40 <= 50 -> kept.
+	rt.UpdateLatency(key, testDomain, "proxy-d", 40)
+
+	ranked := rt.RankByScore([]string{"proxy-b", "proxy-c", "proxy-d", "proxy-a"}, nil, key, testDomain)
+
+	if len(ranked) != 3 {
+		t.Fatalf("expected 3 proxies (only proxy-b skipped), got %d: %v", len(ranked), ranked)
+	}
+	// TTFB group (proxy-a) first, then the latency group by score.
+	if ranked[0] != "proxy-a" || ranked[1] != "proxy-c" || ranked[2] != "proxy-d" {
+		t.Fatalf("unexpected order: %v", ranked)
+	}
+}
+
+func TestRankByScoreURLTestDelayOnlyRanksUnknownProxies(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	proxies := []string{"unknown-slow", "sampled", "unknown-fast", "dial-slow"}
+	urlTest := func(name string) uint16 {
+		switch name {
+		case "unknown-slow":
+			return 1200
+		case "unknown-fast":
+			return 300
+		case "dial-slow":
+			return 1 // URL-test cannot override a measured dial latency.
+		default:
+			return 0xffff
+		}
+	}
+
+	// Before any local TTFB sample, URL-test orders the unknown proxies.
+	if got := rt.RankByScore(proxies[:3], urlTest, key, testDomain); !slices.Equal(got, []string{"unknown-fast", "unknown-slow", "sampled"}) {
+		t.Fatalf("cold-start URL-test ranking: got %v", got)
+	}
+
+	rt.UpdateTTFB(key, testDomain, "sampled", 100)
+	rt.UpdateLatency(key, testDomain, "dial-slow", 200)
+	got := rt.RankByScore(proxies, urlTest, key, testDomain)
+	want := []string{"sampled", "unknown-fast", "unknown-slow"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("URL-test delays must not prune unknown proxies; got %v, want %v", got, want)
+	}
+}
+
+func TestRankByScoreLatencyGroupAfterTTFBGroup(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// proxy-a has TTFB=50; proxy-b has no TTFB but latency=20 (<= minTTFB,
+	// so it survives the prune even though its raw latency is lower).
+	rt.UpdateTTFB(key, testDomain, "proxy-a", 50)
+	rt.UpdateLatency(key, testDomain, "proxy-b", 20)
+
+	ranked := rt.RankByScore([]string{"proxy-b", "proxy-a"}, nil, key, testDomain)
+	// TTFB group always comes first, even though proxy-b's raw latency is lower.
+	expected := []string{"proxy-a", "proxy-b"}
+	for i := range expected {
+		if ranked[i] != expected[i] {
+			t.Fatalf("ranked[%d]: expected %s, got %s (full: %v)", i, expected[i], ranked[i], ranked)
+		}
+	}
+}
+
+func TestRankByScoreMinTTFBFromWholeRow(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// proxy-b is NOT in the candidate list but establishes minTTFB=50.
+	rt.UpdateTTFB(key, testDomain, "proxy-b", 50)
+	// proxy-a is in the list with TTFB=100.
+	rt.UpdateTTFB(key, testDomain, "proxy-a", 100)
+	// proxy-c has no TTFB and latency=80, which is > 50 (whole-row min) -> skipped.
+	rt.UpdateLatency(key, testDomain, "proxy-c", 80)
+
+	ranked := rt.RankByScore([]string{"proxy-a", "proxy-c"}, nil, key, testDomain)
+	if len(ranked) != 1 || ranked[0] != "proxy-a" {
+		t.Fatalf("expected only proxy-a (proxy-c skipped via whole-row minTTFB), got %v", ranked)
+	}
+}
+
+func TestRankByScoreCapsTTFBGroup(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// Six proxies with a TTFB sample, clearly distinct first-byte times.
+	// proxy-a is the fastest, proxy-f the slowest.
+	for i, name := range []string{"proxy-a", "proxy-b", "proxy-c", "proxy-d", "proxy-e", "proxy-f"} {
+		rt.UpdateTTFB(key, testDomain, name, int64(50+10*i))
+	}
+	// A latency-only proxy with latency <= minTTFB so it survives the prune.
+	rt.UpdateLatency(key, testDomain, "proxy-nottfb", 20)
+
+	proxies := []string{"proxy-f", "proxy-e", "proxy-d", "proxy-c", "proxy-b", "proxy-a", "proxy-nottfb"}
+	ranked := rt.RankByScore(proxies, nil, key, testDomain)
+
+	if len(ranked) != MaxTTFBProxiesPerRank+1 {
+		t.Fatalf("expected %d proxies (%d TTFB + 1 latency), got %d: %v", MaxTTFBProxiesPerRank+1, MaxTTFBProxiesPerRank, len(ranked), ranked)
+	}
+	// All 6 configured TTFB slots survive, score-descending.
+	expected := []string{"proxy-a", "proxy-b", "proxy-c", "proxy-d", "proxy-e", "proxy-f", "proxy-nottfb"}
+	for i := range expected {
+		if ranked[i] != expected[i] {
+			t.Fatalf("ranked[%d]: expected %s, got %s (full: %v)", i, expected[i], ranked[i], ranked)
+		}
+	}
+}
+
+func TestProxyFailedCount(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	if got := rt.ProxyFailedCount(key, testDomain, "proxy-a"); got != 0 {
+		t.Fatalf("ProxyFailedCount on absent proxy = %v, want 0", got)
+	}
+
+	// MarkFailed only records on an existing row (a proxy that failed was
+	// being used, so its row already exists). Create it first.
+	rt.UpdateLatency(key, testDomain, "proxy-a", 100)
+	rt.MarkFailed(key, "proxy-a", testDomain, 0.4)
+	rt.MarkFailed(key, "proxy-a", testDomain, 0.8)
+	if got := rt.ProxyFailedCount(key, testDomain, "proxy-a"); math.Abs(got-1.2) > 0.001 {
+		t.Fatalf("ProxyFailedCount = %v, want 1.2", got)
+	}
+	if got := rt.ProxyFailedCount("ASN:other", testDomain, "proxy-a"); got != 0 {
+		t.Fatalf("ProxyFailedCount on other key = %v, want 0", got)
+	}
+}
+
+func TestSetBestProxyAndTCPProbed(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	rt.SetBestProxyAndTCPProbed(key, testDomain, "proxy-a")
+
+	if best, ok := rt.GetBestProxy(key, testDomain); !ok || best != "proxy-a" {
+		t.Fatalf("best = %q, %v; want proxy-a, true", best, ok)
+	}
+	if !rt.IsTCPProbed(key, testDomain) {
+		t.Fatal("tcpProbed should be true after SetBestProxyAndTCPProbed")
+	}
+}
+
+func TestTCPAndUDPBestAreIndependent(t *testing.T) {
+	rt := NewRouteTable(10)
+	key := "TARGET:example.com"
+
+	rt.SetBestProxyAndTCPProbed(key, testDomain, "tcp-proxy")
+	rt.SetUDPBestProxy(key, testDomain, "udp-proxy", true)
+
+	best, ok := rt.GetBestProxy(key, testDomain)
+	if !ok || best != "tcp-proxy" {
+		t.Fatalf("TCP best proxy = %q, %v; want tcp-proxy, true", best, ok)
+	}
+	if !rt.IsTCPProbed(key, testDomain) {
+		t.Fatal("UDP best update cleared TCP-probed state")
+	}
+	udpBest, ok := rt.GetUDPBestProxyIfFresh(key, testDomain, time.Minute)
+	if !ok || udpBest != "udp-proxy" {
+		t.Fatalf("UDP best proxy = %q, %v; want udp-proxy, true", udpBest, ok)
+	}
+
+	rt.SetUDPBestProxy("TARGET:new.example.com", "new.example.com", "udp-proxy", true)
+	if rt.IsTCPProbed("TARGET:new.example.com", "new.example.com") {
+		t.Fatal("UDP-only best update incorrectly marked TCP as probed")
+	}
+}
+
+func TestTableMetaTracksLiveRowsAfterLRUEviction(t *testing.T) {
+	rt := NewRouteTable(2)
+	rt.SetBestProxy("ASN:1", testDomain, "p1")
+	rt.SetBestProxy("ASN:2", testDomain, "p2")
+	rt.SetBestProxy("ASN:3", testDomain, "p3")
+
+	meta, dirty := rt.SnapshotAndClearTableMeta()
+	if !dirty {
+		t.Fatal("row membership changes did not dirty table metadata")
+	}
+	if len(meta.Rows) != 2 || meta.Rows[0] != "ASN:2" || meta.Rows[1] != "ASN:3" {
+		t.Fatalf("live row catalog = %v, want [ASN:2 ASN:3]", meta.Rows)
+	}
+	if _, dirty = rt.SnapshotAndClearTableMeta(); dirty {
+		t.Fatal("unchanged table metadata remained dirty after snapshot")
 	}
 }
 
@@ -312,13 +742,13 @@ func TestSnapshotIncludesScore(t *testing.T) {
 	key := "ASN:64512"
 	proxy := "proxy-a"
 
-	rt.UpdateLatency(key, proxy, 100)
-	rt.UpdateSpeed(key, proxy, 10485760)
-	rt.RefreshScores(key, []string{proxy})
+	rt.UpdateLatency(key, testDomain, proxy, 100)
+	rt.UpdateSpeed(key, testDomain, proxy, 10485760)
+	rt.RefreshScores(key, testDomain, []string{proxy})
 	snap := rt.Snapshot("test")
-	got := snap.Rows[0].Proxies[proxy].Attributes.Score
-	rec := snap.Rows[0].Proxies[proxy]
-	atom := 100.0/(math.Max(float64(rec.Attributes.Latency), 100.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.Score
+	rec := domainProxies(snap.Rows[0], testDomain)[proxy]
+	atom := 100.0/(math.Max(float64(rec.Attributes.Latency), 50.0)+math.Max(rec.Attributes.Jitter, 10.0)) + math.Log1p(rec.Attributes.Speed/1024.0/1024.0/0.5)
 	expected := atom // no per-proxy aggregation -> raw unblended score
 	if math.Abs(got-expected) > 0.000001 {
 		t.Fatalf("expected snapshot score %.6f, got %.6f", expected, got)
@@ -328,19 +758,88 @@ func TestSnapshotIncludesScore(t *testing.T) {
 func TestGetBestProxyIfFresh(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
-	rt.SetBestProxy(key, "proxy-a")
+	rt.SetBestProxy(key, testDomain, "proxy-a")
 
-	name, ok := rt.GetBestProxyIfFresh(key, 20*time.Second)
+	name, ok := rt.GetBestProxyIfFresh(key, testDomain, 20*time.Second)
 	if !ok || name != "proxy-a" {
 		t.Fatalf("expected fresh proxy-a, got %s ok=%v", name, ok)
 	}
 
 	rt.mu.Lock()
-	rt.rows[key].lastUsed = time.Now().Add(-21 * time.Second).Unix()
+	rt.rows[key].domainTable[testDomain].tcpEvaluatedAt = time.Now().Add(-21 * time.Second).Unix()
 	rt.mu.Unlock()
 
-	if name, ok := rt.GetBestProxyIfFresh(key, 20*time.Second); ok {
+	if name, ok := rt.GetBestProxyIfFresh(key, testDomain, 20*time.Second); ok {
 		t.Fatalf("expected stale best proxy to be unavailable, got %s", name)
+	}
+}
+
+func TestBestReuseDoesNotRefreshEvaluationTime(t *testing.T) {
+	rt := NewRouteTable(10)
+	key := "TARGET:example.com"
+	rt.SetBestProxyAndTCPProbed(key, testDomain, "tcp-proxy")
+	rt.SetUDPBestProxy(key, testDomain, "udp-proxy", true)
+
+	stale := time.Now().Add(-10 * time.Second).Unix()
+	rt.mu.Lock()
+	cell := rt.rows[key].domainTable[testDomain]
+	cell.tcpEvaluatedAt = stale
+	cell.udpEvaluatedAt = stale
+	rt.mu.Unlock()
+
+	rt.SetBestProxyAndTCPProbedPreserveEvaluation(key, testDomain, "tcp-proxy")
+	rt.SetUDPBestProxy(key, testDomain, "udp-proxy", false)
+	if _, ok := rt.GetBestProxyIfFresh(key, testDomain, 5*time.Second); ok {
+		t.Fatal("TCP best reuse refreshed its evaluation time")
+	}
+	if _, ok := rt.GetUDPBestProxyIfFresh(key, testDomain, 5*time.Second); ok {
+		t.Fatal("UDP best reuse refreshed its evaluation time")
+	}
+
+	rt.SetBestProxyAndTCPProbed(key, testDomain, "tcp-proxy")
+	rt.SetUDPBestProxy(key, testDomain, "udp-proxy", true)
+	if _, ok := rt.GetBestProxyIfFresh(key, testDomain, 5*time.Second); !ok {
+		t.Fatal("TCP re-evaluation did not refresh freshness")
+	}
+	if _, ok := rt.GetUDPBestProxyIfFresh(key, testDomain, 5*time.Second); !ok {
+		t.Fatal("UDP re-evaluation did not refresh freshness")
+	}
+}
+
+func TestLateExplorationCannotRestoreOldBest(t *testing.T) {
+	rt := NewRouteTable(10)
+	key := "TARGET:example.com"
+	rt.SetBestProxyAndTCPProbed(key, testDomain, "old-best")
+
+	// Two requests captured old-best. The first promotes a challenger while
+	// the second is still dialing; its late dial result must not restore it.
+	rt.SetTCPProbedPreserveEvaluation(key, testDomain)
+	if !rt.PromoteTCPBestIfCurrent(key, testDomain, "old-best", "new-best") {
+		t.Fatal("first challenger was not promoted")
+	}
+	rt.SetTCPProbedPreserveEvaluation(key, testDomain)
+	if best, _ := rt.GetBestProxy(key, testDomain); best != "new-best" {
+		t.Fatalf("late dial restored %q, want new-best", best)
+	}
+	if rt.PromoteTCPBestIfCurrent(key, testDomain, "old-best", "late-best") {
+		t.Fatal("late TTFB result replaced a newer best")
+	}
+	if best, _ := rt.GetBestProxy(key, testDomain); best != "new-best" {
+		t.Fatalf("late TTFB replaced best with %q", best)
+	}
+	if rt.PromoteTCPBestAfterFallback(key, testDomain, "old-best", "late-fallback") {
+		t.Fatal("late dial fallback replaced a newer best")
+	}
+
+	rt.MarkFailed(key, "new-best", testDomain, 1)
+	if _, ok := rt.GetBestProxy(key, testDomain); ok {
+		t.Fatal("failed best was not cleared")
+	}
+	if !rt.PromoteTCPBestAfterFallback(key, testDomain, "new-best", "working-fallback") {
+		t.Fatal("working fallback did not replace an empty best")
+	}
+	if best, _ := rt.GetBestProxy(key, testDomain); best != "working-fallback" {
+		t.Fatalf("best after failed incumbent = %q", best)
 	}
 }
 
@@ -348,14 +847,14 @@ func TestPreRankLatency(t *testing.T) {
 	rt := NewRouteTable(100)
 
 	// Build known latencies: proxy-a avg=50, proxy-b avg=30, proxy-c avg=80
-	rt.UpdateLatency("ASN:1", "proxy-a", 40)
-	rt.UpdateLatency("ASN:2", "proxy-a", 60)
-	rt.UpdateLatency("ASN:1", "proxy-b", 30)
-	rt.UpdateLatency("ASN:2", "proxy-b", 30)
-	rt.UpdateLatency("ASN:1", "proxy-c", 80)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 40)
+	rt.UpdateLatency("ASN:2", testDomain, "proxy-a", 60)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-b", 30)
+	rt.UpdateLatency("ASN:2", testDomain, "proxy-b", 30)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-c", 80)
 
 	proxies := []string{"proxy-a", "proxy-c", "proxy-b"}
-	ranked := rt.PreRankLatency(proxies, nil, "")
+	ranked := rt.PreRankLatency(proxies, nil, "", "")
 
 	// proxy-b (30) < proxy-a (50) < proxy-c (80)
 	expected := []string{"proxy-b", "proxy-a", "proxy-c"}
@@ -370,12 +869,12 @@ func TestPreRankStableSort(t *testing.T) {
 	rt := NewRouteTable(100)
 
 	// Same latency for all → preserves input order (stable sort)
-	rt.UpdateLatency("ASN:1", "proxy-a", 50)
-	rt.UpdateLatency("ASN:1", "proxy-b", 50)
-	rt.UpdateLatency("ASN:1", "proxy-c", 50)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 50)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-b", 50)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-c", 50)
 
 	proxies := []string{"proxy-c", "proxy-a", "proxy-b"}
-	ranked := rt.PreRankLatency(proxies, nil, "")
+	ranked := rt.PreRankLatency(proxies, nil, "", "")
 
 	// All same latency, stable sort keeps input order
 	for i := range proxies {
@@ -389,8 +888,8 @@ func TestPreRankWithHealthCheckFallback(t *testing.T) {
 	rt := NewRouteTable(100)
 
 	// proxy-d has no route table data, falls back to health check
-	rt.UpdateLatency("ASN:1", "proxy-a", 50)
-	rt.UpdateLatency("ASN:1", "proxy-b", 30)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 50)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-b", 30)
 
 	healthCheck := func(name string) uint16 {
 		if name == "proxy-d" {
@@ -400,7 +899,7 @@ func TestPreRankWithHealthCheckFallback(t *testing.T) {
 	}
 
 	proxies := []string{"proxy-a", "proxy-b", "proxy-d"}
-	ranked := rt.PreRankLatency(proxies, healthCheck, "")
+	ranked := rt.PreRankLatency(proxies, healthCheck, "", "")
 
 	// proxy-d (20 health) < proxy-b (30) < proxy-a (50)
 	expected := []string{"proxy-d", "proxy-b", "proxy-a"}
@@ -415,9 +914,9 @@ func TestPreRankWithHealthCheckFallback(t *testing.T) {
 func TestLRUEviction(t *testing.T) {
 	rt := NewRouteTable(3) // small max for testing
 
-	rt.SetBestProxy("ASN:1", "p1")
-	rt.SetBestProxy("ASN:2", "p2")
-	rt.SetBestProxy("ASN:3", "p3")
+	rt.SetBestProxy("ASN:1", testDomain, "p1")
+	rt.SetBestProxy("ASN:2", testDomain, "p2")
+	rt.SetBestProxy("ASN:3", testDomain, "p3")
 
 	snap := rt.Snapshot("test")
 	if snap.RowCount != 3 {
@@ -429,7 +928,7 @@ func TestLRUEviction(t *testing.T) {
 	rt.TouchRow("ASN:2")
 
 	// Add a 4th row, should evict ASN:3 (least recently used)
-	rt.SetBestProxy("ASN:4", "p4")
+	rt.SetBestProxy("ASN:4", testDomain, "p4")
 
 	snap = rt.Snapshot("test")
 	if snap.RowCount != 3 {
@@ -437,13 +936,13 @@ func TestLRUEviction(t *testing.T) {
 	}
 
 	// ASN:3 should be gone
-	if _, ok := rt.GetBestProxy("ASN:3"); ok {
+	if _, ok := rt.GetBestProxy("ASN:3", testDomain); ok {
 		t.Fatal("ASN:3 should have been evicted")
 	}
 
 	// ASN:1, ASN:2, ASN:4 should remain
 	for _, k := range []string{"ASN:1", "ASN:2", "ASN:4"} {
-		if _, ok := rt.GetBestProxy(k); !ok {
+		if _, ok := rt.GetBestProxy(k, testDomain); !ok {
 			t.Fatalf("%s should still be in table", k)
 		}
 	}
@@ -451,28 +950,28 @@ func TestLRUEviction(t *testing.T) {
 
 func TestSnapshotIsCopy(t *testing.T) {
 	rt := NewRouteTable(100)
-	rt.UpdateLatency("ASN:1", "proxy-a", 42)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 42)
 
 	snap := rt.Snapshot("test")
 	// Mutate snapshot
-	snap.Rows[0].Proxies["proxy-a"] = ProxyRecord{Name: "hacked"}
+	domainProxies(snap.Rows[0], testDomain)["proxy-a"] = ProxyRecord{Name: "hacked"}
 	// Original should be unchanged
 	snap2 := rt.Snapshot("test")
-	if snap2.Rows[0].Proxies["proxy-a"].Name != "proxy-a" {
+	if domainProxies(snap2.Rows[0], testDomain)["proxy-a"].Name != "proxy-a" {
 		t.Fatal("snapshot must be a deep copy — mutation should not affect original")
 	}
 }
 
 func TestRemoveProxy(t *testing.T) {
 	rt := NewRouteTable(100)
-	rt.UpdateLatency("ASN:1", "proxy-a", 42)
-	rt.UpdateLatency("ASN:1", "proxy-b", 30)
-	rt.SetBestProxy("ASN:1", "proxy-a")
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 42)
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-b", 30)
+	rt.SetBestProxy("ASN:1", testDomain, "proxy-a")
 
 	rt.RemoveProxy("proxy-a")
 
 	snap := rt.Snapshot("test")
-	proxies := snap.Rows[0].Proxies
+	proxies := domainProxies(snap.Rows[0], testDomain)
 	if _, ok := proxies["proxy-a"]; ok {
 		t.Fatal("proxy-a should be removed")
 	}
@@ -480,20 +979,90 @@ func TestRemoveProxy(t *testing.T) {
 		t.Fatal("proxy-b should remain")
 	}
 	// best proxy should be cleared since it was removed
-	if bp, _ := rt.GetBestProxy("ASN:1"); bp != "" {
+	if bp, _ := rt.GetBestProxy("ASN:1", testDomain); bp != "" {
 		t.Fatalf("best proxy should be empty after removal, got %s", bp)
+	}
+}
+
+func TestProxyCellLRUEvictionProtectsBest(t *testing.T) {
+	rt := NewRouteTable(10)
+	key, domain := "ASN:64512", "example.com"
+	for i := 0; i < MaxProxyCellsPerDomain; i++ {
+		rt.UpdateLatency(key, domain, fmt.Sprintf("proxy-%02d", i), int64(10+i))
+	}
+	rt.SetBestProxyAndTCPProbed(key, domain, "proxy-00")
+	rt.SetUDPBestProxy(key, domain, "proxy-01", true)
+
+	// All cells are dirty, so the hard-bound fallback must evict the oldest
+	// non-best observation (proxy-02), not either protected best.
+	rt.UpdateLatency(key, domain, "proxy-new", 5)
+
+	proxies := domainProxies(rt.Snapshot("test").Rows[0], domain)
+	if len(proxies) != MaxProxyCellsPerDomain {
+		t.Fatalf("proxy cells = %d, want %d", len(proxies), MaxProxyCellsPerDomain)
+	}
+	for _, protected := range []string{"proxy-00", "proxy-01"} {
+		if _, ok := proxies[protected]; !ok {
+			t.Fatalf("protected best %s was evicted", protected)
+		}
+	}
+	if _, ok := proxies["proxy-02"]; ok {
+		t.Fatal("oldest non-best proxy-02 should have been evicted")
+	}
+	if _, ok := proxies["proxy-new"]; !ok {
+		t.Fatal("new proxy cell was not inserted")
+	}
+}
+
+func TestProxyCellLRUTouchMovesToBack(t *testing.T) {
+	rt := NewRouteTable(10)
+	key, domain := "ASN:64512", "example.com"
+	for i := 0; i < MaxProxyCellsPerDomain; i++ {
+		rt.UpdateLatency(key, domain, fmt.Sprintf("proxy-%02d", i), int64(10+i))
+	}
+	// Clear dirty flags so clean-cell preference follows pure observation LRU.
+	rt.SnapshotAndClearDirty()
+	rt.UpdateLatency(key, domain, "proxy-00", 20) // touch oldest
+	rt.UpdateLatency(key, domain, "proxy-new", 5)
+
+	proxies := domainProxies(rt.Snapshot("test").Rows[0], domain)
+	if _, ok := proxies["proxy-00"]; !ok {
+		t.Fatal("recently observed proxy-00 was evicted")
+	}
+	if _, ok := proxies["proxy-01"]; ok {
+		t.Fatal("least-recent clean proxy-01 should have been evicted")
+	}
+}
+
+func TestExploreCountsBoundedLRU(t *testing.T) {
+	rt := NewRouteTable(10)
+	for i := 0; i <= MaxExploreRoutes; i++ {
+		domain := fmt.Sprintf("family-%d.example", i)
+		rt.ShouldExplore("", domain, 2)
+	}
+
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if len(rt.exploreCounts) != MaxExploreRoutes {
+		t.Fatalf("exploreCounts = %d, want %d", len(rt.exploreCounts), MaxExploreRoutes)
+	}
+	if _, ok := rt.exploreCounts["family-0.example"]; ok {
+		t.Fatal("least-recent exploration route was not evicted")
+	}
+	if _, ok := rt.exploreCounts[fmt.Sprintf("family-%d.example", MaxExploreRoutes)]; !ok {
+		t.Fatal("newest exploration route is missing")
 	}
 }
 
 func TestMarkFailed(t *testing.T) {
 	rt := NewRouteTable(100)
-	rt.UpdateLatency("ASN:1", "proxy-a", 42)
-	rt.SetBestProxy("ASN:1", "proxy-a")
+	rt.UpdateLatency("ASN:1", testDomain, "proxy-a", 42)
+	rt.SetBestProxy("ASN:1", testDomain, "proxy-a")
 
-	rt.MarkFailed("ASN:1", "proxy-a", 1.0)
+	rt.MarkFailed("ASN:1", "proxy-a", testDomain, 1.0)
 
 	// Best proxy should be cleared
-	if bp, _ := rt.GetBestProxy("ASN:1"); bp != "" {
+	if bp, _ := rt.GetBestProxy("ASN:1", testDomain); bp != "" {
 		t.Fatalf("best proxy should be empty after mark-failed, got %s", bp)
 	}
 }
@@ -507,17 +1076,17 @@ func TestConcurrentSafety(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			key := "ASN:" + string(rune('0'+id%10))
-			rt.UpdateLatency(key, "proxy-a", int64(id))
-			rt.UpdatePkgLoss(key, "proxy-a", 0.01)
-			rt.UpdateSpeed(key, "proxy-a", 1000)
-			rt.IncrementUseCount(key, "proxy-a")
-			rt.SetBestProxy(key, "proxy-a")
-			rt.GetBestProxy(key)
-			rt.IsTCPProbed(key)
-			rt.PreRankLatency([]string{"proxy-a", "proxy-b"}, nil, "")
-			rt.RefreshScores(key, []string{"proxy-a", "proxy-b"})
-			rt.RankByScore([]string{"proxy-a", "proxy-b"}, nil, key)
-			rt.GetBestProxyIfFresh(key, time.Second)
+			rt.UpdateLatency(key, testDomain, "proxy-a", int64(id))
+			rt.UpdatePkgLoss(key, testDomain, "proxy-a", 0.01)
+			rt.UpdateSpeed(key, testDomain, "proxy-a", 1000)
+			rt.IncrementUseCount(key, testDomain, "proxy-a")
+			rt.SetBestProxy(key, testDomain, "proxy-a")
+			rt.GetBestProxy(key, testDomain)
+			rt.IsTCPProbed(key, testDomain)
+			rt.PreRankLatency([]string{"proxy-a", "proxy-b"}, nil, "", "")
+			rt.RefreshScores(key, testDomain, []string{"proxy-a", "proxy-b"})
+			rt.RankByScore([]string{"proxy-a", "proxy-b"}, nil, key, testDomain)
+			rt.GetBestProxyIfFresh(key, testDomain, time.Second)
 			rt.Snapshot("test")
 		}(i)
 	}
@@ -528,9 +1097,9 @@ func TestConcurrentSafety(t *testing.T) {
 
 func TestSnapshotRowOrder(t *testing.T) {
 	rt := NewRouteTable(100)
-	rt.SetBestProxy("ASN:1", "p1")
-	rt.SetBestProxy("ASN:3", "p3")
-	rt.SetBestProxy("ASN:2", "p2")
+	rt.SetBestProxy("ASN:1", testDomain, "p1")
+	rt.SetBestProxy("ASN:3", testDomain, "p3")
+	rt.SetBestProxy("ASN:2", testDomain, "p2")
 	time.Sleep(time.Second) // ensure distinct timestamp
 	rt.TouchRow("ASN:2")    // make ASN:2 most recent
 
@@ -547,9 +1116,9 @@ func TestPerMetricHasSampleIndependent(t *testing.T) {
 	proxy := "proxy-a"
 
 	// Update only latency — verify only latency flag is set
-	rt.UpdateLatency(key, proxy, 100)
+	rt.UpdateLatency(key, testDomain, proxy, 100)
 	rt.mu.RLock()
-	cell := rt.rows[key].proxies[proxy]
+	cell := rt.rows[key].domainTable[testDomain].proxies[proxy]
 	hasLat := cell.HasLatencySample
 	hasSpd := cell.HasSpeedSample
 	hasLoss := cell.HasPkgLossSample
@@ -565,22 +1134,22 @@ func TestPerMetricHasSampleIndependent(t *testing.T) {
 	}
 
 	// Update speed — verify both latency and speed flags now set
-	rt.UpdateSpeed(key, proxy, 10485760)
+	rt.UpdateSpeed(key, testDomain, proxy, 10485760)
 	rt.mu.RLock()
-	cell = rt.rows[key].proxies[proxy]
+	cell = rt.rows[key].domainTable[testDomain].proxies[proxy]
 	hasSpd = cell.HasSpeedSample
 	rt.mu.RUnlock()
 	if !hasSpd {
 		t.Fatal("HasSpeedSample should be true after UpdateSpeed")
 	}
-	if !rt.rows[key].proxies[proxy].HasLatencySample {
+	if !rt.rows[key].domainTable[testDomain].proxies[proxy].HasLatencySample {
 		t.Fatal("HasLatencySample should still be true")
 	}
 
 	// Update pkg_loss — verify all three flags now set
-	rt.UpdatePkgLoss(key, proxy, 0.01)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.01)
 	rt.mu.RLock()
-	cell = rt.rows[key].proxies[proxy]
+	cell = rt.rows[key].domainTable[testDomain].proxies[proxy]
 	hasLoss = cell.HasPkgLossSample
 	rt.mu.RUnlock()
 	if !hasLoss {
@@ -594,12 +1163,12 @@ func TestEMASpeedIsCorrectWithPriorLatencySample(t *testing.T) {
 	proxy := "proxy-a"
 
 	// Latency sample first (sets HasLatencySample, not HasSpeedSample)
-	rt.UpdateLatency(key, proxy, 100)
+	rt.UpdateLatency(key, testDomain, proxy, 100)
 
 	// Speed sample second — must be 100% of real speed, NOT 25% (EMA with 0)
-	rt.UpdateSpeed(key, proxy, 10485760)
+	rt.UpdateSpeed(key, testDomain, proxy, 10485760)
 	snap := rt.Snapshot("test")
-	got := snap.Rows[0].Proxies[proxy].Attributes.Speed
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.Speed
 	if got != 10485760 {
 		t.Fatalf("expected first speed=10485760 (100%% of value), got %.0f (%.1f%%)",
 			got, got/10485760*100)
@@ -612,12 +1181,12 @@ func TestEMAPkgLossIsCorrectWithPriorLatencySample(t *testing.T) {
 	proxy := "proxy-a"
 
 	// Latency sample first (sets HasLatencySample, not HasPkgLossSample)
-	rt.UpdateLatency(key, proxy, 100)
+	rt.UpdateLatency(key, testDomain, proxy, 100)
 
 	// PkgLoss sample second — must be 100% of real value, NOT 25%
-	rt.UpdatePkgLoss(key, proxy, 0.08)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.08)
 	snap := rt.Snapshot("test")
-	got := snap.Rows[0].Proxies[proxy].Attributes.PkgLoss
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.PkgLoss
 	if got != 0.08 {
 		t.Fatalf("expected first pkg_loss=0.08 (100%% of value), got %.4f", got)
 	}
@@ -629,26 +1198,26 @@ func TestPkgLossZeroUpdatesEMA(t *testing.T) {
 	proxy := "proxy-a"
 
 	// Record initial loss
-	rt.UpdatePkgLoss(key, proxy, 0.1)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.1)
 	snap := rt.Snapshot("test")
-	if snap.Rows[0].Proxies[proxy].Attributes.PkgLoss != 0.1 {
+	if domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.PkgLoss != 0.1 {
 		t.Fatal("first pkg_loss should be 0.1")
 	}
 
 	// Update with 0% loss — EMA should decay toward 0
-	rt.UpdatePkgLoss(key, proxy, 0.0)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.0)
 	snap = rt.Snapshot("test")
 	expected := 0.1*3.0/4.0 + 0.0/4.0 // = 0.075
-	got := snap.Rows[0].Proxies[proxy].Attributes.PkgLoss
+	got := domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.PkgLoss
 	if got < expected-0.001 || got > expected+0.001 {
 		t.Fatalf("expected pkg_loss=%.4f after 0%% update, got %.4f", expected, got)
 	}
 
 	// Second 0% update — should decay further
-	rt.UpdatePkgLoss(key, proxy, 0.0)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.0)
 	snap = rt.Snapshot("test")
 	expected = expected*3.0/4.0 + 0.0/4.0 // = 0.05625
-	got = snap.Rows[0].Proxies[proxy].Attributes.PkgLoss
+	got = domainProxies(snap.Rows[0], testDomain)[proxy].Attributes.PkgLoss
 	if got < expected-0.001 || got > expected+0.001 {
 		t.Fatalf("expected pkg_loss=%.4f after second 0%% update, got %.4f", expected, got)
 	}
@@ -671,10 +1240,10 @@ func TestBackwardCompatPersistedCell(t *testing.T) {
 		// (zero values from old-format JSON)
 	}
 
-	rt.RestoreRow(key, proxy, pc)
+	rt.RestoreRow(key, testDomain, proxy, pc)
 
 	rt.mu.RLock()
-	cell := rt.rows[key].proxies[proxy]
+	cell := rt.rows[key].domainTable[testDomain].proxies[proxy]
 	hasLat := cell.HasLatencySample
 	hasLoss := cell.HasPkgLossSample
 	hasSpd := cell.HasSpeedSample
@@ -699,18 +1268,18 @@ func TestIntegrationLatencySpeedLossFromSingleConnection(t *testing.T) {
 	// Simulate a full connection lifecycle:
 	// 1. dialAndWrap / probeBatch writes connectTime once
 	connectTime := int64(120)
-	rt.UpdateLatency(key, proxy, connectTime)
+	rt.UpdateLatency(key, testDomain, proxy, connectTime)
 
 	// 2. Speed sample from tracker (written on close)
 	speed := 10485760.0 // 10 MiB/s
-	rt.UpdateSpeed(key, proxy, speed)
+	rt.UpdateSpeed(key, testDomain, proxy, speed)
 
 	// 3. Loss rate from TCP stats (written on close, 0% loss — should still update)
-	rt.UpdatePkgLoss(key, proxy, 0.0)
+	rt.UpdatePkgLoss(key, testDomain, proxy, 0.0)
 
 	// Verify all per-metric flags are set independently
 	rt.mu.RLock()
-	cell := rt.rows[key].proxies[proxy]
+	cell := rt.rows[key].domainTable[testDomain].proxies[proxy]
 	if !cell.HasLatencySample {
 		t.Fatal("HasLatencySample should be true after connectTime write")
 	}
@@ -724,7 +1293,7 @@ func TestIntegrationLatencySpeedLossFromSingleConnection(t *testing.T) {
 
 	// Verify final values
 	snap := rt.Snapshot("test")
-	rec := snap.Rows[0].Proxies[proxy]
+	rec := domainProxies(snap.Rows[0], testDomain)[proxy]
 
 	// Speed: first sample, no prior = raw value
 	if rec.Attributes.Speed != speed {
@@ -751,9 +1320,9 @@ func TestRowMetaDirtyTracking(t *testing.T) {
 		t.Fatalf("expected no dirty rows on fresh table, got %d", len(snap))
 	}
 
-	// SetBestProxy marks the row dirty and snapshots the best proxy.
-	rt.SetBestProxy(key, "proxy-a")
-	rt.SetTCPProbed(key)
+	// SetBestProxy marks the row dirty and snapshots the per-domain best proxy.
+	rt.SetBestProxy(key, testDomain, "proxy-a")
+	rt.SetTCPProbed(key, testDomain)
 	snap := rt.SnapshotAndClearDirtyRows()
 	if len(snap) != 1 {
 		t.Fatalf("expected 1 dirty row, got %d", len(snap))
@@ -762,10 +1331,14 @@ func TestRowMetaDirtyTracking(t *testing.T) {
 	if !ok {
 		t.Fatalf("dirty snapshot missing key %q", key)
 	}
-	if pr.BestProxy != "proxy-a" {
-		t.Fatalf("BestProxy = %q, want %q", pr.BestProxy, "proxy-a")
+	pd, ok := pr.Domains[testDomain]
+	if !ok {
+		t.Fatalf("dirty snapshot missing domain %q", testDomain)
 	}
-	if !pr.TCPProbed {
+	if pd.BestProxy != "proxy-a" {
+		t.Fatalf("BestProxy = %q, want %q", pd.BestProxy, "proxy-a")
+	}
+	if !pd.TCPProbed {
 		t.Fatal("TCPProbed should be true")
 	}
 
@@ -775,16 +1348,20 @@ func TestRowMetaDirtyTracking(t *testing.T) {
 	}
 
 	// MarkFailed clears the routing state and re-marks the row dirty.
-	rt.MarkFailed(key, "proxy-a", 1.0)
+	rt.MarkFailed(key, "proxy-a", testDomain, 1.0)
 	snap = rt.SnapshotAndClearDirtyRows()
 	if len(snap) != 1 {
 		t.Fatalf("expected 1 dirty row after MarkFailed, got %d", len(snap))
 	}
 	pr = snap[key]
-	if pr.BestProxy != "" {
-		t.Fatalf("BestProxy should be cleared by MarkFailed, got %q", pr.BestProxy)
+	pd, ok = pr.Domains[testDomain]
+	if !ok {
+		t.Fatalf("dirty snapshot missing domain %q after MarkFailed", testDomain)
 	}
-	if pr.TCPProbed {
+	if pd.BestProxy != "" {
+		t.Fatalf("BestProxy should be cleared by MarkFailed, got %q", pd.BestProxy)
+	}
+	if pd.TCPProbed {
 		t.Fatal("TCPProbed should be cleared by MarkFailed")
 	}
 }
@@ -794,23 +1371,27 @@ func TestRestoreRowMetaRoundtrip(t *testing.T) {
 	key := "ASN:64512"
 
 	// A fresh restore must be clean and immediately serve the fast path.
-	rt.RestoreRowMeta(key, PersistedRow{BestProxy: "proxy-a", TCPProbed: true})
+	rt.RestoreRowMeta(key, PersistedRow{Domains: map[string]PersistedDomain{
+		testDomain: {BestProxy: "proxy-a", TCPProbed: true},
+	}})
 	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
 		t.Fatalf("restored row should be clean, got %d dirty", len(snap))
 	}
-	if best, ok := rt.GetBestProxy(key); !ok || best != "proxy-a" {
+	if best, ok := rt.GetBestProxy(key, testDomain); !ok || best != "proxy-a" {
 		t.Fatalf("GetBestProxy = %q, %v; want proxy-a, true", best, ok)
 	}
-	if !rt.IsTCPProbed(key) {
+	if !rt.IsTCPProbed(key, testDomain) {
 		t.Fatal("IsTCPProbed should be true after restore")
 	}
 
 	// Restoring again with different state updates in place and stays clean.
-	rt.RestoreRowMeta(key, PersistedRow{BestProxy: "proxy-b", TCPProbed: false})
-	if best, ok := rt.GetBestProxy(key); !ok || best != "proxy-b" {
+	rt.RestoreRowMeta(key, PersistedRow{Domains: map[string]PersistedDomain{
+		testDomain: {BestProxy: "proxy-b", TCPProbed: false},
+	}})
+	if best, ok := rt.GetBestProxy(key, testDomain); !ok || best != "proxy-b" {
 		t.Fatalf("GetBestProxy after second restore = %q, %v; want proxy-b, true", best, ok)
 	}
-	if rt.IsTCPProbed(key) {
+	if rt.IsTCPProbed(key, testDomain) {
 		t.Fatal("IsTCPProbed should be false after second restore")
 	}
 	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
@@ -828,8 +1409,8 @@ func TestRowMetaRemoveProxyClearsBest(t *testing.T) {
 	rt := NewRouteTable(100)
 	key := "ASN:64512"
 
-	rt.SetBestProxy(key, "proxy-a")
-	rt.SetTCPProbed(key)
+	rt.SetBestProxy(key, testDomain, "proxy-a")
+	rt.SetTCPProbed(key, testDomain)
 
 	rt.RemoveProxy("proxy-a")
 	snap := rt.SnapshotAndClearDirtyRows()
@@ -837,18 +1418,240 @@ func TestRowMetaRemoveProxyClearsBest(t *testing.T) {
 		t.Fatalf("expected 1 dirty row after RemoveProxy, got %d", len(snap))
 	}
 	pr := snap[key]
-	if pr.BestProxy != "" {
-		t.Fatalf("BestProxy should be cleared by RemoveProxy, got %q", pr.BestProxy)
+	pd := pr.Domains[testDomain]
+	if pd.BestProxy != "" {
+		t.Fatalf("BestProxy should be cleared by RemoveProxy, got %q", pd.BestProxy)
 	}
-	if pr.TCPProbed {
+	if pd.TCPProbed {
 		t.Fatal("TCPProbed should be cleared by RemoveProxy")
 	}
 
 	// Removing a proxy that was never best must not mark the row dirty.
-	rt.SetBestProxy(key, "proxy-b")
+	rt.SetBestProxy(key, testDomain, "proxy-b")
 	rt.SnapshotAndClearDirtyRows()
 	rt.RemoveProxy("proxy-c")
 	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
 		t.Fatalf("RemoveProxy of non-best proxy marked row dirty")
+	}
+}
+
+func TestPerDomainBestIndependent(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:13335"
+
+	// Two domains under the same ASN row keep independent best proxies.
+	rt.SetBestProxy(key, "site-a.example.com", "proxy-a")
+	rt.SetBestProxy(key, "site-b.example.com", "proxy-b")
+
+	if best, _ := rt.GetBestProxy(key, "site-a.example.com"); best != "proxy-a" {
+		t.Fatalf("site-a best = %q, want proxy-a", best)
+	}
+	if best, _ := rt.GetBestProxy(key, "site-b.example.com"); best != "proxy-b" {
+		t.Fatalf("site-b best = %q, want proxy-b", best)
+	}
+
+	// Marking proxy-a failed on site-a must only clear site-a, leaving site-b
+	// (which still points at proxy-a) intact.
+	rt.MarkFailed(key, "proxy-a", "site-a.example.com", 1.0)
+	if _, ok := rt.GetBestProxy(key, "site-a.example.com"); ok {
+		t.Fatal("site-a best should be cleared after proxy-a fails")
+	}
+	if best, _ := rt.GetBestProxy(key, "site-b.example.com"); best != "proxy-b" {
+		t.Fatalf("site-b best = %q after proxy-a failure, want proxy-b", best)
+	}
+}
+
+func TestMarkFailedClearsOnlyFailingDomain(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:13335"
+
+	// Two domains point at proxy-a, one at proxy-b.
+	rt.SetBestProxy(key, "site-a.example.com", "proxy-a")
+	rt.SetBestProxy(key, "site-b.example.com", "proxy-a")
+	rt.SetBestProxy(key, "site-c.example.com", "proxy-b")
+
+	// A failure on site-a must clear only site-a.  site-b still points at
+	// proxy-a (it did not observe the failure), and site-c is untouched.
+	rt.MarkFailed(key, "proxy-a", "site-a.example.com", 1.0)
+
+	if _, ok := rt.GetBestProxy(key, "site-a.example.com"); ok {
+		t.Fatal("site-a should be cleared")
+	}
+	if best, _ := rt.GetBestProxy(key, "site-b.example.com"); best != "proxy-a" {
+		t.Fatalf("site-b best = %q, want proxy-a (only site-a failed)", best)
+	}
+	if best, _ := rt.GetBestProxy(key, "site-c.example.com"); best != "proxy-b" {
+		t.Fatalf("site-c best = %q, want proxy-b", best)
+	}
+
+	// The failure penalty is domain-scoped: failedCount advances only on the
+	// domain that actually observed the failure (site-a), not on sibling
+	// domains sharing the same ASN row (site-b), since proxy quality metrics
+	// now live per domain rather than per row.
+	if fcA := rt.ProxyFailedCount(key, "site-a.example.com", "proxy-a"); fcA != 1.0 {
+		t.Fatalf("site-a proxy-a failedCount = %v, want 1.0", fcA)
+	}
+	if fcB := rt.ProxyFailedCount(key, "site-b.example.com", "proxy-a"); fcB != 0 {
+		t.Fatalf("site-b proxy-a failedCount = %v, want 0 (unaffected by site-a's failure)", fcB)
+	}
+}
+
+func TestDomainTableLRUEviction(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+
+	// Fill the domain table to capacity (normal ASN row).
+	for i := 0; i < MaxDomainsPerNormalASRow; i++ {
+		rt.SetBestProxy(key, fmt.Sprintf("domain-%d.example.com", i), "proxy-a")
+	}
+
+	rt.mu.RLock()
+	count := len(rt.rows[key].domainTable)
+	rt.mu.RUnlock()
+	if count != MaxDomainsPerNormalASRow {
+		t.Fatalf("expected %d domains, got %d", MaxDomainsPerNormalASRow, count)
+	}
+
+	// The first domain (least recently used) should be evicted on overflow.
+	rt.SetBestProxy(key, "overflow.example.com", "proxy-b")
+
+	rt.mu.RLock()
+	_, firstGone := rt.rows[key].domainTable["domain-0.example.com"]
+	_, overflowPresent := rt.rows[key].domainTable["overflow.example.com"]
+	count = len(rt.rows[key].domainTable)
+	rt.mu.RUnlock()
+
+	if firstGone {
+		t.Fatal("domain-0 should have been evicted (least recently used)")
+	}
+	if !overflowPresent {
+		t.Fatal("overflow domain should be present")
+	}
+	if count != MaxDomainsPerNormalASRow {
+		t.Fatalf("expected %d domains after overflow, got %d", MaxDomainsPerNormalASRow, count)
+	}
+}
+
+func TestDomainTableCDNASLargerCapacity(t *testing.T) {
+	rt := NewRouteTable(100)
+
+	// A CDN ASN row (Cloudflare) gets MaxDomainsPerCDNASRow, not the smaller
+	// normal-ASN limit.
+	cdnKey := "ASN:13335 Cloudflare"
+	for i := 0; i < MaxDomainsPerCDNASRow; i++ {
+		rt.SetBestProxy(cdnKey, fmt.Sprintf("site-%d.example.com", i), "proxy-a")
+	}
+	rt.mu.RLock()
+	cdnCount := len(rt.rows[cdnKey].domainTable)
+	rt.mu.RUnlock()
+	if cdnCount != MaxDomainsPerCDNASRow {
+		t.Fatalf("CDN ASN row expected %d domains, got %d", MaxDomainsPerCDNASRow, cdnCount)
+	}
+
+	// A normal ASN row still caps at MaxDomainsPerNormalASRow.
+	normalKey := "ASN:64512"
+	for i := 0; i < MaxDomainsPerCDNASRow; i++ {
+		rt.SetBestProxy(normalKey, fmt.Sprintf("site-%d.example.com", i), "proxy-a")
+	}
+	rt.mu.RLock()
+	normalCount := len(rt.rows[normalKey].domainTable)
+	rt.mu.RUnlock()
+	if normalCount != MaxDomainsPerNormalASRow {
+		t.Fatalf("normal ASN row expected %d domains, got %d", MaxDomainsPerNormalASRow, normalCount)
+	}
+}
+
+func TestMaxDomainsForRow(t *testing.T) {
+	cases := []struct {
+		key  string
+		want int
+	}{
+		{"ASN:13335 Cloudflare", MaxDomainsPerCDNASRow},
+		{"ASN:13335", MaxDomainsPerCDNASRow},
+		{"ASN:64512 Foo Corp", MaxDomainsPerNormalASRow},
+		{"ASN:64512", MaxDomainsPerNormalASRow},
+		{"TARGET:example.com", MaxDomainsPerNormalASRow},
+		{"", MaxDomainsPerNormalASRow},
+	}
+	for _, tc := range cases {
+		if got := maxDomainsForRow(tc.key); got != tc.want {
+			t.Fatalf("maxDomainsForRow(%q) = %d, want %d", tc.key, got, tc.want)
+		}
+	}
+}
+
+func TestRestoreRowMetaLegacyTargetMigration(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "TARGET:example.com"
+
+	// Legacy persisted rows carried row-level BestProxy/TCPProbed with no
+	// domain map.  A TARGET row can reconstruct its domain from the key.
+	rt.RestoreRowMeta(key, PersistedRow{BestProxy: "proxy-a", TCPProbed: true})
+
+	if best, ok := rt.GetBestProxy(key, "example.com"); !ok || best != "proxy-a" {
+		t.Fatalf("legacy TARGET migration GetBestProxy = %q, %v; want proxy-a, true", best, ok)
+	}
+	if !rt.IsTCPProbed(key, "example.com") {
+		t.Fatal("legacy TARGET migration should restore tcpProbed")
+	}
+	if snap := rt.SnapshotAndClearDirtyRows(); len(snap) != 0 {
+		t.Fatalf("legacy restore should be clean, got %d dirty", len(snap))
+	}
+}
+
+func TestRestoreRowMetaLegacyASNDropped(t *testing.T) {
+	rt := NewRouteTable(100)
+	key := "ASN:13335"
+
+	// Legacy ASN rows cannot reconstruct a domain from the key, so their old
+	// row-level best is deliberately dropped and re-learned per-domain.
+	rt.RestoreRowMeta(key, PersistedRow{BestProxy: "proxy-a", TCPProbed: true})
+
+	if _, ok := rt.GetBestProxy(key, "example.com"); ok {
+		t.Fatal("legacy ASN best should be dropped (no domain to map to)")
+	}
+	if rt.IsTCPProbed(key, "example.com") {
+		t.Fatal("legacy ASN tcpProbed should be dropped")
+	}
+}
+
+func TestRestoreRowMetaIgnoresLegacyConnectionSize(t *testing.T) {
+	const legacy = `{"domains":{"example.com":{"best_proxy":"proxy-a","udp_best_proxy":"proxy-b","tcp_probed":true,"conn_size":1,"has_conn_size_sample":true}}}`
+	var row PersistedRow
+	if err := json.Unmarshal([]byte(legacy), &row); err != nil {
+		t.Fatal(err)
+	}
+	rt := NewRouteTable(100)
+	key := "ASN:64512"
+	rt.RestoreRowMeta(key, row)
+	if best, ok := rt.GetBestProxy(key, testDomain); !ok || best != "proxy-a" {
+		t.Fatalf("legacy TCP best lost: %q, %v", best, ok)
+	}
+	if !rt.IsTCPProbed(key, testDomain) {
+		t.Fatal("legacy probe state lost")
+	}
+	rt.UpdateLatency(key, testDomain, "proxy-a", 100)
+	rt.UpdateLatency(key, testDomain, "proxy-c", 200)
+	rt.UpdateSpeed(key, testDomain, "proxy-c", 10485760)
+	ranked := rt.RankByScore([]string{"proxy-a", "proxy-c"}, nil, key, testDomain)
+	if ranked[0] != "proxy-c" {
+		t.Fatalf("legacy small connection must not suppress speed: %v", ranked)
+	}
+	if best, ok := rt.GetUDPBestProxyIfFresh(key, testDomain, time.Minute); !ok || best != "proxy-b" {
+		t.Fatalf("legacy UDP best lost: %q, %v", best, ok)
+	}
+	rt.SetBestProxy(key, testDomain, "proxy-c")
+	encoded, err := json.Marshal(rt.SnapshotAndClearDirtyRows()[key])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"conn_size", "has_conn_size_sample"} {
+		if _, ok := decoded["domains"][testDomain][field]; ok {
+			t.Fatalf("obsolete field persisted: %s", field)
+		}
 	}
 }

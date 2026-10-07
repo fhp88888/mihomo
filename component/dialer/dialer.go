@@ -37,6 +37,38 @@ func GetTcpConcurrent() bool {
 	return tcpConcurrent.Load()
 }
 
+// connTimerKey is the context key carrying a *ConnTimer.
+type connTimerKey struct{}
+
+// ConnTimer records the duration of the raw TCP connect performed by the
+// dialer.  It is carried through the dial context so a caller up the stack
+// (e.g. the smart routing layer) can measure how long connecting to the proxy
+// server took, independent of any protocol handshake or the proxy's own
+// connection to the target.
+type ConnTimer struct {
+	d atomic.Int64 // nanoseconds
+}
+
+// Duration returns the recorded TCP connect duration (0 if none was recorded).
+func (t *ConnTimer) Duration() time.Duration {
+	return time.Duration(t.d.Load())
+}
+
+// WithConnTimer returns a context carrying a fresh ConnTimer and the timer
+// itself.  The dialer writes the TCP connect duration into the timer when it
+// establishes a connection.
+func WithConnTimer(ctx context.Context) (context.Context, *ConnTimer) {
+	t := &ConnTimer{}
+	return context.WithValue(ctx, connTimerKey{}, t), t
+}
+
+func connTimerFromContext(ctx context.Context) *ConnTimer {
+	if t, ok := ctx.Value(connTimerKey{}).(*ConnTimer); ok {
+		return t
+	}
+	return nil
+}
+
 func DialContext(ctx context.Context, network, address string, options ...Option) (net.Conn, error) {
 	opt := applyOptions(options...)
 
@@ -120,7 +152,16 @@ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.
 	return lc.ListenPacket(ctx, network, address)
 }
 
-func dialContext(ctx context.Context, network string, destination netip.Addr, port string, opt option) (net.Conn, error) {
+func dialContext(ctx context.Context, network string, destination netip.Addr, port string, opt option) (conn net.Conn, err error) {
+	if timer := connTimerFromContext(ctx); timer != nil {
+		start := time.Now()
+		defer func() {
+			if err == nil && conn != nil {
+				timer.d.Store(int64(time.Since(start)))
+			}
+		}()
+	}
+
 	var address string
 	destination, port = resolver.LookupIP4P(destination, port)
 	address = net.JoinHostPort(destination.String(), port)

@@ -27,7 +27,7 @@ func GetSmartStore() *smart.Store {
 		})
 
 		if err != nil {
-			log.Warnln("[CacheFile] write cache to %s failed: %s", c.DB.Path(), err.Error())
+			log.Warnln("[Smart] write cache to %s failed: %s", c.DB.Path(), err.Error())
 			smartStore = smart.NewStore(nil)
 			return
 		}
