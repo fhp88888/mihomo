@@ -752,7 +752,7 @@ func (s *Smart) getASNCode(metadata *C.Metadata) string {
 				metadata.DstIPASN = "0"
 				return ""
 			}
-			log.Debugln("[Smart] DNS %s --> %s", metadata.Host, ip.String())
+			// log.Debugln("[Smart] DNS %s --> %s", metadata.Host, ip.String())
 			if !ip.IsValid() {
 				metadata.DstIPASN = "0"
 				return ""

@@ -134,11 +134,11 @@ func (s *Smart) checkHostStatus() {
 				s.applyNodeAnswer(metadata, it.nodeName, verdict)
 				switch verdict.Action {
 				case smart.VerdictReachable:
-					log.Debugln("[Smart] Recheck Group: [%s] - Node: [%s] - Host: [%s] recovered [%s]", s.Name(), it.nodeName, it.host, verdict.Reason)
+					log.Debugln("[SmartProbe] Recheck Group: [%s] - Node: [%s] - Host: [%s] recovered [%s]", s.Name(), it.nodeName, it.host, verdict.Reason)
 				case smart.VerdictRecord:
-					log.Debugln("[Smart] Recheck Group: [%s] - Node: [%s] - Host: [%s] avoided for [%s]: [%s]", s.Name(), it.nodeName, it.host, verdict.TTL, verdict.Reason)
+					log.Debugln("[SmartProbe] Recheck Group: [%s] - Node: [%s] - Host: [%s] avoided for [%s]: [%s]", s.Name(), it.nodeName, it.host, verdict.TTL, verdict.Reason)
 				default:
-					log.Debugln("[Smart] Recheck Group: [%s] - Node: [%s] - Host: [%s] left unchanged [%s]", s.Name(), it.nodeName, it.host, verdict.Reason)
+					log.Debugln("[SmartProbe] Recheck Group: [%s] - Node: [%s] - Host: [%s] left unchanged [%s]", s.Name(), it.nodeName, it.host, verdict.Reason)
 				}
 			}
 		}()
@@ -195,11 +195,11 @@ func (s *Smart) probeAfterClose(metadata *C.Metadata, proxy C.Proxy) {
 
 		verdict := s.probeVerdict(proxy, clone.Host)
 		if verdict.Action == smart.VerdictIgnore {
-			log.Debugln("[Smart] Probe Group: [%s] - Node: [%s] - Host: [%s] ignored answer [%s]", s.Name(), nodeName, clone.Host, verdict.Reason)
+			log.Debugln("[SmartProbe] Probe Group: [%s] - Node: [%s] - Host: [%s] ignored answer [%s]", s.Name(), nodeName, clone.Host, verdict.Reason)
 			return
 		}
 		if !s.probeThrottle.AllowHostRecord(clone.Host, verdict, time.Now()) {
-			log.Debugln("[Smart] Probe Group: [%s] - Node: [%s] - Host: [%s] kept, no node reaches the host [%s]", s.Name(), nodeName, clone.Host, verdict.Reason)
+			log.Debugln("[SmartProbe] Probe Group: [%s] - Node: [%s] - Host: [%s] kept, no node reaches the host [%s]", s.Name(), nodeName, clone.Host, verdict.Reason)
 			return
 		}
 		if (s.ctx != nil && s.ctx.Err() != nil) || s.selected != "" || !lo.ContainsBy(s.GetProxies(false), func(p C.Proxy) bool { return p.Name() == nodeName }) {
@@ -211,13 +211,13 @@ func (s *Smart) probeAfterClose(metadata *C.Metadata, proxy C.Proxy) {
 
 		if verdict.Action == smart.VerdictReachable {
 			s.applyNodeAnswer(clone, nodeName, verdict)
-			log.Debugln("[Smart] Probe Group: [%s] - Node: [%s] - Host: [%s] recovered [%s]", s.Name(), nodeName, clone.Host, verdict.Reason)
+			log.Debugln("[SmartProbe] Probe Group: [%s] - Node: [%s] - Host: [%s] recovered [%s]", s.Name(), nodeName, clone.Host, verdict.Reason)
 			return
 		}
 
 		s.probeThrottle.NoteFailure(clone.WildcardTarget, nodeName, time.Now())
 		s.applyNodeAnswer(clone, nodeName, verdict)
-		log.Debugln("[Smart] Probe Group: [%s] - Node: [%s] - Host: [%s] avoided for [%s]: [%s]", s.Name(), nodeName, clone.Host, verdict.TTL, verdict.Reason)
+		log.Debugln("[SmartProbe] Probe Group: [%s] - Node: [%s] - Host: [%s] avoided for [%s]: [%s]", s.Name(), nodeName, clone.Host, verdict.TTL, verdict.Reason)
 	}()
 }
 

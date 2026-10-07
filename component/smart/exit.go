@@ -738,23 +738,23 @@ func (w *ExitWatcher) MaybeProbe(parent context.Context, proxy C.Proxy) {
 			failedAt := time.Now()
 			w.NoteFailure(node, failedAt)
 			w.storeExitFailure(node, failedAt)
-			log.Debugln("[Smart] Exit probe [%s] node [%s] failed: %s", w.name, node, err.Error())
+			log.Debugln("[SmartProbe] Exit probe [%s] node [%s] failed: %s", w.name, node, err.Error())
 			return
 		}
 
 		w.Store(node, ExitInfo{Region: result.Region, ASN: result.ASN, Key: result.Key}, time.Now())
 		if result.ASN != "" {
-			log.Debugln("[Smart] Exit probe [%s] node [%s] -> region [%s] asn [%s]", w.name, node, result.Region, result.ASN)
+			log.Debugln("[SmartProbe] Exit probe [%s] node [%s] -> region [%s] asn [%s]", w.name, node, result.Region, result.ASN)
 		} else {
-			log.Debugln("[Smart] Exit probe [%s] node [%s] -> region [%s]", w.name, node, result.Region)
+			log.Debugln("[SmartProbe] Exit probe [%s] node [%s] -> region [%s]", w.name, node, result.Region)
 		}
 		w.storeExitState(node, w.Info(node))
 		for _, target := range w.Release(node) {
-			log.Debugln("[Smart] Exit refusal released [%s] target [%s] node [%s] after its exit answer", w.name, target, node)
+			log.Debugln("[SmartProbe] Exit refusal released [%s] target [%s] node [%s] after its exit answer", w.name, target, node)
 			w.confirm(target, node)
 		}
 		for _, target := range w.ReleaseSuccess(node) {
-			log.Debugln("[Smart] Exit control released [%s] target [%s] node [%s] after its exit answer", w.name, target, node)
+			log.Debugln("[SmartProbe] Exit control released [%s] target [%s] node [%s] after its exit answer", w.name, target, node)
 			w.Clear(target, node)
 			w.NoteSuccess(target, node)
 		}
@@ -838,7 +838,7 @@ func (w *ExitWatcher) loadExitState(node string) (ExitInfo, int64, bool) {
 func (w *ExitWatcher) Note(target, node string) bool {
 	if w.Info(node).Region == "" && w.asnOf(node) == "" {
 		w.Withhold(target, node)
-		log.Debugln("[Smart] Exit refusal [%s] target [%s] node [%s] held until its exit answer arrives", w.name, target, node)
+		log.Debugln("[SmartProbe] Exit refusal [%s] target [%s] node [%s] held until its exit answer arrives", w.name, target, node)
 		return false
 	}
 	return w.confirm(target, node)
@@ -852,7 +852,7 @@ func (w *ExitWatcher) NoteSuccess(target, node string) bool {
 	asn := w.asnOf(node)
 	if info.Region == "" && asn == "" {
 		w.WithholdSuccess(target, node)
-		log.Debugln("[Smart] Exit control [%s] target [%s] node [%s] held until its exit answer arrives", w.name, target, node)
+		log.Debugln("[SmartProbe] Exit control [%s] target [%s] node [%s] held until its exit answer arrives", w.name, target, node)
 		return false
 	}
 	identity := w.identity(node)
@@ -861,14 +861,14 @@ func (w *ExitWatcher) NoteSuccess(target, node string) bool {
 	if info.Region != "" {
 		for _, failedRegion := range w.regions.NoteSuccess(target, info.Region, identity, now) {
 			raised = true
-			log.Debugln("[Smart] Exit suspect [%s] target [%s] region [%s] raised after a successful control from [%s]",
+			log.Debugln("[SmartProbe] Exit suspect [%s] target [%s] region [%s] raised after a successful control from [%s]",
 				w.name, target, failedRegion, node)
 		}
 	}
 	if asn != "" {
 		for _, failedASN := range w.asns.NoteSuccess(target, asn, identity, now) {
 			raised = true
-			log.Debugln("[Smart] Exit suspect [%s] target [%s] asn [%s] raised after a successful control from [%s]",
+			log.Debugln("[SmartProbe] Exit suspect [%s] target [%s] asn [%s] raised after a successful control from [%s]",
 				w.name, target, failedASN, node)
 		}
 	}
@@ -882,14 +882,14 @@ func (w *ExitWatcher) confirm(target, node string) bool {
 	if region := w.Info(node).Region; region != "" {
 		if w.regions.Note(target, region, identity, now) {
 			raised = true
-			log.Debugln("[Smart] Exit suspect [%s] target [%s] region [%s] raised by node [%s]",
+			log.Debugln("[SmartProbe] Exit suspect [%s] target [%s] region [%s] raised by node [%s]",
 				w.name, target, region, node)
 		}
 	}
 	if asn := w.asnOf(node); asn != "" {
 		if w.asns.Note(target, asn, identity, now) {
 			raised = true
-			log.Debugln("[Smart] Exit suspect [%s] target [%s] asn [%s] raised by node [%s]",
+			log.Debugln("[SmartProbe] Exit suspect [%s] target [%s] asn [%s] raised by node [%s]",
 				w.name, target, asn, node)
 		}
 	}
