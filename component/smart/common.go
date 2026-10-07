@@ -633,3 +633,11 @@ func (s *Store) FlushByGroup(group, config string) error {
 func (s *Store) IsDBAvailable() bool {
 	return db != nil
 }
+
+// Alpha host status cache and recovery parameters.
+const (
+	hostStatusRetryAfter     = 4 * time.Hour
+	hostStatusViewTTLSeconds = 30
+	hostStrikeWindow         = 5 * time.Minute
+	hostStrikeLimit          = 2
+)

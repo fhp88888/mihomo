@@ -175,6 +175,9 @@ func TestRouteKey(t *testing.T) {
 		}
 	}
 
+	// The target cache may already be initialised by a previous test run.
+	// Assert the route-key contract against the effective target, not cache state.
+	effectiveTarget := smart.GetEffectiveTarget("www.example.com", "1.2.3.4")
 	t.Run("regular ASN keeps org name in key", func(t *testing.T) {
 		// A non-CDN ASN (e.g. a residential ISP) shares one row across all
 		// targets in that ASN — the domain is not part of the key, but the
@@ -190,13 +193,13 @@ func TestRouteKey(t *testing.T) {
 		// getASNCode writes "0" when resolution fails; routeKey must fall back
 		// to the TARGET form keyed by the effective target.
 		m := mkMeta("www.example.com", "1.2.3.4", "0")
-		if got := routeKey(m); got != "TARGET:www.example.com" {
-			t.Fatalf("routeKey = %q, want %q", got, "TARGET:www.example.com")
+		if got := routeKey(m); got != "TARGET:"+effectiveTarget {
+			t.Fatalf("routeKey = %q, want %q", got, "TARGET:"+effectiveTarget)
 		}
 		// SmartTarget should be populated so the close callback (which re-derives
 		// the key) agrees with the route-time key.
-		if m.SmartTarget != "www.example.com" {
-			t.Fatalf("SmartTarget = %q, want %q", m.SmartTarget, "www.example.com")
+		if m.SmartTarget != effectiveTarget {
+			t.Fatalf("SmartTarget = %q, want %q", m.SmartTarget, effectiveTarget)
 		}
 	})
 
@@ -204,8 +207,8 @@ func TestRouteKey(t *testing.T) {
 		// rules/common/ipasn.go still writes "unknown" when the ASN rule
 		// matches nothing; routeKey treats it the same as "0".
 		m := mkMeta("www.example.com", "1.2.3.4", "unknown")
-		if got := routeKey(m); got != "TARGET:www.example.com" {
-			t.Fatalf("routeKey = %q, want %q", got, "TARGET:www.example.com")
+		if got := routeKey(m); got != "TARGET:"+effectiveTarget {
+			t.Fatalf("routeKey = %q, want %q", got, "TARGET:"+effectiveTarget)
 		}
 	})
 
@@ -216,8 +219,8 @@ func TestRouteKey(t *testing.T) {
 		// different rules shares one row.
 		m := mkMeta("www.example.com", "1.2.3.4", "0")
 		m.SmartTarget = "DomainSuffix [example.com]"
-		if got := routeKey(m); got != "TARGET:www.example.com" {
-			t.Fatalf("routeKey = %q, want %q", got, "TARGET:www.example.com")
+		if got := routeKey(m); got != "TARGET:"+effectiveTarget {
+			t.Fatalf("routeKey = %q, want %q", got, "TARGET:"+effectiveTarget)
 		}
 		// The descriptor must be preserved (not overwritten) — it feeds stats.
 		if m.SmartTarget != "DomainSuffix [example.com]" {

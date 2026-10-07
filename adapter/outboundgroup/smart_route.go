@@ -102,6 +102,11 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 		return nil, fmt.Errorf("selected proxy %q not found", s.selected)
 	}
 
+	proxies = s.responseCandidates(metadata, proxies)
+	if len(proxies) == 0 {
+		return nil, errors.New("no accessible proxies for target")
+	}
+
 	// A known route exploits its current best on most requests. Every
 	// rediscoverEvery-th request explicitly explores a single challenger first,
 	// giving previously untested nodes a chance to collect a TTFB sample.
@@ -733,7 +738,7 @@ func (s *Smart) discoverAndRoute(ctx context.Context, metadata *C.Metadata, key,
 		if err := s.waitForHealthRecovery(ctx); err != nil {
 			return nil, err
 		}
-		for _, p := range s.GetProxies(true) {
+		for _, p := range s.responseCandidates(metadata, s.GetProxies(true)) {
 			if p.AliveForTestUrl(s.testUrl) {
 				available = append(available, p)
 			}
@@ -1041,6 +1046,10 @@ func (s *Smart) wrapTCPConnWithExploration(c C.Conn, proxy C.Proxy, metadata *C.
 		// check for TCP RST or early death and mark-failed if necessary
 		s.checkResetByPeer(key, domain, proxy.Name(), readErr)
 		s.checkEarlyDeath(key, domain, proxy.Name(), readErr, firstRead, tracker)
+
+		if tracker != nil && smart.ResponseProbeEligible(metadata, float64(tracker.Info().DownloadTotal.Load())/1024/1024, false) {
+			s.probeAfterClose(metadata, proxy)
+		}
 	})
 }
 
@@ -1100,6 +1109,11 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 		return nil, errors.New("selected proxy not found or does not support UDP")
 	}
 
+	proxies = s.responseCandidates(metadata, proxies)
+	if len(proxies) == 0 {
+		return nil, errors.New("no accessible proxies for target")
+	}
+
 	// Filter to UDP-capable, alive proxies
 	udpProxies := make([]C.Proxy, 0, len(proxies))
 	for _, p := range proxies {
@@ -1114,7 +1128,7 @@ func (s *Smart) udpRoute(ctx context.Context, metadata *C.Metadata) (C.PacketCon
 			if err := s.waitForHealthRecovery(ctx); err != nil {
 				return nil, err
 			}
-			for _, p := range s.GetProxies(true) {
+			for _, p := range s.responseCandidates(metadata, s.GetProxies(true)) {
 				if p.SupportUDP() && p.AliveForTestUrl(s.testUrl) {
 					udpProxies = append(udpProxies, p)
 				}

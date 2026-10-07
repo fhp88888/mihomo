@@ -64,6 +64,12 @@ type Smart struct {
 	useLightGBM bool // retained for config parsing, no-op in new impl
 	collectData bool // retained for config parsing, no-op in new impl
 	preferASN   bool
+
+	store          *smart.Store
+	probeThrottle  smart.ProbeThrottle
+	responseMu     sync.Mutex
+	responseWG     sync.WaitGroup
+	responseClosed bool
 }
 
 func getConfigFilename() string {
@@ -233,6 +239,7 @@ func (s *Smart) GetConfigFilename() string {
 }
 
 func (s *Smart) InitSmart() {
+	s.store = cachefile.GetSmartStore()
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
 	// try load ASN database for any smart group that needs it
@@ -248,6 +255,7 @@ func (s *Smart) InitSmart() {
 	s.startTimedTask(10*time.Minute, 10*time.Minute, "FailedCount decay", s.decayFailedCounts, false)
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, false)
 	s.startTimedTask(1*time.Minute, 1*time.Minute, "Proxy aggregation", s.aggregateProxies, false)
+	s.startTimedTask(1*time.Minute, 1*time.Minute, "Host response recovery", s.checkHostStatus, false)
 }
 
 // ── Public proxy methods ────────────────────────────────────
@@ -285,6 +293,11 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 				return p
 			}
 		}
+	}
+
+	proxies = s.responseCandidates(metadata, proxies)
+	if len(proxies) == 0 {
+		return s.EmptyFallback()
 	}
 
 	if metadata.SmartTarget == "" {
@@ -463,11 +476,15 @@ func (s *Smart) aggregateProxies() {
 // ── Lifecycle ───────────────────────────────────────────────
 
 func (s *Smart) Close() error {
+	s.responseMu.Lock()
+	s.responseClosed = true
+	s.responseMu.Unlock()
 	if s.cancel != nil {
 		s.cancel()
 	}
 
 	s.wg.Wait()
+	s.responseWG.Wait()
 
 	// Close the probe coordinator first so that all in-flight dials
 	// and drain goroutines finish before the final persistence pass.

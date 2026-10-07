@@ -124,6 +124,19 @@ func (pc *ProbeCoordinator) Discover(
 			ds.mu.Unlock()
 
 			if p != nil && e == nil {
+				// The leader may have started before an HTTP refusal changed this
+				// caller's candidate set. Its winner must still be eligible here.
+				allowed := false
+				for _, candidate := range proxies {
+					if candidate.Name() == p.Name() {
+						allowed = true
+						break
+					}
+				}
+				if !allowed {
+					fallback := pc.probeBatch(followerCtx, key, proxies, metadata, preRanked, singleDial, rt)
+					return fallback.proxy, fallback.conn, fallback.connectTime, fallback.err
+				}
 				// Follower gets a NEW connection to the same proxy
 				start := time.Now()
 				newConn, connectTime, dialErr := singleDial(followerCtx, p, metadata, start)
