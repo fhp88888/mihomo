@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	C "github.com/metacubex/mihomo/constant"
+
 	"github.com/metacubex/sing/common/network"
 )
 
@@ -54,9 +55,7 @@ func (w *closeCallbackPacketConn) Close() error {
 }
 
 func (w *closeCallbackPacketConn) CloseWrite() error {
-	go w.closeOnce.Do(func() {
-		w.closeFunc()
-	})
+	w.closeOnce.Do(w.closeFunc)
 	if wc, ok := w.PacketConn.(network.WriteCloser); ok {
 		return wc.CloseWrite()
 	}

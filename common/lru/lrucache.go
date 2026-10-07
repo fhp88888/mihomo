@@ -291,18 +291,12 @@ type entry[K comparable, V any] struct {
 	expires int64
 }
 
-func ResetLRU[K comparable, V any](oldCache *LruCache[K, V], newSize int, options ...Option[K, V]) *LruCache[K, V] {
-	newCache := New[K, V](append(options, WithSize[K, V](newSize))...)
-	oldCache.CloneTo(newCache)
-	return newCache
-}
-
 func (c *LruCache[K, V]) FilterByKeyPrefix(prefix string) map[string]V {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	result := make(map[string]V)
-	now := time.Now().Unix()
+	result := make(map[string]V, len(c.cache))
+	var now int64
 
 	for k, le := range c.cache {
 		keyStr, ok := any(k).(string)
@@ -314,13 +308,18 @@ func (c *LruCache[K, V]) FilterByKeyPrefix(prefix string) map[string]V {
 			continue
 		}
 
-		if !c.staleReturn && c.maxAge > 0 && le.Value.expires <= now {
-			c.deleteElement(le)
-			continue
+		// the clock is only read for a cache that can hold stale entries
+		if !c.staleReturn && c.maxAge > 0 {
+			if now == 0 {
+				now = time.Now().Unix()
+			}
+			if le.Value.expires <= now {
+				c.deleteElement(le)
+				continue
+			}
 		}
 
-		e := le.Value
-		result[keyStr] = e.value
+		result[keyStr] = le.Value.value
 	}
 
 	c.maybeDeleteOldest()
@@ -333,23 +332,39 @@ func (c *LruCache[K, V]) RemoveByKeyPrefix(prefix string) int {
 	defer c.mu.Unlock()
 
 	var removed int
-	var keysToRemove []K
 
+	// an entry may be deleted during the range
 	for k := range c.cache {
 		keyStr, ok := any(k).(string)
-		if !ok {
+		if !ok || !strings.HasPrefix(keyStr, prefix) {
 			continue
 		}
 
-		if strings.HasPrefix(keyStr, prefix) {
-			keysToRemove = append(keysToRemove, k)
-		}
-	}
-
-	for _, k := range keysToRemove {
 		c.delete(k)
 		removed++
 	}
 
 	return removed
+}
+
+// SetMaxSize changes the max length of the cache, the entries over the new limit are
+// evicted from the least recently used side. A maxSize of 0 or less means no limit.
+func (c *LruCache[K, V]) SetMaxSize(maxSize int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.maxSize = maxSize
+
+	if maxSize <= 0 {
+		return
+	}
+	for c.lru.Len() > maxSize {
+		c.deleteElement(c.lru.Front())
+	}
+}
+
+func ResetLRU[K comparable, V any](oldCache *LruCache[K, V], newSize int, options ...Option[K, V]) *LruCache[K, V] {
+	newCache := New[K, V](append(options, WithSize[K, V](newSize))...)
+	oldCache.CloneTo(newCache)
+	return newCache
 }

@@ -17,6 +17,9 @@ type firstReadCallBackConn struct {
 }
 
 func (c *firstReadCallBackConn) Read(b []byte) (n int, err error) {
+	if c.read.Load() {
+		return c.Conn.Read(b)
+	}
 	defer func() {
 		if c.read.CompareAndSwap(false, true) {
 			c.callback(err)
@@ -26,6 +29,9 @@ func (c *firstReadCallBackConn) Read(b []byte) (n int, err error) {
 }
 
 func (c *firstReadCallBackConn) ReadBuffer(buffer *buf.Buffer) (err error) {
+	if c.read.Load() {
+		return c.Conn.ReadBuffer(buffer)
+	}
 	defer func() {
 		if c.read.CompareAndSwap(false, true) {
 			c.callback(err)
@@ -46,6 +52,10 @@ func (c *firstReadCallBackConn) ReaderReplaceable() bool {
 	return c.read.Load()
 }
 
+func (c *firstReadCallBackConn) ReaderPossiblyReplaceable() bool {
+	return !c.read.Load()
+}
+
 var _ N.ExtendedConn = (*firstReadCallBackConn)(nil)
 
 func NewFirstReadCallBackConn(c C.Conn, callback func(error)) C.Conn {
@@ -63,11 +73,17 @@ type firstReadCallBackPacketConn struct {
 }
 
 func (c *firstReadCallBackPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
-	c.firstWrite.CompareAndSwap(0, time.Now().UnixNano())
-	return c.PacketConn.WriteTo(b, addr)
+	n, err = c.PacketConn.WriteTo(b, addr)
+	if err == nil && c.firstWrite.Load() == 0 {
+		c.firstWrite.CompareAndSwap(0, time.Now().UnixNano())
+	}
+	return
 }
 
 func (c *firstReadCallBackPacketConn) onRead() {
+	if c.called.Load() {
+		return
+	}
 	if first := c.firstWrite.Load(); first != 0 {
 		if c.called.CompareAndSwap(false, true) {
 			latency := (time.Now().UnixNano() - first) / int64(time.Millisecond)
@@ -78,13 +94,17 @@ func (c *firstReadCallBackPacketConn) onRead() {
 
 func (c *firstReadCallBackPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 	n, addr, err = c.PacketConn.ReadFrom(b)
-	c.onRead()
+	if err == nil {
+		c.onRead()
+	}
 	return
 }
 
 func (c *firstReadCallBackPacketConn) WaitReadFrom() (data []byte, put func(), addr net.Addr, err error) {
 	data, put, addr, err = c.PacketConn.WaitReadFrom()
-	c.onRead()
+	if err == nil {
+		c.onRead()
+	}
 	return
 }
 

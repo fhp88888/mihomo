@@ -62,6 +62,7 @@ type dnsOverQUIC struct {
 	addr           string
 	dialer         *dnsDialer
 	skipCertVerify bool
+	nameCertVerify string
 }
 
 // type check
@@ -81,6 +82,7 @@ func newDoQ(addr string, resolver resolver.Resolver, params map[string]string, p
 	if params["skip-cert-verify"] == "true" {
 		doq.skipCertVerify = true
 	}
+	doq.nameCertVerify = params["name-cert-verify"]
 
 	runtime.SetFinalizer(doq, (*dnsOverQUIC).Close)
 	return doq
@@ -337,6 +339,7 @@ func (doq *dnsOverQUIC) openConnection(ctx context.Context) (quicConn *quic.Conn
 
 	host, _, err := net.SplitHostPort(doq.addr)
 	if err != nil {
+		_ = packetConn.Close()
 		return nil, err
 	}
 
@@ -349,8 +352,10 @@ func (doq *dnsOverQUIC) openConnection(ctx context.Context) (quicConn *quic.Conn
 			},
 			SessionTicketsDisabled: false,
 		},
+		NameCertVerify: doq.nameCertVerify,
 	})
 	if err != nil {
+		_ = packetConn.Close()
 		return nil, err
 	}
 

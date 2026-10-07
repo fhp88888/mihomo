@@ -480,9 +480,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 			logMetadata(metadata, rule, rawPc)
 
 			// recover info to dialMetadata for smart
-			dialMetadata.Host = metadata.Host 
-			dialMetadata.SmartTarget = metadata.SmartTarget
-			dialMetadata.SmartBlock = metadata.SmartBlock
+			dialMetadata.Host = metadata.Host
 
 			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, dialMetadata, rule, 0, 0, true)
 
@@ -620,7 +618,10 @@ func handleTCPConn(connCtx C.ConnContext) {
 	}
 	logMetadata(metadata, rule, remoteConn)
 
-	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule, int64(peekLen), 0, true)
+	// recover info to dialMetadata for smart
+	dialMetadata.Host = metadata.Host
+
+	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, dialMetadata, rule, int64(peekLen), 0, true)
 	defer func(remoteConn C.Conn) {
 		_ = remoteConn.Close()
 	}(remoteConn)
@@ -677,7 +678,7 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err
 
 				// set target for Smart gorup nodes selected
 				if smartRuleType(rule.RuleType()) {
-					if rule.RuleType().String() != "GEOIP" || !countryCodeRegex.MatchString(rule.Payload()) {
+					if rule.RuleType() != C.GEOIP || !countryCodeRegex.MatchString(rule.Payload()) {
 						metadata.SmartTarget = fmt.Sprintf("%s [%s]", rule.RuleType().String(), rule.Payload())
 					}
 				}
