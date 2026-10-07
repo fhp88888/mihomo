@@ -87,7 +87,7 @@ func (s *Store) FlushQueue(force bool) error {
 	if err := s.BatchSave(ops); err != nil {
 		log.Warnln("[Smart] FlushQueue failed, re-enqueuing %d operations: %v", len(ops), err)
 		// Re-enqueue: current queue values override the older snapshot.
-		globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
+		updateGlobalQueue(func(old []StoreOperation) []StoreOperation {
 			return mergeOperations(ops, old)
 		})
 		return err

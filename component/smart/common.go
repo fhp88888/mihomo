@@ -66,6 +66,7 @@ var (
 	bucketSmartStats = []byte("smart_stats")
 
 	globalOperationQueue atomic.TypedValue[[]StoreOperation]
+	operationQueueMutex  sync.Mutex
 	flushMutex           sync.Mutex
 
 	globalCacheParams struct {
@@ -448,7 +449,7 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 	shouldFlush := false
 	var snapshot []StoreOperation
 
-	globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
+	updateGlobalQueue(func(old []StoreOperation) []StoreOperation {
 		newQueue := mergeOperations(old, operations)
 
 		threshold := GetBatchSaveThreshold()
@@ -473,7 +474,7 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 			log.Warnln("[Smart] Sync batch save failed, re-enqueuing %d operations: %v", len(snapshot), err)
 			// Merge old snapshot first, then current queue, so that newer
 			// values in the current queue override older snapshot values.
-			globalOperationQueue.Update(func(old []StoreOperation) []StoreOperation {
+			updateGlobalQueue(func(old []StoreOperation) []StoreOperation {
 				return mergeOperations(snapshot, old)
 			})
 		} else {
@@ -484,6 +485,8 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 }
 
 func replaceGlobalQueue(newQueue []StoreOperation) {
+	operationQueueMutex.Lock()
+	defer operationQueueMutex.Unlock()
 	globalOperationQueue.Store(newQueue)
 }
 
@@ -494,15 +497,19 @@ func getGlobalQueueSnapshot() []StoreOperation {
 	return snapshot
 }
 
+// Queue updates are serialized locally; published slices remain immutable so
+// readers can continue using Alpha's atomic Load without holding the queue lock.
 func updateGlobalQueue(updateFunc func([]StoreOperation) []StoreOperation) {
-	globalOperationQueue.Update(updateFunc)
+	operationQueueMutex.Lock()
+	defer operationQueueMutex.Unlock()
+	globalOperationQueue.Store(updateFunc(globalOperationQueue.Load()))
 }
 
 func drainGlobalQueue(force bool) []StoreOperation {
 	threshold := GetBatchSaveThreshold()
 	var snapshot []StoreOperation
 
-	globalOperationQueue.Update(func(current []StoreOperation) []StoreOperation {
+	updateGlobalQueue(func(current []StoreOperation) []StoreOperation {
 		if len(current) == 0 {
 			return current
 		}

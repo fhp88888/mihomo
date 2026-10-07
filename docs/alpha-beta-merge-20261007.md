@@ -18,16 +18,16 @@ components incorporate as many Alpha updates as possible.
   methods require response and exit parsing helpers; retain `response.go` and
   extract the independent exit probe helpers into `exit_probe.go`. These helpers
   do not initialize an exit watcher or affect Beta's Smart candidate selection.
-- Restore `atomic.TypedValue.Update` and `lru.ResetLRU`, which Alpha removed but
-  Beta's retained Smart persistence/cache code still uses. Keep Alpha's other
-  changes to those common libraries.
+- Initially restore `atomic.TypedValue.Update` and `lru.ResetLRU` for Beta's
+  retained Smart code. The subsequent adaptation below removes both shims and
+  uses Alpha's common libraries verbatim.
 - Keep Alpha's load-balance hash-key tests. Exclude four tests embedded in the
   same file that exercise Alpha's unadopted Smart exit-watcher implementation.
 - Keep Beta's two-second dial timeout and raw TCP connect timer, alongside
   Alpha's listener improvements.
 
-The original ten principal Smart implementation files are byte-identical to the
-pre-merge Beta version. File hashes and binary fingerprints are recorded in the
+At the initial merge, the original ten principal Smart implementation files
+were byte-identical to the pre-merge Beta version. File hashes and binary fingerprints are recorded in the
 validation provenance artifact.
 
 ## Verification
@@ -106,3 +106,39 @@ Local artifacts are under
 `run_core.py`, `run_pairs.py`, `provenance.json`, `summary.json`, per-run JSON/CSV,
 and progress logs. Go test logs and binaries are under
 `bin/alpha-merge-validation/`.
+
+## Follow-up: adapt Smart to Alpha common libraries
+
+At the user's request, `common/atomic/value.go` and `common/lru/lrucache.go` now
+match Alpha exactly; no `TypedValue.Update` or `ResetLRU` compatibility shim
+remains. Smart routing and scoring policies remain Beta's implementation.
+
+- Smart serializes queue read-modify-write operations with a local mutex and
+  publishes immutable slices using Alpha's `TypedValue.Load`/`Store`. Append,
+  drain, filtering, initialization, and failed-write re-enqueue share this lock.
+  Atomic readers do not need to take the lock. Update callbacks execute once,
+  avoiding the side effects of retries in the previous CAS callback.
+- The six Smart caches use Alpha's `SetMaxSize` in place. Their pointers and
+  existing expiration times remain stable; shrinking immediately evicts excess
+  least-recently-used entries. Initialization still assigns 300-second TTLs
+  (1800 seconds for the unwrap cache).
+- Strengthen the concurrent persistence test to verify all 200 submitted
+  records and their contents in bbolt, as well as an empty final queue.
+
+Follow-up checks passed:
+
+```sh
+go test -race ./component/smart ./adapter/outboundgroup ./adapter/provider \
+  ./common/atomic ./common/lru
+go test -tags with_gvisor ./...
+```
+
+One supplemental full `advanced-web-loading-bench` run passed all 320 pages,
+2880 requests and complete-workload/route validation against each of the six
+historical references. Build flags and workload settings are unchanged.
+Page duration total was 2538.882592414 seconds, within the previous merged
+range (2441.162982241–2569.271535588 seconds), +1.988% versus its historical
+median and +1.451% versus the pre-merge historical median. This is a single
+supplemental run, not a new paired experiment or proof of zero regression.
+Results: `mihomo-benchmark/results/alpha-beta-merge-20261007/alpha-common.json`
+and `alpha-common-validation.json` (ignored benchmark artifacts).

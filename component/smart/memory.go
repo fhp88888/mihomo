@@ -128,7 +128,7 @@ func (s *Store) StorePrefetchResult(group, config string, target string, asnNumb
 			asnPm.RefTCP = targetCacheKey
 		}
 		asnPm.UpdatedTime = time.Now().Unix()
-		
+
 		asnData, asnErr := json.Marshal(asnPm)
 		if asnErr == nil {
 			operations = append(operations, StoreOperation{
@@ -369,12 +369,12 @@ func (s *Store) AdjustCacheParameters() {
 		globalCacheParams.BatchSaveThreshold)
 
 	cacheSize := globalCacheParams.MaxTargets / 4
-	targetCache = lru.ResetLRU(targetCache, cacheSize, lru.WithAge[string, string](300))
-	unwrapCache = lru.ResetLRU(unwrapCache, cacheSize, lru.WithAge[string, UnwrapMap](1800))
-	recordCache = lru.ResetLRU(recordCache, cacheSize, lru.WithAge[string, *AtomicStatsRecord](300))
-	dbResultCache = lru.ResetLRU(dbResultCache, cacheSize, lru.WithAge[string, map[string][]byte](300))
-	blockedNodesCache = lru.ResetLRU(blockedNodesCache, cacheSize, lru.WithAge[string, map[string]bool](300))
-	hostStatusCache = lru.ResetLRU(hostStatusCache, cacheSize, lru.WithAge[string, *HostStatus](300))
+	targetCache.SetMaxSize(cacheSize)
+	unwrapCache.SetMaxSize(cacheSize)
+	recordCache.SetMaxSize(cacheSize)
+	dbResultCache.SetMaxSize(cacheSize)
+	blockedNodesCache.SetMaxSize(cacheSize)
+	hostStatusCache.SetMaxSize(cacheSize)
 	go s.FlushQueue(true)
 }
 

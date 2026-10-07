@@ -189,13 +189,25 @@ func TestConcurrentFlushQueue(t *testing.T) {
 
 	wg.Wait()
 
-	// Final sync flush to ensure everything is written
-	store.FlushQueue(true)
-
-	// Verify no panics occurred (the real test is -race)
-	// Check that the queue is clean
-	queueLen := len(globalOperationQueue.Load())
-	t.Logf("final queue length: %d (total ops sent: %d)", queueLen, totalOps)
+	// Final sync flush to ensure everything is written.
+	if err := store.FlushQueue(true); err != nil {
+		t.Fatalf("final flush: %v", err)
+	}
+	if queueLen := len(globalOperationQueue.Load()); queueLen != 0 {
+		t.Fatalf("expected empty queue, got %d pending operations", queueLen)
+	}
+	// Concurrent drains must persist every submitted operation, not just
+	// empty the queue without panicking.
+	for g := 0; g < concurrency; g++ {
+		for _, op := range makeRouteOps(opsPerGoroutine, fmt.Sprintf("group-%d", g), "shared-config") {
+			key := FormatDBKey(KeyTypeRoute, op.Config, op.Group, op.Target)
+			data, err := store.DBViewGetItem(key)
+			if err != nil || string(data) != string(op.Data) {
+				t.Errorf("persisted operation %s: got %s, error %v, want %s", key, data, err, op.Data)
+			}
+		}
+	}
+	t.Logf("verified %d persisted operations", totalOps)
 }
 
 // makeRouteMetaOps creates n OpSaveRouteMeta operations with unique route keys.

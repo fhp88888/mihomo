@@ -362,9 +362,3 @@ func (c *LruCache[K, V]) SetMaxSize(maxSize int) {
 		c.deleteElement(c.lru.Front())
 	}
 }
-
-func ResetLRU[K comparable, V any](oldCache *LruCache[K, V], newSize int, options ...Option[K, V]) *LruCache[K, V] {
-	newCache := New[K, V](append(options, WithSize[K, V](newSize))...)
-	oldCache.CloneTo(newCache)
-	return newCache
-}
