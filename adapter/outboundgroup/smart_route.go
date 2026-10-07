@@ -945,6 +945,9 @@ func (s *Smart) wrapTCPConn(c C.Conn, proxy C.Proxy, metadata *C.Metadata, conne
 }
 
 func (s *Smart) wrapTCPConnWithExploration(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64, incumbent, challenger string, refreshAfterSample bool) C.Conn {
+	if s.exitWatch != nil && metadata.Host != "" && metadata.DstPort == 443 && metadata.Type != C.INNER && s.selected == "" {
+		s.exitWatch.MaybeProbe(s.ctx, proxy)
+	}
 	key := routeKey(metadata)
 	domain := routeDomain(metadata)
 

@@ -114,7 +114,10 @@ var CdnASNs = map[string]bool{
 }
 
 type (
-	Store struct{}
+	Store struct {
+		// Keep node updates visible while a drained batch is still being written.
+		nodeStates sync.Map
+	}
 
 	StoreOperation struct {
 		Type   int
@@ -574,6 +577,7 @@ func (s *Store) FlushByLevel(level string, config string, group string) error {
 	}
 
 	s.clearCache(level, config, group)
+	s.clearNodeStates(level, config, group)
 
 	if level == "all" {
 		s.DBBatchDeletePrefix([]string{"smart"}, false)

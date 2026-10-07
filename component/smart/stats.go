@@ -44,6 +44,11 @@ type NodeState struct {
 	LastChecked    int64  `json:"last_checked"`
 	BlockedUntil   int64  `json:"blocked_until"`
 	ThresholdGrade int    `json:"threshold_grade,omitempty"`
+	ExitRegion     string `json:"exit_region,omitempty"`
+	ExitASN        string `json:"exit_asn,omitempty"`
+	ExitKey        string `json:"exit_key,omitempty"`
+	ExitUpdated    int64  `json:"exit_updated,omitempty"`
+	ExitFailed     int64  `json:"exit_failed,omitempty"`
 }
 
 type AtomicStatsRecord struct {

@@ -65,6 +65,7 @@ type Smart struct {
 	collectData bool // retained for config parsing, no-op in new impl
 	preferASN   bool
 
+	exitWatch      *smart.ExitWatcher
 	store          *smart.Store
 	probeThrottle  smart.ProbeThrottle
 	responseMu     sync.Mutex
@@ -242,12 +243,23 @@ func (s *Smart) InitSmart() {
 	s.store = cachefile.GetSmartStore()
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
+	wantExitASN := s.preferASN
 	// try load ASN database for any smart group that needs it
 	if s.preferASN {
 		if err := geodata.InitASN(); err != nil {
 			log.Warnln("[Smart] Failed to load ASN database: %v", err)
+			wantExitASN = false
 		}
 	}
+
+	s.exitWatch = smart.NewExitWatcher(smart.ExitWatcherOptions{Name: s.Name(), Config: s.configName, Store: s.store, WantASN: func() bool { return wantExitASN }, ValidNode: func(node string) bool {
+		for _, p := range s.GetProxies(false) {
+			if p.Name() == node {
+				return true
+			}
+		}
+		return false
+	}})
 
 	// Periodic route table persistence: every 10 minutes, iterate the route
 	// table and enqueue dirty cells to the bbolt batch queue.
@@ -485,6 +497,9 @@ func (s *Smart) Close() error {
 
 	s.wg.Wait()
 	s.responseWG.Wait()
+	if s.exitWatch != nil {
+		s.exitWatch.Close()
+	}
 
 	// Close the probe coordinator first so that all in-flight dials
 	// and drain goroutines finish before the final persistence pass.

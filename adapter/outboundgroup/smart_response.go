@@ -37,8 +37,25 @@ func (s *Smart) applyNodeAnswer(metadata *C.Metadata, node string, verdict smart
 	switch verdict.Action {
 	case smart.VerdictReachable:
 		s.markNodeFailure(metadata, node, false, true, 0, 0)
+		if s.exitWatch != nil && verdict.ControlSuccess {
+			s.exitWatch.EnsureLoaded(node)
+			s.exitWatch.Clear(routeDomain(metadata), node)
+			s.exitWatch.NoteSuccess(routeDomain(metadata), node)
+		}
 	case smart.VerdictRecord:
 		s.markNodeFailure(metadata, node, true, true, blockCodeAnswer, verdict.TTL)
+		if s.exitWatch != nil && smart.RegionEvidence(verdict.Reason) {
+			s.exitWatch.EnsureLoaded(node)
+			s.exitWatch.Note(routeDomain(metadata), node)
+		}
+	}
+	if s.exitWatch != nil && (verdict.ControlSuccess || (verdict.Action == smart.VerdictRecord && smart.RegionEvidence(verdict.Reason))) {
+		for _, proxy := range s.GetProxies(false) {
+			if proxy.Name() == node {
+				s.exitWatch.MaybeProbe(s.ctx, proxy)
+				break
+			}
+		}
 	}
 }
 
@@ -230,13 +247,57 @@ func (s *Smart) responseCandidates(metadata *C.Metadata, proxies []C.Proxy) []C.
 	}
 	failed, blocked := s.store.GetHostStatus(s.Name(), s.configName, routeDomain(metadata), s.maxFailedTimes)
 	if len(failed) == 0 {
-		return proxies
+		return s.exitCandidates(metadata, proxies)
 	}
 	available := make([]C.Proxy, 0, len(proxies))
 	for _, p := range proxies {
 		code := failed[p.Name()]
 		if code == 0 || (blocked && code != 1) {
 			available = append(available, p)
+		}
+	}
+	return s.exitCandidates(metadata, available)
+}
+
+// Exit inference changes eligibility, never Beta's measured quality or scoring.
+// Node-specific HTTP exclusions are applied before this layer and stay excluded.
+func (s *Smart) exitCandidates(metadata *C.Metadata, proxies []C.Proxy) []C.Proxy {
+	if s.exitWatch == nil || !s.exitWatch.Active() {
+		return proxies
+	}
+	target, now := routeDomain(metadata), time.Now()
+	var available, deferred []C.Proxy
+	healthy := false
+	for _, p := range proxies {
+		// A TCP-only node must not consume the UDP recovery lease.
+		if metadata.NetWork == C.UDP && !p.SupportUDP() {
+			continue
+		}
+		s.exitWatch.EnsureLoaded(p.Name())
+		if s.exitWatch.Defer(target, p.Name(), now, smart.ProbeTimeout) {
+			deferred = append(deferred, p)
+		} else {
+			available = append(available, p)
+			healthy = healthy || p.AliveForTestUrl(s.testUrl)
+		}
+	}
+	if len(deferred) == 0 {
+		return proxies
+	}
+	if !healthy {
+		// Prefer a healthy deferred exit; retain health recovery when none are alive.
+		hasHealthyDeferred := false
+		for _, p := range deferred {
+			hasHealthyDeferred = hasHealthyDeferred || p.AliveForTestUrl(s.testUrl)
+		}
+		for _, p := range deferred {
+			if hasHealthyDeferred && !p.AliveForTestUrl(s.testUrl) {
+				continue
+			}
+			if s.exitWatch.AllowFallback(target, p.Name(), now, smart.ProbeTimeout) {
+				available = append(available, p)
+				break
+			}
 		}
 	}
 	return available
