@@ -30,7 +30,7 @@ const (
 	smartBestProxyFreshness = 1 * time.Second
 	smartTCPFallbackStagger = 200 * time.Millisecond
 	// smartDefaultDialWindow is used until a candidate has a historical dial
-	// sample. Once sampled, its head start is 1.5x the dial-latency EMA, clamped
+	// sample. Once sampled, its head start is 2.0x the dial-latency EMA, clamped
 	// so scheduler noise cannot trigger spurious fallback and an outlier cannot
 	// delay recovery indefinitely.
 	smartDefaultDialWindow = 400 * time.Millisecond
@@ -229,7 +229,7 @@ func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key, do
 	return nil, nil
 }
 
-// adaptiveDialWindow returns 1.5x the candidate's historical dial-latency
+// adaptiveDialWindow returns 2.0x the candidate's historical dial-latency
 // EMA. A default covers unsampled candidates; bounds keep fallback useful in
 // both very-low-latency tests and pathological histories.
 func (s *Smart) adaptiveDialWindow(key, domain, proxy string) time.Duration {
@@ -237,7 +237,7 @@ func (s *Smart) adaptiveDialWindow(key, domain, proxy string) time.Duration {
 	if !ok || latency <= 0 {
 		return smartDefaultDialWindow
 	}
-	window := time.Duration(latency*3/2) * time.Millisecond
+	window := time.Duration(latency*2) * time.Millisecond
 	if window < smartMinDialWindow {
 		return smartMinDialWindow
 	}

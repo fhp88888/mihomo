@@ -1078,8 +1078,8 @@ func TestAdaptiveDialWindow(t *testing.T) {
 		t.Fatalf("unsampled window = %v, want %v", got, smartDefaultDialWindow)
 	}
 	rt.UpdateLatency(key, domain, "normal", 100)
-	if got := s.adaptiveDialWindow(key, domain, "normal"); got != 150*time.Millisecond {
-		t.Fatalf("sampled window = %v, want 150ms", got)
+	if got := s.adaptiveDialWindow(key, domain, "normal"); got != 200*time.Millisecond {
+		t.Fatalf("sampled window = %v, want 200ms", got)
 	}
 	rt.UpdateLatency(key, domain, "tiny", 1)
 	if got := s.adaptiveDialWindow(key, domain, "tiny"); got != smartMinDialWindow {

@@ -26,3 +26,6 @@ test/config/cache*
 /output
 .vscode/
 .fleet/
+
+# Local agent instructions
+/AGENTS.md
