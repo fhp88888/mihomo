@@ -53,8 +53,8 @@ type Smart struct {
 	disableUDP     bool
 
 	// New in-memory routing components
-	routeTable       *smart.RouteTable
-	probeCoordinator *ProbeCoordinator
+	routeTable      *smart.RouteTable
+	raceCoordinator *smartRaceCoordinator
 
 	// per-proxy aggregation (5-min weighted average across the route table)
 	proxyAggMu sync.RWMutex
@@ -65,14 +65,14 @@ type Smart struct {
 	collectData bool // retained for config parsing, no-op in new impl
 	preferASN   bool
 
-	exitWatch      *smart.ExitWatcher
-	store          *smart.Store
-	probeThrottle  smart.ProbeThrottle
-	responseMu     sync.Mutex
-	responseWG     sync.WaitGroup
-	responseClosed bool
-	mergeMu        sync.Mutex
-	mergeRoutes    map[discoveryKey]*mergeRouteState
+	exitWatch         *smart.ExitWatcher
+	store             *smart.Store
+	probeThrottle     smart.ProbeThrottle
+	responseMu        sync.Mutex
+	responseWG        sync.WaitGroup
+	responseClosed    bool
+	explorationMu     sync.Mutex
+	explorationRoutes map[explorationRouteKey]*businessExplorationState
 }
 
 func getConfigFilename() string {
@@ -108,16 +108,16 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 			EmptyFallback:  emptyFallback,
 			Providers:      providers,
 		}),
-		testUrl:          option.URL,
-		expectedStatus:   option.ExpectedStatus,
-		configName:       configName,
-		disableUDP:       option.DisableUDP,
-		sampleRate:       1,
-		useLightGBM:      smartOption.UseLightGBM,
-		collectData:      smartOption.CollectData,
-		preferASN:        smartOption.PreferASN,
-		routeTable:       routeTable,
-		probeCoordinator: NewProbeCoordinator(),
+		testUrl:         option.URL,
+		expectedStatus:  option.ExpectedStatus,
+		configName:      configName,
+		disableUDP:      option.DisableUDP,
+		sampleRate:      1,
+		useLightGBM:     smartOption.UseLightGBM,
+		collectData:     smartOption.CollectData,
+		preferASN:       smartOption.PreferASN,
+		routeTable:      routeTable,
+		raceCoordinator: newSmartRaceCoordinator(),
 	}
 
 	if smartOption.SampleRate > 0 && smartOption.SampleRate <= 1 {
@@ -205,7 +205,7 @@ func (s *Smart) restoreRouteTable(rt *smart.RouteTable, configName string) {
 			if secondSlash < 0 {
 				// Legacy 2-part {routeKey}/{proxyName} format from before
 				// per-domain metrics: no domain to restore into, so drop it —
-				// the proxy simply re-learns via discovery on next use.
+				// the proxy simply re-learns from business traffic on next use.
 				continue
 			}
 			key := rest[:secondSlash]
@@ -507,8 +507,8 @@ func (s *Smart) Close() error {
 	// and drain goroutines finish before the final persistence pass.
 	// This ensures drain-produced latency updates are included in the
 	// final snapshot.
-	if s.probeCoordinator != nil {
-		s.probeCoordinator.Close()
+	if s.raceCoordinator != nil {
+		s.raceCoordinator.Close()
 	}
 
 	// Final persistence: snapshot remaining dirty cells and force-write

@@ -281,33 +281,3 @@ func TestSmartResponseRealTLSProbe(t *testing.T) {
 		}
 	}
 }
-
-func TestSmartResponseDiscoveryFollowerRejectsOldWinner(t *testing.T) {
-	var badDials atomic.Int32
-	bad := newResponseProxy("old-winner", 403)
-	bad.dial = func(context.Context, *C.Metadata) (C.Conn, error) { badDials.Add(1); return &stubConn{}, nil }
-	good := newResponseProxy("eligible", 200)
-	s := newResponseSmart(t, bad, good)
-	m := &C.Metadata{Host: "follower.example.com"}
-	key, domain := routeKey(m), routeDomain(m)
-	s.routeTable.UpdateLatency(key, domain, bad.Name(), 10)
-	// The leader selected this node before its HTTP refusal arrived.
-	ds := &discoveryState{done: make(chan struct{}), proxy: bad, leaderCancel: func() {}}
-	close(ds.done)
-	s.probeCoordinator.discoveries[discoveryKey{routeKey: key, domain: domain}] = ds
-	clone := m.Clone()
-	clone.WildcardTarget = domain
-	s.applyNodeAnswer(clone, bad.Name(), smart.ClassifyResponse(403, nil, nil, time.Now()))
-	conn, err := s.tcpRoute(context.Background(), m)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn.Close()
-	best, _ := s.routeTable.GetBestProxy(key, domain)
-	if best != good.Name() || badDials.Load() != 0 {
-		t.Fatalf("follower bypassed avoidance: best=%s bad dials=%d", best, badDials.Load())
-	}
-	if s.routeTable.ProxyFailedCount(key, domain, bad.Name()) != 0 {
-		t.Fatal("eligibility rejection counted as transport failure")
-	}
-}
