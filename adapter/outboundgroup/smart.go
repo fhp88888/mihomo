@@ -71,6 +71,8 @@ type Smart struct {
 	responseMu     sync.Mutex
 	responseWG     sync.WaitGroup
 	responseClosed bool
+	mergeMu        sync.Mutex
+	mergeRoutes    map[discoveryKey]*mergeRouteState
 }
 
 func getConfigFilename() string {

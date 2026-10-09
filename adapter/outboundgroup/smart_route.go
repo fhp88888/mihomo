@@ -110,62 +110,7 @@ func (s *Smart) tcpRoute(ctx context.Context, metadata *C.Metadata) (C.Conn, err
 	// A known route exploits its current best on most requests. Every
 	// rediscoverEvery-th request explicitly explores a single challenger first,
 	// giving previously untested nodes a chance to collect a TTFB sample.
-	if s.routeTable.IsTCPProbed(key, domain) {
-		exploreEvery := uint64(rediscoverEvery)
-		covered := s.routeTable.RouteTTFBProxyCount(key, domain)
-		// Detailed per-domain observations are intentionally capped. Initial
-		// coverage is complete once that many distinct proxies have evidence;
-		// comparing against the full provider forever would keep large groups in
-		// aggressive exploration after the cache has reached its designed size.
-		targetCoverage := len(proxies)
-		if targetCoverage > smart.MaxProxyCellsPerDomain {
-			targetCoverage = smart.MaxProxyCellsPerDomain
-		}
-		remaining := targetCoverage - covered
-		if remaining > 0 {
-			bestName, _ := s.routeTable.GetBestProxy(key, domain)
-			eligibleUnknown := 0
-			for _, proxy := range proxies {
-				if !proxy.AliveForTestUrl(s.testUrl) || s.routeTable.ProxyHasTTFBSample(key, domain, proxy.Name()) {
-					continue
-				}
-				if bestName != "" && !s.explorationWorthRisk(key, domain, bestName, proxy.Name()) {
-					continue
-				}
-				eligibleUnknown++
-			}
-			if eligibleUnknown < remaining {
-				remaining = eligibleUnknown
-			}
-		}
-		if remaining > 0 {
-			exploreEvery = initialExploreEvery
-			if s.routeTable.ExpectedRouteFutureRequests(key, domain, 30*time.Second) >= float64(remaining*4) {
-				exploreEvery = fastExploreEvery
-			}
-		}
-		shouldExplore := s.routeTable.ShouldExplore(key, domain, exploreEvery)
-		bestName, _ := s.routeTable.GetBestProxy(key, domain)
-		log.Debugln("[SmartTrace] decision key=%s target=%s best=%s coverage=%d/%d eligible_remaining=%d cadence=%d explore=%t",
-			key, domain, bestName,
-			covered, targetCoverage, remaining, exploreEvery, shouldExplore)
-		if shouldExplore {
-			conn, err := s.exploreTcpConn(ctx, metadata, key, domain, proxies)
-			if conn != nil || err != nil {
-				return conn, err
-			}
-		} else {
-			conn, err := s.serialTcpConn(ctx, metadata, key, domain, proxies)
-			if conn != nil || err != nil {
-				return conn, err
-			}
-		}
-		log.Debugln("[Smart] route key=%s known proxies all failed, running full discovery", key)
-	}
-
-	// Fallback, Cold start, 4% re-discover, or all serial fallbacks exhausted:
-	// full parallel discovery.
-	return s.discoverAndRoute(ctx, metadata, key, domain, proxies)
+	return s.mergeBetaRoute(ctx, metadata, key, domain, proxies)
 }
 
 func (s *Smart) serialTcpConn(ctx context.Context, metadata *C.Metadata, key, domain string, proxies []C.Proxy) (C.Conn, error) {
